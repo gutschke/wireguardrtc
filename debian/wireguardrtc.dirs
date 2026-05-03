@@ -1,0 +1,5 @@
+etc/wireguardrtc/peers.d
+usr/lib/wireguardrtc
+usr/sbin
+usr/share/man/man8
+usr/share/doc/wireguardrtc/examples/peers.d

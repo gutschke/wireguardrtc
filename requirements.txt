@@ -1,0 +1,17 @@
+# Pinned runtime dependencies for wireguardrtc-daemon.
+# These are bundled into the Debian package under /usr/lib/wireguardrtc/site-packages/
+# so the daemon is insulated from whatever versions ship with the target distro.
+#
+# Portability notes:
+#   websockets: installed without its optional C speedups extension so the
+#               same package works across Python versions and architectures.
+#               Throughput is not a bottleneck for signalling traffic.
+#   PyNaCl:     ships an abi3 wheel (cp36-abi3) — one binary for Python 3.6+.
+#   cffi:       PyNaCl's runtime dependency.  NOT bundled here; the system
+#               python3-cffi package is declared as a Depends in the .deb.
+#               All supported Debian/Ubuntu releases carry a compatible version.
+#
+# To update: verify abi3 / pure-Python status of new wheel tags before bumping
+# any version.  Test on all supported distributions.
+websockets==13.1
+PyNaCl==1.5.0

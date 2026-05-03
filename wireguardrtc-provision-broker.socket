@@ -1,0 +1,19 @@
+[Unit]
+Description=Privileged provisioning broker for wireguardrtc auto-enrollment
+Documentation=man:wireguardrtc(8)
+
+[Socket]
+ListenStream=/run/wireguardrtc-provision/sock
+SocketUser=root
+SocketGroup=wireguardrtc
+SocketMode=0660
+# One service instance per accepted connection — see man systemd.socket(5)
+# under "Accept=true" for the inetd-style behaviour.
+Accept=yes
+# RuntimeDirectory creates /run/wireguardrtc-provision/ owned by root with
+# the right group ACL so SocketGroup applies cleanly.
+RuntimeDirectory=wireguardrtc-provision
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target

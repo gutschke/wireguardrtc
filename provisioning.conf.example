@@ -1,0 +1,14 @@
+# Example /etc/wireguardrtc/provisioning.conf
+#
+# This file is read by the default ProvisionScript helper
+# (`wireguardrtc-provision-default`) when auto-enrolling new peers.  If you
+# point [Enrollment] ProvisionScript at your own helper, this file is not
+# used.
+#
+# Copy this to /etc/wireguardrtc/provisioning.conf and edit Pool to match
+# the address space your existing /etc/wireguard/<iface>.conf uses.
+
+# CIDR pool that auto-enrolled peers are allocated from.  The first usable
+# address is conventionally the server's; allocations start at the next
+# free host within the pool.
+Pool = 10.99.0.0/24

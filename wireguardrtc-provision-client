@@ -1,0 +1,94 @@
+#!/bin/bash
+# wireguardrtc-provision-client — daemon-side hook for the privileged
+# provisioning broker.
+#
+# This script is what wireguardrtc.conf's [Enrollment] ProvisionScript
+# points at.  It runs inside the daemon's sandbox (as the wireguardrtc
+# user, no FS write to /etc/wireguard, no setuid).  All it does is
+# format a JSON request and hand it to the broker via a Unix socket;
+# the broker validates and invokes the actual provisioner with root
+# privileges.
+#
+# Contract (called by the daemon):
+#     wireguardrtc-provision-client IFACE NAME PUBKEY_BASE64
+# Exit 0 on success, non-zero on any failure (the daemon then sends
+# PROVISION_FAILED back to the enrolling client).
+
+set -euo pipefail
+
+SOCKET="${WIREGUARDRTC_PROVISION_SOCKET:-/run/wireguardrtc-provision/sock}"
+TIMEOUT="${WIREGUARDRTC_PROVISION_TIMEOUT:-10}"
+
+ifc="${1:?usage: $0 IFACE NAME PUBKEY_BASE64}"
+name="${2:?usage: $0 IFACE NAME PUBKEY_BASE64}"
+pub="${3:?usage: $0 IFACE NAME PUBKEY_BASE64}"
+
+# The daemon sets this to the URL-safe-b64 (no padding) form of the
+# token whose claim triggered the call.  The broker uses it to look
+# up an admin-authored permit; without a matching permit the broker
+# refuses to provision.  This narrows daemon-RCE provisioning attacks
+# to the in-flight window between mint and the legitimate broker call.
+token="${WIREGUARDRTC_PROVISION_TOKEN:-}"
+if [ -z "$token" ]; then
+    >&2 echo "WIREGUARDRTC_PROVISION_TOKEN not set in daemon env"
+    >&2 echo "(your wireguardrtc daemon is older than this client; upgrade)"
+    exit 1
+fi
+
+if ! [ -S "$SOCKET" ]; then
+    >&2 echo "provision broker socket $SOCKET not present"
+    >&2 echo "(systemctl start wireguardrtc-provision-broker.socket)"
+    exit 1
+fi
+
+# Compose request and round-trip via Python (more robust than bash here,
+# and the daemon already requires Python for its venv).  socat or nc -U
+# are alternatives but neither is guaranteed installed and both have
+# corner cases around half-close that complicate clean exit.
+python3 - "$SOCKET" "$ifc" "$name" "$pub" "$token" "$TIMEOUT" <<'PY'
+import json, socket, sys
+
+sock_path, ifc, name, pub, tok, timeout = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+    float(sys.argv[6]))
+
+req = json.dumps({"iface": ifc, "name": name, "pubkey": pub, "token": tok}) + "\n"
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(sock_path)
+    s.sendall(req.encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    chunks = []
+    while True:
+        b = s.recv(4096)
+        if not b:
+            break
+        chunks.append(b)
+    s.close()
+except Exception as e:
+    sys.stderr.write(f"broker IPC failed: {e}\n")
+    sys.exit(1)
+
+raw = b"".join(chunks).decode("utf-8", "replace").strip()
+try:
+    resp = json.loads(raw)
+except Exception:
+    sys.stderr.write(f"broker returned non-JSON: {raw!r}\n")
+    sys.exit(1)
+
+status = resp.get("status", "error")
+exit_code = int(resp.get("exit_code", 1))
+err_tail = resp.get("stderr", "")
+
+if status == "ok" and exit_code == 0:
+    sys.exit(0)
+
+# Surface the broker's reason on stderr — the daemon truncates it for
+# the PROVISION_FAILED response, and journals the rest.
+prefix = {"reject": "broker rejected request",
+          "error":  "provisioner failed"}.get(status, f"broker status={status}")
+sys.stderr.write(f"{prefix}: {err_tail}\n")
+sys.exit(exit_code if exit_code else 1)
+PY

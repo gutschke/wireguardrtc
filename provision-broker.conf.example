@@ -1,0 +1,23 @@
+# Example /etc/wireguardrtc/provision-broker.conf
+#
+# Read by /usr/sbin/wireguardrtc-provision-broker (the privileged side
+# of the auto-enrollment provisioning channel).  Names the actual
+# Provisioner script that gets invoked when an ENROLL request validates.
+#
+# The daemon's [Enrollment] ProvisionScript should ALWAYS point at
+# /usr/sbin/wireguardrtc-provision-client; that client talks to the
+# broker, the broker talks to whichever Provisioner you set here.
+#
+# Default Provisioner if this file is absent or has no setting:
+#   /usr/sbin/wireguardrtc-provision-default
+
+# Stock wg-quick deployments — allocates from a CIDR pool defined in
+# /etc/wireguardrtc/provisioning.conf, appends to /etc/wireguard/<iface>.conf,
+# applies via `wg syncconf`.
+Provisioner = /usr/sbin/wireguardrtc-provision-default
+
+# Custom helper-script deployments (e.g. the schlage5a/vpn add-peer
+# family with /etc/wireguard/<iface>.peers and config-peers).  Replace
+# the line above with:
+#
+# Provisioner = /etc/wireguard/provision-rtc

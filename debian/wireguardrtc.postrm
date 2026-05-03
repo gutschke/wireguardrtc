@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove config (including any peer drop-ins the admin created).
+        rm -rf /etc/wireguardrtc
+
+        # Remove the system user and group created by postinst.
+        if getent passwd wireguardrtc > /dev/null 2>&1; then
+            deluser --system wireguardrtc || true
+        fi
+        if getent group wireguardrtc > /dev/null 2>&1; then
+            delgroup --system wireguardrtc || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

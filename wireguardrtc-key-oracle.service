@@ -1,0 +1,83 @@
+[Unit]
+Description=wireguardrtc key-derivation oracle (privilege-separated key holder)
+Documentation=man:wireguardrtc(8)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wireguardrtc-key-oracle
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wireguardrtc-key-oracle
+
+# The oracle holds the WireGuard private keys in memory (read on demand
+# via `wg show <iface> private-key`, which needs CAP_NET_ADMIN) and
+# serves a small JSON-RPC interface over a Unix socket.  See the script
+# header for the threat model and the man page section
+# SECURITY/Auto-enrollment privilege separation for the why.
+#
+# Runs as the same `wireguardrtc` user the daemon does, so they can
+# trade off the socket without root involvement.  CAP_NET_ADMIN comes
+# from AmbientCapabilities — that is the ONLY user-space process on
+# the host that has it after this package is installed (the daemon
+# explicitly drops it).
+User=wireguardrtc
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+# The socket lives in /run/wireguardrtc/ which systemd creates and
+# chowns to the daemon's user.  Mode 0750 on the dir + 0600 on the
+# socket means only the daemon's user can talk to the oracle.
+RuntimeDirectory=wireguardrtc
+RuntimeDirectoryMode=0750
+# Shared with wireguardrtc.service and wireguardrtc-raw-helper.service.
+# Preserve=yes keeps the dir across stop/restart cycles so a daemon
+# restart doesn't transiently destroy this oracle's socket path.
+RuntimeDirectoryPreserve=yes
+Environment=WIREGUARDRTC_KEY_ORACLE_SOCKET=/run/wireguardrtc/oracle.sock
+
+# Sandboxing.  The oracle is small (one Python file) and has no need
+# for any of the namespaces, devices, or filesystem writes outside its
+# socket.  We deliberately go even tighter than the daemon — the
+# oracle never opens a network socket, never resolves DNS, never reads
+# anything in /etc.  It is the most-locked-down process in the system.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=no   # we still need AF_NETLINK to talk to wg(8)
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+UMask=0077
+
+# AF_UNIX for our listening socket; AF_NETLINK so `wg(8)` can ask the
+# kernel for keys.  Nothing else.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# Same curated syscall filter as the daemon.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug @mount @obsolete @cpu-emulation @module @reboot @swap
+
+# Read-only access to /usr/bin/wg (subprocess invocation) and the
+# venv (we share the daemon's PyNaCl).
+ReadOnlyPaths=/usr/bin/wg /usr/lib/wireguardrtc
+
+[Install]
+WantedBy=multi-user.target

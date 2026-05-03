@@ -1,0 +1,63 @@
+[Unit]
+Description=Provision a single wireguardrtc-enrolled peer
+Documentation=man:wireguardrtc(8)
+# Per-connection template instantiated by wireguardrtc-provision-broker.socket
+# (Accept=yes).  One process per request; exits when the request is handled.
+
+[Service]
+# Inetd-style: stdin and stdout are wired to the accepted connection.
+ExecStart=/usr/sbin/wireguardrtc-provision-broker
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+SyslogIdentifier=wireguardrtc-provision-broker
+TimeoutStartSec=15
+
+# Runs as root because invoking the configured Provisioner needs to write
+# to /etc/wireguard and run wg/nft/ip — all root-only on a normal Debian
+# host.  The blast radius is bounded by:
+#   * Per-connection lifetime (the process exits after one request).
+#   * Strict input validation in the broker before exec.
+#   * Filesystem hardening below.
+# Rationale lives in the broker script's header comment.
+User=root
+
+# We need to write /etc/wireguard (peers + IFACE.conf) plus run network
+# tooling.  Everything else stays read-only.
+ProtectSystem=strict
+ReadWritePaths=/etc/wireguard /var/lib/wireguardrtc-provision-broker
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+UMask=0077
+# Provisioner needs AF_INET/INET6 for `ip` calls; the broker itself only
+# needs AF_UNIX (stdin/stdout from socket activation) and AF_NETLINK
+# for `wg`/`ip`.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+# Same curated syscall set the daemon uses; the broker is a small
+# bash + Python tool plus subprocess(es), all comfortably within
+# @system-service.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug @mount @obsolete @cpu-emulation @module @reboot @swap
+# Drop everything except what the Provisioner actually needs:
+#   CAP_NET_ADMIN — wg set, nft, ip link/route (mandatory)
+# /etc/wireguard files are owned root:root, so root r/w needs no extra
+# cap; we deliberately do NOT grant DAC_OVERRIDE / CHOWN / SETUID etc.
+# We also do NOT grant CAP_NET_RAW — the broker never punches.
+CapabilityBoundingSet=CAP_NET_ADMIN

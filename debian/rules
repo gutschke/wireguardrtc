@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+
+# Bundled dependency directory.  pip install --target puts everything flat
+# here; PYTHONPATH in the systemd unit points Python at it.  This layout is
+# Python-version-agnostic: the same package works on Python 3.10, 3.11, 3.12,
+# etc. without rebuilding, because pynacl and cffi ship abi3 wheels that are
+# compatible with Python 3.6+.
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Pure Python — nothing to compile.
+	chmod +x wireguardrtc
+
+override_dh_auto_install:
+	install -Dm755 wireguardrtc \
+		debian/wireguardrtc/usr/sbin/wireguardrtc
+
+override_dh_installsystemd:
+	# ConditionPathExists in the unit prevents startup until the admin creates
+	# the config file, so --no-start is not needed here.  On upgrade, systemd
+	# will restart the service normally; on first install it will start and
+	# immediately go inactive (dead) because the condition is not met.
+	dh_installsystemd

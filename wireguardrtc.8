@@ -1,0 +1,1740 @@
+'\" t
+.\" wireguardrtc.8 -- manual page for the WireGuard RTC hole-punching daemon
+.\" Process with: groff -man -Tpdf wireguardrtc.8 > wireguardrtc.pdf
+.\"              or: man ./wireguardrtc.8
+.\"
+.TH WIREGUARDRTC 8 "2026-05-03" "wireguardrtc" "System Manager's Manual"
+.\"
+.\" -------------------------------------------------------------------------
+.SH NAME
+.\"
+wireguardrtc \- WireGuard NAT hole-punching daemon via PeerJS signalling
+.\"
+.\" -------------------------------------------------------------------------
+.SH SYNOPSIS
+.\"
+.SY wireguardrtc
+.OP \-\-config FILE
+.OP \-\-peers\-dir DIR
+.OP \-\-log\-level LEVEL
+.YS
+.SY wireguardrtc
+.B \-\-show\-config
+.OP \-\-iface IFACE
+.YS
+.SY wireguardrtc
+.B \-\-enroll\-token NAME
+.OP \-\-expires SECONDS
+.OP \-\-iface IFACE
+.YS
+.\"
+.\" -------------------------------------------------------------------------
+.SH DESCRIPTION
+.\"
+.B wireguardrtc
+maintains direct UDP tunnels between WireGuard peers that are located
+behind cone NATs (full-cone, address-restricted, or port-restricted).
+It does not require a VPN relay or any static public IP address on
+either end of the tunnel.
+.PP
+The daemon operates by:
+.IP 1. 4
+Discovering the host's current public IPv4 address via STUN.
+.IP 2. 4
+Encrypting that address (together with the WireGuard listen port and a
+freshness timestamp) using a key derived from the two endpoints'
+WireGuard Curve25519 identities.
+.IP 3. 4
+Delivering the encrypted blob to the remote peer through a
+.I PeerJS
+signalling broker, using the standard PeerJS OFFER wire format.
+.IP 4. 4
+Punching a NAT pinhole from the local WireGuard listen port toward
+the remote endpoint using a raw IP+UDP packet (source-port spoofed to
+the WG listen port).
+.IP 5. 4
+Waking the kernel WireGuard module by sending a datagram through the
+WG interface, causing it to initiate a handshake to the newly
+established endpoint.
+.PP
+Configuration is split between a single global file and per-peer
+drop-in files.  Peers without a drop-in file are silently ignored,
+allowing gradual adoption in mixed deployments.
+.PP
+The daemon is a single-file Python 3 asyncio program installed as
+.IR /usr/sbin/wireguardrtc .
+It runs under systemd as the
+.B wireguardrtc
+system user with
+.BR CAP_NET_ADMIN " and " CAP_NET_RAW
+capabilities; it does not require root.  Running as root is also
+supported.
+.\"
+.\" -------------------------------------------------------------------------
+.SH OPTIONS
+.\"
+.TP
+.BI \-\-config " FILE"
+Path to the global configuration file.
+.br
+Default:
+.I /etc/wireguardrtc/wireguardrtc.conf
+.br
+Override with the environment variable
+.B WIREGUARDRTC_CONFIG_DIR
+(sets the directory; the filename
+.I wireguardrtc.conf
+is appended).
+.\"
+.TP
+.BI \-\-peers\-dir " DIR"
+Directory containing per-peer drop-in files
+.RI ( "*.conf" ).
+.br
+Default:
+.I /etc/wireguardrtc/peers.d
+.\"
+.TP
+.BI \-\-lock\-file " PATH"
+Path to the single-instance lock file.
+.br
+Default:
+.I /run/wireguardrtc/lock
+.br
+Override with the environment variable
+.BR WIREGUARDRTC_LOCK_FILE .
+.br
+The default path is created and owned by the systemd
+.B RuntimeDirectory
+mechanism when the unit is started; running the daemon manually as a
+non-systemd-managed user requires picking a writable path here.  This
+option is also useful for running multiple daemon instances on the
+same host (for testing or per-namespace deployments) — each instance
+must use a distinct lock path or they will refuse to start, citing
+.IR "another wireguardrtc daemon already holds <path>" .
+.\"
+.TP
+.BI \-\-log\-level " LEVEL"
+Logging verbosity.  One of
+.BR DEBUG ", " INFO ", " WARNING ", " ERROR .
+.br
+Default:
+.B INFO
+(overridable with the environment variable
+.BR LOG_LEVEL ).
+.\"
+.TP
+.B \-\-show\-config
+Print this peer's WireGuard identity and PeerJS broker IDs, then
+exit.  For each configured peer, also prints a ready-to-paste
+.I peers.d
+drop-in that the remote host should use to point back at this one.
+.PP
+.RS
+Use this command on both peers to diagnose configuration mismatches:
+the
+.I broker-id
+shown under
+.B THIS PEER
+on host A must equal the
+.I broker-id
+shown for the corresponding peer entry on host B, and vice versa.
+If the broker IDs don't match despite a common
+.B Salt
+value, the
+.B PublicKey
+in one of the drop-in files is wrong.
+.PP
+This option does not start the daemon, does not acquire the lock file,
+and does not require
+.BR CAP_NET_RAW .
+It does need
+.B CAP_NET_ADMIN
+(or root) to read WireGuard public keys from the kernel.
+.RE
+.\"
+.TP
+.BI \-\-iface " IFACE"
+Used together with
+.BR \-\-show\-config " or " \-\-enroll\-token .
+Restrict operation to the single WireGuard interface named
+.IR IFACE .
+For
+.BR \-\-show\-config ,
+without this option all WireGuard interfaces are shown.
+For
+.BR \-\-enroll\-token ,
+this option chooses which interface's public key is embedded in the
+generated URI; required when the host has multiple WireGuard
+interfaces.
+.PP
+.RS
+Run
+.B \-\-show\-config \-\-iface wg0p4
+on both ends and compare the output line by line to spot key or
+broker-id mismatches.
+.RE
+.\"
+.TP
+.BI \-\-enroll\-token " NAME"
+Mint a single-use enrollment token for the peer named
+.IR NAME ,
+print the
+.B wgrtc-enroll://v1?\&...
+URI to standard output, render a terminal QR code if standard output
+is a TTY and
+.BR qrencode (1)
+is installed, then exit.  See
+.B AUTO\-ENROLLMENT
+below for details on the protocol and the URI format.
+.PP
+.RS
+.B Enrollment must be enabled
+in
+.IB CONFIG_DIR /wireguardrtc.conf
+under
+.B [Enrollment]
+.BR "Enabled = yes" ,
+with
+.B ProvisionScript
+pointing at an executable hook (see
+.BR \-\-iface " and " "[Enrollment]" ).
+.RE
+.\"
+.TP
+.BI \-\-expires " SECONDS"
+Used together with
+.BR \-\-enroll\-token .
+Token lifetime in seconds; valid range
+.BR 60 .. 604800
+(1 minute to 7 days).
+.br
+Default:
+.B 600
+(10 minutes).
+.\"
+.\" -------------------------------------------------------------------------
+.SH CONFIGURATION FILES
+.\"
+.SS Global configuration \(em wireguardrtc.conf
+.\"
+The global configuration file uses INI format (parsed by Python's
+.BR configparser ).
+Key names are case-sensitive; base64 values are preserved verbatim.
+.PP
+.B [Global]
+.RS
+.\"
+.TP
+.B Salt = \fIstring\fR
+.B Required.
+A site-specific random string shared by all hosts that participate in
+the same signalling domain.  The salt is incorporated into the PeerJS
+routing ID derivation; peers with different salts cannot find each
+other on the broker even if they share the same WireGuard public key.
+.br
+Both sides of every tunnel
+.I must
+use the same salt.
+.br
+Generate with:
+.IP
+.EX
+head \-c 32 /dev/urandom | base64
+.EE
+.IP
+The daemon refuses to start if Salt is absent or still set to the
+placeholder value
+.IR CHANGE_ME_TO_A_SECURE_RANDOM_STRING .
+.\"
+.TP
+.B PeerJsServer = \fIwss://host/path\fR
+WebSocket URL of the PeerJS signalling broker.
+.br
+Default:
+.I wss://0.peerjs.com/peerjs
+(the public PeerJS broker).
+.br
+For private deployments, self-host the
+.B peerjs-server
+Docker image and point this setting at
+.IR ws://your.host:9000/peerjs .
+.\"
+.TP
+.B PeerJsKey = \fIstring\fR
+The PeerJS application key.  Must match the key configured on the
+broker.
+.br
+Default:
+.I peerjs
+(matches the public broker's default).
+.\"
+.TP
+.B PublicIp = \fIA.B.C.D\fR
+.I Optional.
+A static IPv4 address that overrides STUN discovery.  When set, the
+daemon advertises this address in OFFERs without querying any STUN
+server.  Useful on:
+.RS
+.IP \(bu 4
+hosts with a known static public IPv4 (VPS, anycast, dedicated IP),
+.IP \(bu 4
+isolated network segments where outbound STUN is firewalled,
+.IP \(bu 4
+test fabrics where the host has no internet egress.
+.RE
+.IP
+The value must be a valid IPv4 address that is not loopback,
+multicast, link-local, unspecified, or otherwise reserved.  IPv6
+endpoint publication is not implemented; use the underlying WireGuard
+configuration directly if you need an IPv6 endpoint.
+.IP
+Default: unset (use STUN).
+.RE
+.PP
+.B [Stun]
+.RS
+.TP
+.B Servers = \fIhost:port\fR\fR[, \fIhost:port\fR ...]
+Comma-separated list of STUN server endpoints.  The daemon queries
+them in order and uses the first response.  Ignored when
+.B PublicIp
+is set in the
+.B [Global]
+section.
+.br
+Default:
+.IR stun.l.google.com:19302 ,
+.IR stun.cloudflare.com:3478 ,
+.IR stun.nextcloud.com:3478
+.TP
+.B Strict = \fIyes|no\fR
+When
+.BR yes ,
+STUN responses whose XOR-MAPPED-ADDRESS is not globally routable
+(RFC 1918 private, CGN 100.64/10, loopback, link-local, RFC 5737
+documentation, multicast, etc.) are rejected and the daemon tries
+the next server in the list.  Useful when you know the host has a
+real public IPv4 address and a hijacked or misconfigured STUN server
+would otherwise feed you an internal address that you'd advertise to
+peers as the host's endpoint.
+.br
+Default:
+.B no
+(LAN-only deployments legitimately advertise private addresses).
+.RE
+.PP
+.B [Enrollment]
+.RS
+This section is read only when auto-enrollment is in use.  See the
+.B AUTO\-ENROLLMENT
+section below for the full protocol description.  In a deployment that
+only uses pre-shared peer keys (the original v0.1 model), leave the
+section out entirely.
+.\"
+.TP
+.B Enabled = \fIyes|no\fR
+Enable the auto-enrollment handler.  When
+.BR yes ,
+the daemon listens for
+.B ENROLL
+messages on its PeerJS connection and processes them via the
+configured
+.BR ProvisionScript .
+When
+.BR no
+(or absent), incoming
+.B ENROLL
+messages are silently dropped.
+.br
+Default:
+.B no
+.\"
+.TP
+.B ProvisionScript = \fIPATH\fR
+Path to an executable that is invoked to add a newly-enrolled peer.
+The script is called as:
+.IP
+.EX
+ProvisionScript IFACE NAME PUBKEY_BASE64
+.EE
+.IP
+and must exit
+.B 0
+on success.  After a successful exit, the daemon reads back the
+peer's allocated address via
+.BR "wg show \fIIFACE\fR allowed-ips" .
+.br
+.B Required when Enabled = yes.
+.IP
+.B Default and recommended value:
+.IR /usr/sbin/wireguardrtc-provision-client .
+This is a thin wrapper that hands the request to the privileged
+.BR wireguardrtc-provision-broker (8)
+over a Unix socket; the broker then invokes the actual provisioning
+helper with root privileges.  The broker exists because the daemon
+runs heavily sandboxed (see
+.B SECURITY
+below) and cannot itself write to
+.IR /etc/wireguard
+or run privileged tooling.  Configure which helper the broker invokes
+in
+.IR /etc/wireguardrtc/provision-broker.conf ;
+two helpers ship with this package:
+.RS
+.IP \(bu 4
+.IR /usr/sbin/wireguardrtc-provision-default
+\(em allocates from a CIDR pool defined in
+.IR /etc/wireguardrtc/provisioning.conf
+and writes a
+.B [Peer]
+block to
+.IR /etc/wireguard/IFACE.conf .
+.IP \(bu 4
+A custom helper of your own (Ansible-managed peers, the
+.IR add-peer / show-peer
+helper-script family used by some private deployments, etc.).
+.RE
+.IP
+Do
+.B not
+point ProvisionScript directly at the helper unless you have also
+relaxed the daemon's sandbox to allow filesystem access \(em the
+default helpers all write to
+.IR /etc/wireguard/ ,
+which the daemon's
+.B ProtectSystem=strict
+forbids.  See the
+.B SECURITY
+section below for the privilege-separation rationale.
+.\"
+.TP
+.B StateDir = \fIPATH\fR
+Directory holding the daemon's persistent enrollment state, in
+particular the
+.I pending-tokens.json
+file.  The directory is created with mode
+.B 0700
+on first use.
+.br
+Default:
+.IR /var/lib/wireguardrtc .
+.\"
+.TP
+.B MaxPendingTokens = \fIN\fR
+Refuse to mint additional tokens once
+.I N
+unconsumed tokens are already pending; admin must wait for them to be
+used or to expire.  Bounds worst-case state size and per-ENROLL
+decryption cost.
+.br
+Default:
+.B 32
+(range
+.BR 1 .. 1000 ).
+.\"
+.TP
+.B AutoActive = \fIyes\fR|\fIno\fR
+When a peer completes enrollment, automatically write a
+peers.d-style drop-in for it to
+.IR <StateDir>/auto-enrolled.d/ .
+The drop-in carries
+.B Mode = active
+so the daemon pushes signalling OFFERs (with the daemon's current
+STUN-discovered IPv4) to the new peer without requiring you to
+hand-author
+.IR /etc/wireguardrtc/peers.d/<label>.conf .
+This is what lets the Phase-2 long-lived listener on the Android
+client follow your server's roaming public IP between sessions.
+.br
+An explicit drop-in in
+.I /etc/wireguardrtc/peers.d/
+with the same
+.B PublicKey
+always wins over the auto-active entry, so you can override any
+specific peer (e.g. downgrade to
+.B passive
+or
+.BR ignore ).
+.br
+Set this to
+.B no
+if you want strict admin opt-in for every peer's OFFER push.
+.br
+Default:
+.BR yes .
+.RE
+.\"
+.SS Per-peer drop-ins \(em peers.d/*.conf
+.\"
+Each file in the peers directory describes one remote WireGuard peer.
+The filename (without the
+.I .conf
+suffix) is used as a human-readable label in log output; it has no
+functional significance.  The actual peer identity comes from the
+.B PublicKey
+field inside the file.
+.PP
+Files are parsed with the same INI parser as the global config
+(case-sensitive keys).
+.PP
+.B [Peer]
+.RS
+.\"
+.TP
+.B PublicKey = \fIbase64\fR
+.B Required.
+The WireGuard public key of the remote peer, in standard base64
+encoding.  The daemon matches this against the live kernel state
+returned by
+.BR "wg show" .
+.\"
+.TP
+.B Mode = active | passive | dns-roam | ignore
+Controls how the daemon behaves for this peer.
+.br
+Default:
+.B passive
+(if the field is absent or unrecognised).
+.br
+See
+.B PEER MODES
+below for a full description.
+.\"
+.TP
+.B DnsHost = \fIhostname:port\fR
+Applicable only when
+.B Mode = dns-roam.
+The hostname is resolved to an IPv4 address every poll cycle; if the
+resolved address differs from the current WireGuard endpoint the
+kernel is updated with
+.BR "wg set" .
+The daemon refuses to load a
+.B dns-roam
+peer that omits this field.
+.RE
+.\"
+.\" -------------------------------------------------------------------------
+.SH PEER MODES
+.\"
+.TP
+.B active
+The daemon proactively monitors the tunnel.  Every poll cycle it
+reads
+.B latest-handshakes
+from the kernel; if the most recent handshake is older than
+.B HANDSHAKE_DEAD_THRESHOLD
+(180 seconds \(em the WireGuard rekey interval of 120 s plus a 60 s
+grace period) the tunnel is considered dead and the daemon sends a
+PeerJS OFFER carrying this host's current public endpoint.  On
+receiving the OFFER the remote peer punches its NAT and updates
+its kernel endpoint, causing a fresh handshake.
+.sp
+Outbound OFFERs are rate-limited with exponential backoff starting at
+30 seconds and capped at 300 seconds per peer.
+.sp
+In addition to proactive polling,
+.B active
+peers also respond to incoming OFFERs when the tunnel is down: the
+daemon sends its own current endpoint back immediately, so both sides
+can punch their respective NATs concurrently.  This cuts cold-start
+latency in active-active configurations from up to one full backoff
+cycle to a few seconds.
+.sp
+Use
+.B active
+for server-to-server tunnels and for any peer that is expected to be
+persistently online.
+.\"
+.TP
+.B passive
+The daemon never initiates outbound PeerJS signalling for this peer.
+However, when an incoming OFFER arrives from the remote peer and the
+tunnel is down, the daemon automatically responds with its own current
+endpoint.  This allows the remote peer to punch its NAT toward this
+host even when the remote peer is behind a restricted-cone NAT that
+requires knowing the destination endpoint before it will forward traffic.
+.sp
+Use
+.B passive
+for mobile devices or intermittently-connected clients that should
+initiate contact themselves.  The server-side daemon will respond to
+each client's OFFER so that both NATs are punched before the
+WireGuard handshake fires.
+.\"
+.TP
+.B dns-roam
+PeerJS is not used.  Instead, the daemon resolves the hostname given
+in
+.B DnsHost
+every poll cycle.  When the resolved address changes it calls
+.B "wg set \fIiface\fR peer \fIpubkey\fR endpoint \fIip\fR:\fIport\fR"
+and wakes the kernel WireGuard module to trigger a new handshake.
+.sp
+Use
+.B dns-roam
+for peers behind dynamic DNS (DDNS) where you control the hostname
+but the underlying IP changes unpredictably.
+.\"
+.TP
+.B ignore
+The daemon takes no action for this peer.  Useful for upstream VPN
+provider tunnels, relay servers, or any peer whose endpoint is
+managed by another mechanism.
+.\"
+.SS "OFFER LOOP PROTECTION"
+.\"
+When two responsive peers exchange OFFERs continuously without the
+tunnel ever coming up (for example because of a symmetric NAT on one
+side, or a routing black-hole), the daemon applies the following
+safeguards:
+.IP \(bu 4
+A rate-limit prevents sending more than one outbound OFFER
+per 25 seconds per peer, regardless of how many incoming OFFERs arrive.
+.IP \(bu 4
+A rolling-window counter tracks how many OFFER exchanges occur
+within a 10-minute window.  When the counter reaches 8 without the
+tunnel recovering, the daemon logs a
+.B WARNING
+and enters a 5-minute
+.I quarantine
+for that peer: all responsive OFFERs are suppressed until the
+quarantine expires.  This bounds worst-case broker traffic to roughly
+one OFFER per 25 seconds during active exchange, falling back to at
+most one burst per 15 minutes under a sustained fault.
+.IP \(bu 4
+If an OFFER arrives bearing this daemon's own routing ID
+(which would happen if a host accidentally configures its own public
+key in its peers.d file), it is discarded with a
+.B WARNING
+and never processed.
+.PP
+After a quarantine period the counter resets and the daemon tries
+again.  When the tunnel eventually comes up the counter and quarantine
+state are cleared immediately.
+.\"
+.\" -------------------------------------------------------------------------
+.SH HOLE-PUNCHING MECHANISM
+.\"
+The hole-punching sequence, as executed after receiving a valid OFFER,
+is:
+.IP 1. 4
+.B Raw-socket injection.
+A raw
+.B AF_INET/SOCK_RAW
+socket with
+.B IP_HDRINCL
+sends three empty UDP datagrams to the remote endpoint.  The source
+port in the hand-crafted IP+UDP header is set to the local WireGuard
+listen port.  This causes the NAT device to create an outbound
+mapping from
+.RI < local_listen_port >
+to
+.RI < remote_ip > : < remote_port >
+in the NAT table.  The three-packet burst (with a 50 ms gap) hedges
+against UDP packet loss during NAT state creation.
+.IP
+Because the kernel WireGuard module binds the listen port exclusively,
+even
+.BR SO_REUSEADDR / SO_REUSEPORT
+is rejected for that port; the raw socket bypasses this restriction
+because it operates at the IP layer, not the UDP layer.
+.IP 2. 4
+.B Kernel endpoint update.
+.B "wg set \fIiface\fR peer \fIpubkey\fR endpoint \fIip\fR:\fIport\fR"
+is called to tell the kernel WireGuard module where the remote peer
+now lives.
+.IP 3. 4
+.B Handshake wake.
+A 1-byte UDP datagram is sent through the WireGuard interface using
+.B SO_BINDTODEVICE
+to force it through the correct interface regardless of routing table
+preference.  The kernel WireGuard module observes the outbound
+traffic, sees a pending handshake for the updated endpoint, and
+initiates it.
+.sp
+For peers with a
+.B /32
+allowed-ip the datagram is addressed to that host address.  For peers
+with a wider subnet the first usable host address is used.  For
+.B 0.0.0.0/0
+catch-all peers,
+.B 192.0.2.1
+(TEST-NET-1, RFC 5737) is used; any address in the /0 range would
+work, but 192.0.2.1 is unlikely to exist as a real host and is
+clearly bogon.
+.sp
+The conntrack NAT mapping created by the raw injection lasts
+approximately 30 seconds (default
+.B nf_conntrack_udp_timeout
+on Linux).  The wake step must trigger a handshake within this
+window; in practice the WireGuard handshake completes in under 1
+second.
+.\"
+.\" -------------------------------------------------------------------------
+.SH CRYPTOGRAPHY
+.\"
+All signalling payloads are end-to-end encrypted; the PeerJS broker
+sees only opaque blobs and cannot read or modify the endpoint
+information.
+.SS Key derivation
+.PP
+For each peer pair (A, B) a shared symmetric key is derived:
+.IP 1. 4
+Perform X25519 Diffie-Hellman:
+.sp
+.B shared = X25519(my_wg_private_key, peer_wg_public_key)
+.IP 2. 4
+Apply keyed BLAKE2b for domain separation:
+.sp
+.B key = BLAKE2b\-256(shared, key=\(lqwg-peerjs/v1/sigbox\(rq)
+.PP
+The domain label ensures that this key is cryptographically
+independent from WireGuard's own session keys, even though both
+derive from the same Curve25519 keypair.
+.SS Payload encryption
+.PP
+Payloads are encrypted with
+.B libsodium SecretBox
+(XSalsa20-Poly1305).  Each payload contains:
+.RS
+.TP
+.B v
+Protocol version (integer, currently 1).  Recipients reject
+mismatches.
+.TP
+.B ts
+Unix timestamp of encryption time (integer seconds).  Recipients
+reject messages older than 90 seconds or more than 90 seconds in the
+future, providing replay protection.
+.TP
+.B ip
+The sender's current public IPv4 address (string).
+.TP
+.B port
+The sender's WireGuard listen port (integer).
+.RE
+.PP
+The encrypted blob is base64-encoded and carried in
+.B payload.metadata.blob
+of the PeerJS OFFER envelope.
+.SS Endpoint validation
+.PP
+On receipt, the decrypted endpoint is sanity-checked before being
+applied to the kernel:
+loopback, link-local, multicast, unspecified, and reserved addresses
+are rejected.  Port numbers outside 1\(en65535 are rejected.  This
+prevents a compromised peer or broker from redirecting WireGuard
+handshakes to infrastructure services.
+.\"
+.\" -------------------------------------------------------------------------
+.SH PEERJS ROUTING IDENTITY
+.\"
+Each daemon instance registers on the signalling broker under a
+deterministic routing ID derived from its WireGuard public key and the
+shared salt:
+.PP
+.B routing_id = SHA\-256(wg_public_key_bytes || salt_bytes).hexdigest()
+.PP
+Because the salt is site-specific and not embedded in the public key,
+two installations running the same WireGuard key with different salts
+will not interfere with each other on the public broker.
+.PP
+The daemon opens
+.I one
+long-lived WebSocket connection per process, not one per peer.  This
+is deliberate: a single connection is sufficient for all configured peers
+(routing IDs are per-peer, not per-connection), and avoids multiplying
+broker load with the number of peers.
+.PP
+The routing ID is keyed to the WireGuard interface whose public key
+the daemon chose as the "primary" interface (the one hosting the most
+non-IGNORE configured peers).  Peers configured on
+.I other
+WireGuard interfaces on the same host will not reach this daemon over
+PeerJS until multi-interface support is added.  A warning is logged
+when this situation is detected.
+.\"
+.\" -------------------------------------------------------------------------
+.SH PEERJS WIRE FORMAT
+.\"
+All signalling messages use the standard PeerJS OFFER wire format: a
+WebRTC datachannel OFFER envelope with freshly generated ICE credentials
+and a DTLS fingerprint in the SDP body.  The encrypted endpoint blob is
+carried in
+.B payload.metadata.blob
+alongside the standard WebRTC fields.
+.PP
+This format is used unconditionally — with both self-hosted and public
+brokers — so there is one wire format regardless of deployment.
+.\"
+.SS Discriminator: \fBpayload.metadata.kind\fR
+.\"
+The
+.B kind
+field inside
+.B payload.metadata
+discriminates between three message families that all share the OFFER
+envelope:
+.TP
+.B (absent or "offer")
+Ordinary signalling OFFER.  The encrypted blob carries a
+.B candidates
+list (see below); the receiver applies the first valid candidate to the
+kernel WG endpoint and (when the tunnel is DOWN) sends a responsive
+OFFER carrying its own endpoint(s).
+.TP
+.B "signal_wake"
+Client-initiated wake.  The encrypted blob carries an
+.I empty
+.B candidates
+list — the sender hasn't claimed an endpoint, it's asking the receiver
+to refresh its view.  The receiver does NOT touch kernel WG state from
+a wake (no endpoint claim to apply).  It DOES send a responsive OFFER
+carrying its own endpoint(s),
+.I bypassing the "tunnel-already-UP" guard
+that suppresses ordinary responsive OFFERs, since wakes are explicit
+user-driven requests.  The same OFFER-loop rate-limiters apply.
+.TP
+.B "enroll" / "enroll_ok" / "enroll_err"
+Auto-enrollment.  See AUTO-ENROLLMENT below.
+.\"
+.SS Encrypted blob: \fBcandidates\fR list
+.\"
+The decrypted
+.B blob
+plaintext is JSON of the form:
+.PP
+.RS 4
+.nf
+{
+  "v": 1, "ts": <epoch_seconds>,
+  "candidates": [
+    {"ip": "192.168.43.1", "port": 51820, "kind": "lan"},
+    {"ip": "1.2.3.4",      "port": 51820, "kind": "stun"}
+  ]
+}
+.fi
+.RE
+.PP
+.B Senders
+list candidate endpoints in preference order: a phone in host-mode-on-
+hotspot fills
+.B [LAN, STUN]
+so on-LAN guests pick the LAN candidate without crossing the public IP
+(avoiding cellular hairpin-NAT failure).  An ordinary single-endpoint
+daemon fills exactly one entry.  Senders that don't claim any endpoint
+(today,
+.BR signal_wake )
+fill an empty list.
+.PP
+.B Receivers
+take the first candidate that passes
+.B is_valid_public_endpoint
+(rejects loopback, link-local, multicast, unspecified, reserved, and
+weirdly-low ports — RFC 1918 private addresses are accepted on the
+assumption the sender saw a LAN candidate and the receiver is on the
+same LAN).  Kernel WireGuard endpoint roaming sorts out the rest from
+real handshake traffic — no need for the receiver to time-share
+between candidates.
+.PP
+.B Per-candidate
+.B kind
+is purely informational
+.RB ( lan / stun / dns / manual ;
+future expansion: \fBv6ll\fR, \fBpcp\fR).  Receivers do not interpret
+the field; it shows up only in diagnostic logs.
+.\"
+.\" -------------------------------------------------------------------------
+.SH AUTO-ENROLLMENT
+.\"
+Auto-enrollment lets a freshly-installed client join an existing
+.B wireguardrtc
+mesh by scanning a one-time QR code, with no manual exchange of
+public keys.  The protocol is opt-in: enable
+.B [Enrollment] Enabled = yes
+in the global config and configure
+.BR ProvisionScript .
+.\"
+.SS Threat model
+The voucher (token in the QR code) is the trust anchor.  Anyone in
+possession of a token can enroll a single device until the token is
+consumed or expires.  The protocol guarantees:
+.IP \(bu 4
+.B Confidentiality.
+The PeerJS broker sees only routing IDs and ciphertext.  Endpoint
+addresses, name hints, and device strings are encrypted with a key
+derived from the token plus an X25519 ECDH between the client's and
+server's WireGuard keypairs.
+.IP \(bu 4
+.B Server authentication.
+The encrypted ENROLL_OK / ENROLL_ERR response carries an
+authentication tag that only the server (holder of its private
+WireGuard key) can produce.  A passive observer cannot forge a
+response, and a forged response from any other party fails the
+client's auth-tag check.
+.IP \(bu 4
+.B Single-use enforcement.
+The server marks tokens as consumed atomically before invoking the
+provisioning hook.  Concurrent racers serialize on a file lock; the
+loser receives an authenticated
+.B TOKEN_USED
+response so the legitimate user
+.I notices the failure
+rather than silently re-enrolling onto a stolen identity.
+.IP \(bu 4
+.B Replay safety.
+A successful enrollment response is cached server-side for 5 minutes,
+keyed by the client's public key.  Legitimate retries (lost
+.B ENROLL_OK
+over a flaky network) return the same envelope; only the holder of
+the matching private key can decrypt it.
+.PP
+.B What auto-enrollment does NOT protect against:
+QR-code leakage.  If an attacker observes the QR before the legitimate
+user does, they can race for the token.  In a small-scale deployment
+this is acceptable: the loser sees an authenticated
+.B TOKEN_USED
+error and surfaces a prominent failure to the user, who can then ask
+the admin to revoke the rogue enrollment and mint a fresh token.
+Treat QR images like one-time passwords — share over E2EE channels
+or in person, not via plaintext email.
+.\"
+.SS Wire format
+Both
+.B ENROLL
+and the corresponding
+.B ENROLL_OK
+/
+.B ENROLL_ERR
+responses ride inside the same WebRTC OFFER envelope used by
+signalling traffic; they are discriminated by a
+.B kind
+field inside
+.IR payload.metadata :
+.IP
+.EX
+"metadata": {
+    "v":          1,
+    "kind":       "enroll" | "enroll_ok" | "enroll_err",
+    "client_pub": "<X25519 base64>",   // ENROLL only
+    "server_pub": "<X25519 base64>",   // ENROLL_OK / ENROLL_ERR only
+    "blob":       "<base64 secretbox>"
+}
+.EE
+.IP
+The
+.B blob
+is encrypted under a key derived as:
+.IP
+.EX
+shared     = X25519(local_priv, peer_pub)
+enroll_key = BLAKE2b-32(shared,    key="wg-peerjs/v1/enroll")
+final_key  = BLAKE2b-32(enroll_key, key=token)
+ciphertext = secretbox(plaintext, key=final_key)
+.EE
+.IP
+Domain separation guarantees: the enrollment key cannot collide with
+the signalling key (which uses
+.IR wg-peerjs/v1/sigbox )
+and re-keying with
+.B token
+binds each ciphertext to a specific single-use voucher.
+.\"
+.SS URI format
+The minted token is encoded as a
+.B wgrtc-enroll://v1?\&...
+URI suitable for embedding in a QR code:
+.IP
+.EX
+wgrtc-enroll://v1?
+    pk=<server_pubkey, b64url no padding>
+    &salt=<salt, b64url no padding>
+    &broker=<wss-url>
+    &brokerkey=<peerjs key>
+    &token=<32-byte token, b64url no padding>
+    &expires=<unix seconds>
+    &server=<NAME>
+.EE
+.\"
+.SS Operations
+.B Mint a token (admin):
+.IP
+.EX
+sudo wireguardrtc \-\-enroll\-token "Anna's Pixel 8"
+.EE
+.IP
+Prints the URI on stdout and a terminal QR code (when stdout is a
+TTY and
+.BR qrencode (1)
+is installed).  The daemon must be running for the token to be
+processed; the
+.B \-\-enroll\-token
+mode itself just persists the token to
+.I StateDir/pending-tokens.json
+and exits.
+.\"
+.PP
+.B Honour an enrollment request (server, automatic):
+The running daemon listens for
+.B ENROLL
+messages on its PeerJS connection.  On receipt:
+.IP 1. 4
+Try-decrypt the ciphertext against each unexpired token in
+.IR pending-tokens.json .
+.IP 2. 4
+Validate the inner timestamp is within ±90 s of current time.
+.IP 3. 4
+Atomically claim the token (compare-and-swap under
+.BR flock (2)).
+.IP 4. 4
+Invoke
+.B ProvisionScript
+with the new peer's
+.IR IFACE ,
+.IR NAME ,
+and base64-encoded public key.
+.IP 5. 4
+Read back the allocated address via
+.BR "wg show \fIIFACE\fR allowed-ips" .
+.IP 6. 4
+Build, encrypt, and send the
+.B ENROLL_OK
+response.  Cache it for 5 minutes for retry safety.
+.PP
+On any failure that the client should
+.B notice
+(token already consumed, provisioning script error), the daemon sends
+an authenticated
+.B ENROLL_ERR
+response carrying a machine-readable
+.B code
+field.  On any failure that should
+.B not
+leak token state (no decryption succeeded — could be wrong key,
+no such token, or expired token), the daemon silently drops the
+request and logs at
+.B WARNING
+level on its own side.
+.\"
+.\" -------------------------------------------------------------------------
+.SH LIVE KERNEL STATE
+.\"
+The daemon never parses WireGuard
+.I .conf
+files.  All peer and interface state is read from the running kernel
+via
+.B wg show
+subcommands:
+.RS
+.TP
+.B wg show interfaces
+Enumerate WireGuard interfaces.
+.TP
+.B wg show \fIiface\fR private-key
+Read private key (requires
+.BR CAP_NET_ADMIN ).
+.TP
+.B wg show \fIiface\fR public-key
+Read public key.
+.TP
+.B wg show \fIiface\fR listen-port
+Read the bound UDP port.
+.TP
+.B wg show \fIiface\fR latest-handshakes
+Get the last handshake time (Unix seconds) for each peer.
+.TP
+.B wg show \fIiface\fR endpoints
+Get the current kernel endpoint for each peer.
+.TP
+.B wg show \fIiface\fR allowed-ips
+Read the allowed-ip prefixes, used to select a wake target.
+.RE
+.PP
+The state is refreshed every
+.B POLL_INTERVAL
+seconds (30 s).
+.\"
+.\" -------------------------------------------------------------------------
+.SH SIGNALS
+.\"
+.TP
+.BR SIGTERM ", " SIGINT
+Initiates a clean shutdown: the PeerJS WebSocket is closed, all
+asyncio tasks are cancelled, and the process exits with status 0.
+.PP
+There is no
+.B SIGHUP
+reload; restart the daemon with
+.B systemctl restart wireguardrtc
+to pick up configuration changes.
+.\"
+.\" -------------------------------------------------------------------------
+.SH EXIT STATUS
+.\"
+.TP
+.B 0
+Clean shutdown (SIGTERM or SIGINT received).
+.TP
+.B 2
+Fatal configuration or capability error:
+missing or placeholder Salt;
+missing global configuration file;
+no usable WireGuard interface found;
+cannot create raw socket (missing
+.BR CAP_NET_RAW );
+cannot read WireGuard private key (missing
+.BR CAP_NET_ADMIN );
+another instance already holds the lock file;
+or a required Python package is not installed.
+.PP
+Exit status 2 is treated as a permanent failure by the systemd unit
+.RB ( RestartPreventExitStatus=2 );
+the service will not be restarted automatically until the
+administrator corrects the configuration and runs
+.BR "systemctl start wireguardrtc" .
+.\"
+.\" -------------------------------------------------------------------------
+.SH ENVIRONMENT
+.\"
+.TP
+.B WIREGUARDRTC_CONFIG_DIR
+Overrides the base directory for both the global config file and the
+peers directory.  Default:
+.IR /etc/wireguardrtc .
+Useful for testing without touching system files.
+.TP
+.B LOG_LEVEL
+Default log level, equivalent to
+.BR \-\-log\-level .
+Respected only when
+.B \-\-log\-level
+is not given on the command line.
+.TP
+.B PYTHONUNBUFFERED
+Set to
+.B 1
+by the systemd unit so that log lines are written to the journal
+immediately rather than being held in Python's stdio buffer.
+.\"
+.\" -------------------------------------------------------------------------
+.SH FILES
+.\"
+.TP
+.I /etc/wireguardrtc/wireguardrtc.conf
+Global daemon configuration.  Owned
+.BR root : wireguardrtc ,
+mode
+.BR 0640 .
+See
+.B CONFIGURATION FILES
+above.
+.TP
+.I /etc/wireguardrtc/peers.d/*.conf
+Per-peer drop-in files.  Same ownership and mode as the global
+config.  See
+.B CONFIGURATION FILES
+and
+.B PEER MODES
+above.
+.TP
+.I /var/lib/wireguardrtc/auto-enrolled.d/*.conf
+Auto-generated per-peer drop-ins, one per successfully-enrolled
+peer.  Format identical to
+.IR /etc/wireguardrtc/peers.d/*.conf ;
+default
+.B Mode = active
+so the daemon pushes signalling OFFERs to the new peer (Phase-2
+endpoint roaming on the Android client relies on this).  Disabled
+by setting
+.B [Enrollment] AutoActive = no
+in
+.IR wireguardrtc.conf .
+Admin entries in
+.I /etc/wireguardrtc/peers.d/
+override entries here on
+.B PublicKey
+collision.
+.TP
+.I /run/wireguardrtc/lock
+Single-instance lock file.  The daemon acquires an exclusive
+.BR flock (2)
+on this file at startup; subsequent instances exit immediately with
+an error.  The directory
+.I /run/wireguardrtc
+is created by the systemd
+.B RuntimeDirectory=wireguardrtc
+directive and removed when the service stops.
+.TP
+.I /usr/sbin/wireguardrtc
+The daemon executable.
+.TP
+.I /usr/sbin/wireguardrtc-key-oracle
+The privileged key-derivation oracle.  Holds WireGuard private keys
+and serves derive_sigbox/derive_enroll/set_endpoint requests over
+.IR /run/wireguardrtc/oracle.sock .
+Sole holder of
+.B CAP_NET_ADMIN
+on the host.
+.TP
+.I /usr/sbin/wireguardrtc-raw-helper
+The privileged raw-socket helper.  Sends the hole-punch inject and
+the WG-iface-bound wake-up datagram on validated inputs from the
+daemon, over
+.IR /run/wireguardrtc/raw.sock .
+Sole holder of
+.B CAP_NET_RAW
+on the host.
+.TP
+.I /usr/sbin/wireguardrtc-provision-client
+Daemon-side hook for the provisioning broker.  Default
+.B ProvisionScript
+in
+.IR wireguardrtc.conf ;
+runs in the daemon's sandbox and forwards the request to the broker
+over a Unix socket.
+.TP
+.I /usr/sbin/wireguardrtc-provision-broker
+Privileged side of the provisioning channel.  Reads one request from
+stdin, validates strictly, invokes the configured Provisioner, writes
+the result to stdout.  Not invoked directly by admins \(em started
+via socket activation by
+.IR wireguardrtc-provision-broker@.service .
+.TP
+.I /usr/sbin/wireguardrtc-provision-default
+Default Provisioner for stock
+.BR wg-quick (8)
+deployments.  Allocates from a CIDR pool and writes
+.B [Peer]
+blocks to
+.IR /etc/wireguard/IFACE.conf .
+Override in
+.IR /etc/wireguardrtc/provision-broker.conf .
+.TP
+.I /etc/wireguardrtc/provision-broker.conf
+Names the upstream Provisioner the broker invokes.  See the example
+under
+.IR /usr/share/doc/wireguardrtc/examples/ .
+.TP
+.I /etc/wireguardrtc/provisioning.conf
+Read by
+.B wireguardrtc-provision-default
+only.  Defines the CIDR pool for auto-allocated peer addresses.
+.TP
+.I /run/wireguardrtc-provision/sock
+Unix socket the daemon-side client writes provision requests to.
+Created by
+.IR wireguardrtc-provision-broker.socket
+on first request.
+.TP
+.IR /var/lib/wireguardrtc-provision-broker/permits/<urlsafe_token>
+Single-use permit dropped by
+.B wireguardrtc \-\-enroll\-token
+when an admin mints a token; consumed by the broker on first
+provisioning request that matches.  Mode
+.BR 0700 ,
+root-owned; the daemon process cannot write here, which is what gates
+provisioning to the actual mint→consumption window.
+.TP
+.I /lib/systemd/system/wireguardrtc.service
+systemd unit file for the daemon.
+.TP
+.I /lib/systemd/system/wireguardrtc-provision-broker.socket
+.TQ
+.I /lib/systemd/system/wireguardrtc-provision-broker@.service
+systemd socket and per-connection service template for the broker.
+Enable with
+.BR "systemctl enable --now wireguardrtc-provision-broker.socket"
+when auto-enrollment is in use.
+.TP
+.I /usr/share/man/man8/wireguardrtc.8.gz
+This manual page.
+.TP
+.I /usr/share/doc/wireguardrtc/examples/peers.d/
+Example per-peer drop-in files (active-peer.conf, passive-mobile.conf,
+dns-roam.conf).  Copy and edit as needed.
+.\"
+.\" -------------------------------------------------------------------------
+.SH SECURITY
+.\"
+.SS Privilege model
+The package ships three services with carefully partitioned
+capabilities.  The daemon process holds
+.B no
+capabilities at all; both
+.B CAP_NET_ADMIN
+and
+.B CAP_NET_RAW
+live in tiny sibling helpers that the daemon talks to over Unix
+sockets.
+.TP
+.B wireguardrtc.service
+The main daemon — receives PeerJS messages, decrypts OFFERs,
+dispatches enrollment, runs the polling loop.  Runs as the
+.B wireguardrtc
+user with
+.B no Linux capabilities .
+After RCE on the daemon a kernel-level privileged syscall is rejected
+outright; the daemon can only issue narrow RPCs to its helpers,
+each of which validates inputs.
+.TP
+.B wireguardrtc-key-oracle.service
+Holds the WireGuard private keys.  Runs as the
+.B wireguardrtc
+user with
+.B CAP_NET_ADMIN
+only.  Serves three RPCs over
+.IR /run/wireguardrtc/oracle.sock :
+.RS
+.IP \(bu 4
+.BR derive_sigbox " (\fIiface, peer_pub\fR) -> 32-byte signalling key"
+.IP \(bu 4
+.BR derive_enroll " (\fIiface, peer_pub, token\fR) -> 32-byte enrollment key"
+.IP \(bu 4
+.BR set_endpoint " (\fIiface, peer_pub, ip, port\fR) -> bool"
+\(em refuses to silently create new peers (peer must already be in
+.IR allowed-ips ),
+refuses loopback / link-local / multicast / reserved IPs, refuses
+ports outside 1..65535
+.RE
+.IP
+The raw 32-byte private key never leaves this process, so an RCE on
+the daemon cannot lift it for use against the host's WireGuard mesh
+identity.
+.TP
+.B wireguardrtc-raw-helper.service
+Holds
+.B CAP_NET_RAW
+for the spoofy operations the protocol needs.  Runs as the
+.B wireguardrtc
+user.  Serves two RPCs over
+.IR /run/wireguardrtc/raw.sock :
+.RS
+.IP \(bu 4
+.BR inject " (\fIiface, src_port, dst_ip, dst_port\fR) -> bool"
+\(em sends the 3-packet hole-punch burst with spoofed source port.
+Refuses if
+.I src_port
+doesn't match the iface's actual listen-port from
+.BR "wg show" ,
+or if
+.I dst_ip
+fails the same loopback/link-local/multicast/reserved check the
+daemon used to apply.
+.IP \(bu 4
+.BR wake " (\fIiface, target_ip\fR) -> bool"
+\(em sends one zero-byte UDP via
+.B SO_BINDTODEVICE
+on the WG iface so kernel WG triggers a handshake.  Permits
+RFC 5737 documentation IPs because
+.I target_ip
+is consumed by kernel WG (which encrypts before egress) and has no
+exfiltration potential.
+.RE
+.IP
+After RCE on the daemon an attacker can ask this helper to inject
+spoofed packets, but only to publicly-routable IPs and only with the
+host's own WireGuard listen-port as source.
+.TP
+.B wireguardrtc-key-oracle.service
+The privileged key-derivation oracle.  Reads private keys from the
+kernel via
+.BR "wg show \fIiface\fR private-key" ,
+holds them in memory, and serves a small JSON-RPC interface
+.RB ( derive_sigbox ,
+.BR derive_enroll ,
+.BR set_endpoint )
+over a Unix socket at
+.IR /run/wireguardrtc/oracle.sock
+to the daemon.  Runs as the same
+.B wireguardrtc
+user with:
+.RS
+.IP \(bu 4
+.B CAP_NET_ADMIN
+\(em sole purpose: read private keys and call
+.BR "wg set" .
+.RE
+.IP
+The oracle never opens an internet socket, never reads
+.IR /etc ,
+and is heavily seccomp-filtered (same
+.B @system-service
+profile as the daemon, but without
+.BR @debug ).
+The daemon process therefore cannot
+.BR ptrace (2)
+the oracle to lift keys out of its address space, even though both
+processes run as the same user.
+.PP
+The recommended deployment uses the static system user
+.B wireguardrtc
+(created by the Debian package's
+.B postinst
+script) and grants only the two required capabilities via
+.BR AmbientCapabilities .
+The configuration directory
+.I /etc/wireguardrtc
+is owned
+.BR root : wireguardrtc
+with mode
+.B 0750
+so that the daemon user can read it but unprivileged users cannot
+access the salt (which is sensitive: it determines the routing
+identity on the shared signalling broker).
+.SS Signalling security
+The PeerJS broker is treated as an untrusted relay.
+All endpoint information is encrypted with
+.B SecretBox
+before transmission; the broker cannot learn the IP address or port
+of any peer, and cannot forge or replay endpoint updates (the freshness
+window is \(+-90 seconds).
+.PP
+Two different installations that share the same WireGuard key pair but
+use different salts are cryptographically isolated on the broker: their
+routing IDs will not collide, and their payloads are encrypted under
+different derived keys.
+.SS Endpoint acceptance
+Received endpoints are validated to reject loopback, link-local,
+multicast, unspecified, and reserved addresses before being applied
+to the kernel.  This limits the impact of a key compromise: a
+compromised peer cannot redirect WireGuard handshakes to
+infrastructure services such as cloud metadata endpoints.
+.SS Auto-enrollment privilege separation
+The daemon is the only component directly exposed to internet traffic
+(via the PeerJS WebSocket and the kernel WireGuard endpoint), so its
+RCE blast radius is the dominant attack-surface concern.  Auto-enroll
+provisioning would otherwise let a compromised daemon write arbitrary
+.B [Peer]
+blocks into
+.IR /etc/wireguard/ ,
+persisting backdoor peers across daemon restarts.  The package
+mitigates this with a privilege-separated broker
+.B and
+a per-mint permit so the broker only accepts requests when an
+auto-enrollment is actively in progress:
+.IP \(bu 4
+The daemon's
+.B ProvisionScript
+points at
+.IR /usr/sbin/wireguardrtc-provision-client ,
+a small wrapper that runs inside the daemon's sandbox and never
+touches
+.IR /etc/wireguard .
+.IP \(bu 4
+The client connects to
+.IR /run/wireguardrtc-provision/sock ,
+a Unix socket created by
+.B wireguardrtc-provision-broker.socket
+(mode 0660, group
+.BR wireguardrtc ).
+.IP \(bu 4
+.B wireguardrtc-provision-broker@.service
+is socket-activated, runs as root with
+.B CAP_NET_ADMIN
+only (other root capabilities dropped via
+.BR CapabilityBoundingSet ),
+and is reinstantiated per request.  It strictly validates the
+.IR (iface, name, pubkey, token)
+tuple it receives \(em
+.I iface
+must match
+.IR ^wg[0-9]+(p[0-9]+)?$ ,
+.I name
+must match
+.IR [\\w\ .'\-]{1,64}
+(Unicode letters/digits/underscore plus space, dot, apostrophe,
+hyphen \(em deliberately permissive enough for "Anna's Pixel 8" and
+similar real-world names),
+.I pubkey
+must be 44-char standard base64 decoding to exactly 32 bytes,
+.I token
+must be 43-char URL-safe base64 decoding to exactly 32 bytes \(em then
+invokes the configured Provisioner (default
+.IR /usr/sbin/wireguardrtc-provision-default ;
+override in
+.IR /etc/wireguardrtc/provision-broker.conf ).
+.IP \(bu 4
+.B Permit gating.
+For every minted token,
+.B wireguardrtc \-\-enroll\-token
+also drops a single-use permit file in
+.IR /var/lib/wireguardrtc-provision-broker/permits/<urlsafe_token> ,
+in a directory the daemon process cannot write to (mode
+.BR 0700 ,
+root-owned).  The broker requires a matching permit to be present
+before invoking the Provisioner; the permit is unlinked before
+provisioning runs (single-use enforced even if the Provisioner
+fails).  Effect: outside the window between mint and consumption,
+broker requests are flatly refused \(em a daemon RCE cannot synthesize
+a permit because it has no write access to the directory, and cannot
+provision peers at all without a corresponding admin-issued mint.
+.IP \(bu 4
+After RCE on the daemon an attacker can attempt to hijack an
+in-flight enrollment by racing the legitimate broker call with their
+own pubkey under the same name, but they cannot provision out of band,
+cannot read existing configuration, cannot modify peers other than via
+the validated path, and cannot gain shell access.  The legitimate
+client whose token was hijacked receives an authenticated
+.B TOKEN_USED
+response, so the failure is user-noticeable per
+.B "Threat model"
+above.  The broker's request shape is the entire RPC surface.
+.PP
+This is the same privsep pattern OpenSSH uses to keep the
+network-facing
+.B sshd
+process from holding the host private key directly.  The companion
+.BR wireguardrtc-key-oracle.service
+applies the same pattern to the WireGuard private keys themselves
+(see
+.B Privilege model
+above).
+.SS Limitations
+.IP \(bu 4
+.B Symmetric NAT is not supported.
+Only cone-NAT topologies (full-cone, address-restricted,
+port-restricted) are traversable.  Symmetric NAT requires port
+prediction, which the daemon does not implement.
+.IP \(bu 4
+.B IPv6 hole-punching is not implemented.
+The raw injection path constructs an IPv4 header only.  Endpoint
+discovery and publication over IPv6 is on the project roadmap but
+not yet implemented.
+.IP \(bu 4
+.B Single interface limitation.
+The daemon currently registers a single PeerJS routing ID keyed to one
+WireGuard interface.  Peers configured on other WireGuard interfaces
+on the same host will not be reachable via PeerJS until multi-interface
+support is added.
+.\"
+.\" -------------------------------------------------------------------------
+.SH TIMING CONSTANTS
+.\"
+The following timing constants are compiled into the daemon.  They are
+not configurable without editing the source.
+.PP
+.TS
+l l lx.
+Constant	Value	Purpose
+_
+POLL_INTERVAL	30 s	T{
+Interval between poll cycles
+T}
+HANDSHAKE_DEAD_THRESHOLD	180 s	T{
+Tunnel considered dead after this
+T}
+SIGNALING_BACKOFF	300 s	T{
+Minimum time between OFFERs per peer
+T}
+PEERJS_HEARTBEAT	5 s	T{
+WebSocket HEARTBEAT cadence
+T}
+STUN_TIMEOUT	2.5 s	T{
+Per-server STUN query timeout
+T}
+RAW_INJECT_REPEATS	3	T{
+Raw-inject burst count
+T}
+RAW_INJECT_GAP	50 ms	T{
+Delay between burst packets
+T}
+PROTOCOL_FRESHNESS_WINDOW	90 s	T{
+Replay protection window (\(+-)
+T}
+.TE
+.\"
+.\" -------------------------------------------------------------------------
+.SH DIAGNOSTICS
+.\"
+The daemon logs to standard output / the journal.  Anti-spam filtering
+is applied via the internal
+.B StateLogger:
+each
+.IR "(scope, key, value)"
+triple is logged only once per value transition.  This means a
+persistently-dead tunnel generates one log line when it enters the
+dead state, not one line every 30 seconds.
+.PP
+Useful diagnostic commands:
+.PP
+.EX
+# Follow the live log under systemd
+journalctl \-fu wireguardrtc
+
+# Verify WireGuard handshakes are occurring
+wg show wg0 latest\-handshakes
+
+# Confirm raw-injected packets reach the wire
+tcpdump \-i any udp port 51820
+
+# Check capability grant
+systemctl show wireguardrtc \-p AmbientCapabilities
+
+# Check effective config directory
+systemctl show wireguardrtc \-p Environment
+.EE
+.PP
+Common warnings and their meaning:
+.TP
+.B "OFFER from \fIlabel\fR: decryption/freshness failed"
+The OFFER arrived but could not be decrypted or its timestamp was
+outside the freshness window.  Possible causes: clock skew >90 s
+between peers, mismatched WireGuard keys, or a replayed OFFER.
+.TP
+.B "rejected suspicious peer endpoint \fIip\fR:\fIport\fR"
+The decrypted payload contained a loopback, link-local, multicast, or
+otherwise disallowed address.
+.TP
+.B "cannot create raw socket \(em daemon needs CAP_NET_RAW"
+The daemon is running without
+.BR CAP_NET_RAW .
+Enable it with
+.B AmbientCapabilities=CAP_NET_RAW
+in the systemd unit, or run as root.
+.TP
+.B "non-IGNORE peers configured on multiple interfaces"
+Peers on more than one WireGuard interface are configured.  Only the
+primary interface's peers can be reached via PeerJS.  See
+.BR BUGS .
+.TP
+.B "\fIlabel\fR: PublicKey \fIXXX\fR not present on any WireGuard interface"
+A drop-in file references a public key that is not present in the live
+kernel state.  Check for typos or ensure the WireGuard interface is up.
+.\"
+.\" -------------------------------------------------------------------------
+.SH EXAMPLES
+.\"
+.SS Basic setup (two hosts)
+.PP
+On
+.B both
+hosts, generate a shared salt (use the exact same value everywhere):
+.PP
+.EX
+head \-c 32 /dev/urandom | base64
+.EE
+.PP
+Add it to
+.I /etc/wireguardrtc/wireguardrtc.conf
+on both hosts:
+.PP
+.EX
+[Global]
+Salt = <paste\-your\-shared\-salt\-here>
+.EE
+.PP
+On the host that should actively maintain the tunnel, create
+.IR /etc/wireguardrtc/peers.d/laptop-anna.conf :
+.PP
+.EX
+[Peer]
+PublicKey = <base64\-public\-key\-of\-anna>
+Mode = active
+.EE
+.PP
+On Anna's laptop (passive end), create
+.IR /etc/wireguardrtc/peers.d/office\-server.conf :
+.PP
+.EX
+[Peer]
+PublicKey = <base64\-public\-key\-of\-server>
+Mode = passive
+.EE
+.PP
+Restart the daemon on both hosts after editing any configuration file:
+.PP
+.EX
+systemctl restart wireguardrtc
+.EE
+.\"
+.SS DNS roaming
+.PP
+For a home server behind a DDNS hostname, no broker involvement is
+needed.  Create
+.IR /etc/wireguardrtc/peers.d/home\-server.conf :
+.PP
+.EX
+[Peer]
+PublicKey = <base64\-public\-key\-of\-home\-server>
+Mode = dns-roam
+DnsHost = home.example.com:51820
+.EE
+.PP
+The daemon will resolve
+.I home.example.com
+every 30 seconds and update the WireGuard endpoint when the IP
+changes.
+.\"
+.SS Private broker
+.PP
+For deployments that want to avoid the public broker:
+.PP
+.EX
+# On a host with Docker:
+docker run \-d \-\-name peerjs \-\-restart=always \-p 9000:9000 \\
+    peerjs/peerjs\-server \-\-port 9000 \-\-key mysecretkey
+.EE
+.PP
+Then in
+.IR /etc/wireguardrtc/wireguardrtc.conf :
+.PP
+.EX
+[Global]
+PeerJsServer = ws://broker.example.com:9000/peerjs
+PeerJsKey = mysecretkey
+.EE
+.\"
+.SS Testing without system paths
+.PP
+.EX
+export WIREGUARDRTC_CONFIG_DIR=$HOME/wg\-test
+sudo wireguardrtc \-\-log\-level DEBUG
+.EE
+.\"
+.\" -------------------------------------------------------------------------
+.SH SEE ALSO
+.\"
+.BR wg (8),
+.BR wg\-quick (8),
+.BR systemd.unit (5),
+.BR systemd.exec (5),
+.BR capabilities (7),
+.BR raw (7),
+.BR ip (7)
+.PP
+Project design documentation:
+.I /usr/share/doc/wireguardrtc/wg-holepunch-guide.md
+.PP
+PeerJS project:
+.I https://peerjs.com/
+.PP
+RFC 5389 \(em Session Traversal Utilities for NAT (STUN).
+.br
+RFC 5737 \(em IPv4 Address Blocks Reserved for Documentation.
+.\"
+.\" -------------------------------------------------------------------------
+.SH BUGS
+.\"
+.IP \(bu 4
+Only one WireGuard interface is served by a single daemon process.
+Peers on secondary interfaces will not receive PeerJS-based
+hole-punching.
+.IP \(bu 4
+IPv6 NAT traversal is not implemented.
+.IP \(bu 4
+There is no SIGHUP reload; the daemon must be restarted to pick up
+changes to configuration files.
+.IP \(bu 4
+STUN results are not cached between poll cycles; each outbound OFFER
+triggers a fresh STUN query.
+.IP \(bu 4
+Symmetric-NAT topologies are mathematically unsupported by the
+hole-punching model used here; no workaround exists within this
+design.
+.\"
+.\" -------------------------------------------------------------------------
+.SH AUTHORS
+.\"
+Markus Gutschke.
+.\" end of wireguardrtc.8

@@ -1,0 +1,266 @@
+#!/bin/bash
+# wireguardrtc-provision-broker — privileged side of the auto-enrollment
+# provisioning channel.  Runs as root via socket-activated systemd unit;
+# accepts a single JSON request on stdin from the (sandboxed) daemon's
+# wireguardrtc-provision-client, validates it, then invokes the
+# upstream Provisioner script with the same arguments the daemon would
+# have passed directly under the old contract:
+#
+#     ${Provisioner} IFACE NAME PUBKEY_BASE64
+#
+# Why this exists
+# ---------------
+# The daemon runs under heavy systemd sandboxing (ProtectSystem=strict,
+# NoNewPrivileges=yes, RestrictSUIDSGID=yes, ReadOnlyPaths=/etc/wireguardrtc,
+# capabilities limited to CAP_NET_ADMIN+CAP_NET_RAW).  That sandbox
+# correctly forbids the daemon from writing to /etc/wireguard or
+# escalating via setuid — both of which are required by every realistic
+# Provisioner script (whether the bundled wireguardrtc-provision-default
+# or any site-specific add-peer script family).  Rather than relax the daemon
+# sandbox, the daemon talks to *this* tiny privileged broker over a
+# Unix socket: a single, narrow RPC interface that we can review in
+# isolation, rather than letting an RCE on the network-facing daemon
+# inherit fork-exec-anywhere semantics.
+#
+# Wire format
+# -----------
+# Request (one line of JSON on stdin):
+#     {"iface": "wg0", "name": "alice-laptop", "pubkey": "<44 chars b64>"}
+#
+# Response (one line of JSON on stdout):
+#     {"status": "ok|reject|error",
+#      "exit_code": <int>,
+#      "stderr": "<last 512 bytes of provisioner stderr, for diagnostics>"}
+#
+# stderr from THIS broker (validation failures, missing config) is
+# routed to the journal via systemd, never to the requester, to avoid
+# leaking validation timing or internal state to a compromised client.
+
+set -uo pipefail
+
+CONF="${WIREGUARDRTC_PROVISION_BROKER_CONF:-/etc/wireguardrtc/provision-broker.conf}"
+PEER_CRED="${PEERCRED:-}"  # systemd Accept=yes sets this; checked optionally
+
+# Print a JSON response on stdout (consumed by the caller through the
+# socket) and exit; status 0 lets the per-connection systemd unit recycle
+# cleanly even on validation failures.
+emit() {
+    # $1 status, $2 exit_code, $3 stderr
+    python3 -c '
+import json, sys
+print(json.dumps({"status": sys.argv[1],
+                  "exit_code": int(sys.argv[2]),
+                  "stderr": sys.argv[3][-512:]}))
+' "$1" "$2" "$3"
+    exit 0
+}
+
+# Locate the upstream provisioner.  Default matches the bundled helper
+# for stock wg-quick deployments; admins running custom tooling
+# (Ansible, the add-peer family) override Provisioner here.
+provisioner=/usr/sbin/wireguardrtc-provision-default
+if [ -r "$CONF" ]; then
+    while IFS='=' read -r k v; do
+        case "$k" in
+            *Provisioner*|provisioner) v="${v# }"; v="${v% }"; provisioner="$v";;
+        esac
+    done < <(grep -E '^[[:space:]]*[Pp]rovisioner[[:space:]]*=' "$CONF")
+fi
+if ! [ -x "$provisioner" ]; then
+    >&2 echo "[broker] provisioner $provisioner is not executable; check $CONF"
+    emit error 127 "provisioner-not-executable"
+fi
+
+# Read one line of JSON.  Newline-terminated by contract (the client
+# always sends one).  -t 5 catches stuck clients; -r preserves
+# backslashes verbatim.
+read -r -t 5 line || emit reject 1 "no-request-or-timeout"
+[ -n "$line" ] || emit reject 1 "empty-request"
+[ "${#line}" -le 4096 ] || emit reject 1 "request-too-large"
+
+# Parse + validate strictly.  All checks performed in Python because
+# bash + jq is fragile around base64 padding and non-printable bytes.
+#
+# Name policy: peer names may contain Unicode letters/digits, spaces,
+# and the punctuation [.'_-] — same set the existing wg0.peers
+# tooling has accepted for years (e.g. "Anna's Pixel 8").  We do NOT
+# allow shell metacharacters, the CSV separator, or path components,
+# even though the daemon's first-line validator is a bit looser:
+# the broker is the gate that actually invokes the Provisioner so
+# defense in depth wins here.
+parsed=$(python3 - <<'PY' "$line"
+import base64, json, re, sys
+try:
+    req = json.loads(sys.argv[1])
+except Exception:
+    print("reject:bad-json"); sys.exit(0)
+if not isinstance(req, dict):
+    print("reject:not-object"); sys.exit(0)
+ifc, name, pub, tok = (
+    req.get("iface"), req.get("name"), req.get("pubkey"), req.get("token"))
+for k, v in (("iface", ifc), ("name", name), ("pubkey", pub), ("token", tok)):
+    if not isinstance(v, str):
+        print(f"reject:{k}-not-string"); sys.exit(0)
+# IFACE: wg followed by digits, optional pX suffix.  Matches kernel
+# WireGuard naming plus the auxiliary-tunnel convention used by the
+# more elaborate site-specific add-peer script families.
+if not re.fullmatch(r"wg[0-9]+(p[0-9]+)?", ifc):
+    print("reject:bad-iface"); sys.exit(0)
+# NAME: Unicode word chars (letters, digits, _) plus space, dot,
+# apostrophe, hyphen.  1..64 codepoints.  Refuses control chars,
+# CSV separator, slashes, and shell metas.
+if not re.fullmatch(r"[\w .'\-]{1,64}", name, re.UNICODE):
+    print("reject:bad-name-chars"); sys.exit(0)
+# PUBKEY: standard base64, 44 chars, decodes to exactly 32 bytes.
+if len(pub) != 44 or not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pub):
+    print("reject:bad-pubkey-shape"); sys.exit(0)
+try:
+    raw = base64.b64decode(pub, validate=True)
+except Exception:
+    print("reject:bad-pubkey-b64"); sys.exit(0)
+if len(raw) != 32:
+    print("reject:bad-pubkey-len"); sys.exit(0)
+# TOKEN: URL-safe base64 (no padding), decodes to exactly 32 bytes.
+# This is the short token the admin saw in the wgrtc-enroll://
+# URI; the broker uses it to look up an active permit.
+if not re.fullmatch(r"[A-Za-z0-9_\-]{43}", tok):
+    print("reject:bad-token-shape"); sys.exit(0)
+try:
+    raw = base64.urlsafe_b64decode(tok + "=")
+except Exception:
+    print("reject:bad-token-b64"); sys.exit(0)
+if len(raw) != 32:
+    print("reject:bad-token-len"); sys.exit(0)
+# Encode name with a base64 wrapper so we can transport it through bash
+# without any worry about tabs/spaces/non-ASCII in the inner-shell IFS.
+name_b64 = base64.b64encode(name.encode("utf-8")).decode()
+print(f"ok\t{ifc}\t{name_b64}\t{pub}\t{tok}")
+PY
+)
+
+case "$parsed" in
+    ok*)
+        IFS=$'\t' read -r _ ifc name_b64 pub tok <<<"$parsed"
+        # Decode the name out of base64 so we can hand it to the
+        # provisioner verbatim.  base64 -d is part of coreutils on every
+        # Debian host this targets.
+        name=$(printf '%s' "$name_b64" | base64 -d 2>/dev/null) \
+            || emit error 1 "name-decode"
+        ;;
+    reject:*)
+        emit reject 1 "${parsed#reject:}"
+        ;;
+    *)
+        emit error 1 "validator-internal-error"
+        ;;
+esac
+
+# Defensive: refuse requests for interfaces that aren't actually present
+# right now.  An attacker who somehow reached this broker could otherwise
+# request provisioning for a future interface name.
+if ! ip link show "$ifc" >/dev/null 2>&1; then
+    emit reject 1 "iface-not-present"
+fi
+
+# Active-enrollment gate.  Every legitimate provisioning request
+# corresponds to a single-use "permit" file dropped by
+# `wireguardrtc --enroll-token` at mint time, in a directory the
+# daemon itself cannot write to (mode 0700, root:root).  If no permit
+# exists for this token, no admin has authorised an enrollment under
+# this name — refuse, even if every other field validates.  This
+# narrows the attack surface available to a daemon RCE: between mint
+# and consumption the attacker can attempt to hijack an in-flight
+# enrollment, but outside that window provisioning calls are flatly
+# rejected.
+permits_dir="${WIREGUARDRTC_PROVISION_PERMITS_DIR:-/var/lib/wireguardrtc-provision-broker/permits}"
+permit_file="$permits_dir/$tok"
+if [ ! -d "$permits_dir" ]; then
+    >&2 echo "[broker] permits dir $permits_dir missing; auto-enroll disabled"
+    emit error 1 "permits-dir-missing"
+fi
+
+# Opportunistic cleanup of expired permits.  The broker is the only
+# daemon-accessible writer of this dir (mint via `--enroll-token` is
+# the only other writer, and runs ad-hoc as root via sudo) so this is
+# the natural place to do it — periodic cleanup units would just be
+# more machinery.  Bounded scan: max 256 files per call so a flood
+# of stale permits can't blow the per-request budget.
+#
+# We deliberately skip the file matching THIS request's token so the
+# request-specific check below can return a precise reason
+# (permit-expired / permit-name-mismatch) instead of the generic
+# no-active-permit it would emit if we'd already removed the file.
+python3 - "$permits_dir" "$tok" <<'PY' >&2 2>/dev/null
+import json, os, sys, time
+d, this_tok = sys.argv[1], sys.argv[2]
+now = int(time.time())
+try:
+    names = os.listdir(d)
+except OSError:
+    sys.exit(0)
+removed = 0
+for n in names[:256]:
+    if n == this_tok:
+        continue
+    p = os.path.join(d, n)
+    try:
+        with open(p) as f:
+            m = json.load(f)
+    except Exception:
+        # Malformed permit — drop it.
+        try: os.unlink(p)
+        except FileNotFoundError: pass
+        removed += 1
+        continue
+    if not isinstance(m, dict) or not isinstance(m.get("expires_at"), int):
+        try: os.unlink(p)
+        except FileNotFoundError: pass
+        removed += 1
+        continue
+    if m["expires_at"] <= now:
+        try: os.unlink(p)
+        except FileNotFoundError: pass
+        removed += 1
+if removed:
+    sys.stderr.write(f"[broker] purged {removed} expired/malformed permits\n")
+PY
+
+if [ ! -f "$permit_file" ]; then
+    emit reject 1 "no-active-permit"
+fi
+permit_check=$(python3 - "$permit_file" "$name" <<'PY'
+import json, sys, time
+permit_path, expected_name = sys.argv[1], sys.argv[2]
+try:
+    with open(permit_path) as f:
+        meta = json.load(f)
+except Exception:
+    print("reject:permit-unreadable"); sys.exit(0)
+if not isinstance(meta, dict):
+    print("reject:permit-malformed"); sys.exit(0)
+if meta.get("name_hint") != expected_name:
+    print("reject:permit-name-mismatch"); sys.exit(0)
+if not isinstance(meta.get("expires_at"), int) or meta["expires_at"] <= time.time():
+    print("reject:permit-expired"); sys.exit(0)
+print("ok")
+PY
+)
+[ "$permit_check" = "ok" ] || emit reject 1 "${permit_check#reject:}"
+
+# Single-use enforcement.  We unlink the permit BEFORE invoking the
+# provisioner so an attacker who somehow re-races the broker after a
+# legitimate enrollment finds the permit already gone.  If the
+# provisioner then fails, the permit is not regenerated; admin re-mints.
+rm -f "$permit_file"
+
+# Invoke the upstream provisioner.  The provisioner runs as root because
+# this service does; we capture its stderr for diagnostics but only ship
+# the tail (512 bytes) back to the daemon to limit what the broker
+# tells a (potentially compromised) caller.
+err=$("$provisioner" "$ifc" "$name" "$pub" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    emit ok 0 ""
+else
+    emit error "$rc" "$err"
+fi

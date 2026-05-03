@@ -1,0 +1,72 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create the wireguardrtc system user and group if absent.
+        if ! getent group wireguardrtc > /dev/null 2>&1; then
+            addgroup --system wireguardrtc
+        fi
+        if ! getent passwd wireguardrtc > /dev/null 2>&1; then
+            adduser --system \
+                    --ingroup wireguardrtc \
+                    --no-create-home \
+                    --home /nonexistent \
+                    --shell /usr/sbin/nologin \
+                    --gecos "WireGuard RTC daemon" \
+                    wireguardrtc
+        fi
+
+        # Lock down the config directory: readable by root and the daemon
+        # user only. The Salt value determines the daemon's routing identity
+        # on the shared signalling broker and must not be world-readable.
+        chown root:wireguardrtc /etc/wireguardrtc
+        chmod 0750 /etc/wireguardrtc
+
+        chown root:wireguardrtc /etc/wireguardrtc/peers.d
+        chmod 0750 /etc/wireguardrtc/peers.d
+
+        # Protect the main config file that dpkg just installed.
+        if [ -f /etc/wireguardrtc/wireguardrtc.conf ]; then
+            chown root:wireguardrtc /etc/wireguardrtc/wireguardrtc.conf
+            chmod 0640 /etc/wireguardrtc/wireguardrtc.conf
+        fi
+
+        # Pre-create /run/wireguardrtc/ for upgrades from older
+        # versions where the daemon ran with caps and could create the
+        # dir itself.  After the privsep refactor the daemon has no
+        # capabilities and relies on systemd's RuntimeDirectory= to
+        # set this up — but if the user starts wireguardrtc.service
+        # before `daemon-reload` picks up the new unit, the daemon
+        # will fail with EACCES on mkdir.  Belt and suspenders.
+        install -d -m 0750 -o wireguardrtc -g wireguardrtc /run/wireguardrtc
+
+        # Provisioning broker's permit directory.  Created here (rather
+        # than at first broker activation) because the admin-invoked
+        # `wireguardrtc --enroll-token` mint flow ALSO writes here; both
+        # broker and CLI run as root via sudo, but the dir must already
+        # exist when the first mint happens or the permit silently
+        # doesn't get created and downstream broker calls reject.
+        # Mode 0700 root:root: the daemon (running as `wireguardrtc`)
+        # cannot read or write this dir, which is the entire point.
+        install -d -m 0700 -o root -g root \
+            /var/lib/wireguardrtc-provision-broker
+        install -d -m 0700 -o root -g root \
+            /var/lib/wireguardrtc-provision-broker/permits
+
+        # (Re)build the Python venv with pinned runtime dependencies.
+        # Wipe any previous venv first so stale wheels from failed prior runs
+        # do not survive across package upgrades.
+        # Requires an internet connection; see /usr/lib/wireguardrtc/requirements.txt.
+        VENV=/var/lib/wireguardrtc/venv
+        rm -rf "$VENV"
+        python3 -m venv "$VENV"
+        "$VENV/bin/pip" install --quiet --no-cache-dir \
+            -r /usr/lib/wireguardrtc/requirements.txt
+        chown -R wireguardrtc:wireguardrtc /var/lib/wireguardrtc
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

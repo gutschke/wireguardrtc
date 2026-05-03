@@ -1,0 +1,27 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Debian package build artifacts
+debian/wireguardrtc/
+debian/files
+debian/debhelper-build-stamp
+debian/*.debhelper.log
+debian/*.substvars
+debian/.debhelper/
+debian/*.debhelper
+
+# Built packages (land in parent directory by default)
+../*.deb
+../*.buildinfo
+../*.changes
+
+# Documentation build outputs (generated from .md source)
+wg-holepunch-guide.html
+wg-holepunch-guide.pdf
+
+# Test deps (PeerJS broker for fabric tests).  Re-create with:
+#   cd tests && npm install peer
+tests/node_modules/

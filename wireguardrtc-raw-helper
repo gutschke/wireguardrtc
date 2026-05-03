@@ -1,0 +1,322 @@
+#!/var/lib/wireguardrtc/venv/bin/python3
+# wireguardrtc-raw-helper — privileged side of the daemon's raw-socket
+#
+# Shebang points at the venv the .deb's postinst builds, for
+# consistency with the daemon and the key-oracle.  This script itself
+# only uses the stdlib (no nacl) so /usr/bin/python3 would technically
+# work — but using the venv keeps Python version, library paths, and
+# any future dependency uniformly aligned across all three privsep
+# components.
+# privilege separation.
+#
+# Why this exists
+# ---------------
+# After the key-oracle privsep, the daemon's only remaining capability
+# was CAP_NET_RAW, used for two narrow operations:
+#
+#   1. The hole-punch burst: 3 empty UDP datagrams crafted with a
+#      spoofed source port (the host's WireGuard listen-port) to
+#      create a NAT pinhole.  Needs SOCK_RAW + IP_HDRINCL.
+#
+#   2. The wake-up: one zero-byte UDP datagram sent through the WG
+#      interface via SO_BINDTODEVICE so the kernel WireGuard module
+#      sees outbound traffic on that peer and initiates a handshake.
+#      SO_BINDTODEVICE on AF_INET sockets requires CAP_NET_RAW (or
+#      CAP_NET_BIND_SERVICE on newer kernels — we keep the older
+#      requirement for compatibility).
+#
+# Both operations are spoofy-by-nature.  An RCE on the network-facing
+# daemon armed with CAP_NET_RAW could fire arbitrary spoofed packets
+# at any internet host.  This helper takes the cap, narrows the
+# semantics to exactly what the protocol needs, and validates each
+# call.  After this refactor the daemon process holds NO capabilities.
+#
+# Wire format
+# -----------
+# Newline-terminated JSON request, newline-terminated JSON response.
+#
+# Requests:
+#   {"op": "inject", "iface": "wg0", "src_port": 51820, "dst_ip": "X.X.X.X", "dst_port": 51820}
+#   {"op": "wake",   "iface": "wg0", "target_ip": "10.99.0.2"}
+#
+# Successful response:
+#   {"ok": true}
+# Failure response:
+#   {"ok": false, "error": "<short stable token>"}
+#
+# Validation
+# ----------
+# inject:
+#   * iface matches ^wg[0-9]+(p[0-9]+)?$ AND is currently present
+#   * src_port matches the iface's actual listen-port from `wg show`
+#     (so the daemon can't have us inject from an arbitrary port even
+#      if the iface is real)
+#   * dst_ip passes is_valid_public_endpoint (no loopback / link-local
+#     / multicast / unspecified / reserved) — same predicate the
+#     daemon would apply at signal-decrypt time
+#   * dst_port in 1..65535
+#
+# wake:
+#   * iface matches ^wg[0-9]+(p[0-9]+)?$ AND is currently present
+#   * target_ip parses as IPv4 (we permit RFC 5737 documentation
+#     ranges and CGN here because pick_wake_target() in the daemon
+#     legitimately uses 192.0.2.1 as a /0 catchall wake address; the
+#     packet is encrypted by kernel WG before leaving the host so
+#     the destination has no security impact).
+
+import errno
+import ipaddress
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+INJECT_REPEATS = 3
+INJECT_GAP = 0.05
+WAKE_DISCARD_PORT = 9
+
+IFACE_RE = re.compile(r"\Awg[0-9]+(p[0-9]+)?\Z")
+
+
+def wg_show(iface: str, field: str) -> str:
+    try:
+        res = subprocess.run(
+            ["wg", "show", iface, field],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def listen_port_for_iface(iface: str) -> int:
+    """Return iface's listen-port from the kernel, or 0 on error.  No
+    CAP_NET_ADMIN needed: listen-port is unprivileged on `wg show`."""
+    s = wg_show(iface, "listen-port")
+    if not s:
+        return 0
+    try:
+        v = int(s)
+    except ValueError:
+        return 0
+    return v if 1 <= v <= 65535 else 0
+
+
+def iface_present(iface: str) -> bool:
+    """Return True iff `iface` exists in the current network namespace.
+    Uses `ip link show <iface>` because /sys/class/net isn't always
+    populated for the calling task's netns (notably inside the
+    sandbox tests' unshare); `ip` goes through rtnetlink which is."""
+    try:
+        res = subprocess.run(
+            ["ip", "-o", "link", "show", iface],
+            capture_output=True, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return res.returncode == 0
+
+
+def is_valid_public_endpoint(ip: str, port: int) -> bool:
+    """Match the daemon's predicate: reject loopback, link-local,
+    multicast, unspecified, reserved.  Same function elsewhere in the
+    package for defense-in-depth — duplicated here so the helper's
+    check stands on its own."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if (addr.is_loopback or addr.is_multicast or addr.is_link_local
+            or addr.is_unspecified or addr.is_reserved):
+        return False
+    if not (1 <= port <= 65535):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Operations.
+
+def build_raw_udp_packet(src_port: int, dst_ip: str, dst_port: int) -> bytes:
+    ip_hdr = struct.pack(
+        "!BBHHHBBH4s4s",
+        (4 << 4) | 5,                # version=4 IHL=5
+        0,
+        20 + 8,                       # total length (no payload)
+        0, 0,
+        64,
+        socket.IPPROTO_UDP,
+        0,
+        b"\x00\x00\x00\x00",          # src IP filled by kernel
+        socket.inet_aton(dst_ip),
+    )
+    udp_hdr = struct.pack(
+        "!HHHH",
+        src_port, dst_port,
+        8,                            # length: 8-byte UDP header only
+        0,                            # UDP checksum=0 legal for IPv4
+    )
+    return ip_hdr + udp_hdr
+
+
+def do_inject(iface: str, src_port: int, dst_ip: str, dst_port: int) -> dict:
+    if not isinstance(iface, str) or not IFACE_RE.match(iface):
+        return _err("bad-iface")
+    if not iface_present(iface):
+        return _err("iface-not-present")
+    if not isinstance(src_port, int) or not (1 <= src_port <= 65535):
+        return _err("bad-src-port")
+    if not isinstance(dst_ip, str) or not isinstance(dst_port, int):
+        return _err("bad-types")
+    if not is_valid_public_endpoint(dst_ip, dst_port):
+        return _err("bad-dst-endpoint")
+    # The src_port the daemon claims must be the iface's actual listen
+    # port.  Otherwise an attacker could ask us to spoof packets from
+    # arbitrary ports.
+    actual = listen_port_for_iface(iface)
+    if actual == 0:
+        return _err("listen-port-unknown")
+    if actual != src_port:
+        return _err("src-port-mismatch")
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        s.setsockopt(socket.SOL_IP, socket.IP_HDRINCL, 1)
+    except (PermissionError, OSError) as e:
+        sys.stderr.write(f"raw socket creation failed: {e}\n")
+        return _err("raw-socket-failed")
+    try:
+        packet = build_raw_udp_packet(src_port, dst_ip, dst_port)
+        for i in range(INJECT_REPEATS):
+            try:
+                s.sendto(packet, (dst_ip, dst_port))
+            except OSError as e:
+                # Network unreachable etc. is non-fatal for our purpose
+                # (the conntrack entry only requires the kernel to
+                # have processed the egress).
+                sys.stderr.write(f"raw inject sendto: {e}\n")
+            if i + 1 < INJECT_REPEATS:
+                time.sleep(INJECT_GAP)
+    finally:
+        s.close()
+    return {"ok": True}
+
+
+def do_wake(iface: str, target_ip: str) -> dict:
+    if not isinstance(iface, str) or not IFACE_RE.match(iface):
+        return _err("bad-iface")
+    if not iface_present(iface):
+        return _err("iface-not-present")
+    if not isinstance(target_ip, str):
+        return _err("bad-target-ip")
+    try:
+        addr = ipaddress.ip_address(target_ip)
+    except ValueError:
+        return _err("bad-target-ip")
+    # We do permit reserved / documentation IPs here (e.g. 192.0.2.1)
+    # because pick_wake_target() legitimately uses one for /0 catchall
+    # peers.  The packet is encrypted by kernel WG before leaving the
+    # host, so the destination has no security implication.
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return _err("bad-target-ip")  # we don't do v6 wakes yet
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                         iface.encode("utf-8"))
+        except OSError as e:
+            if e.errno == errno.EPERM:
+                return _err("bind-to-device-perm")
+            return _err(f"bind-to-device-{e.errno}")
+        s.setblocking(False)
+        try:
+            s.sendto(b"\x00", (target_ip, WAKE_DISCARD_PORT))
+        except OSError:
+            # Unreachable host or routing failure — kernel still saw
+            # the outbound, which is enough to trigger WG handshake
+            # initiation, so this is a successful wake from our PoV.
+            pass
+    finally:
+        s.close()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+
+def _err(token: str) -> dict:
+    return {"ok": False, "error": token}
+
+
+def handle_request(req: dict) -> dict:
+    op = req.get("op")
+    if op == "inject":
+        return do_inject(
+            req.get("iface"), req.get("src_port"),
+            req.get("dst_ip"), req.get("dst_port"))
+    if op == "wake":
+        return do_wake(req.get("iface"), req.get("target_ip"))
+    return _err("unknown-op")
+
+
+# ---------------------------------------------------------------------------
+# Server loop.
+
+def serve(sock_path: str) -> None:
+    parent = os.path.dirname(sock_path) or "/"
+    st = os.stat(parent)
+    if st.st_mode & 0o002:
+        sys.stderr.write(f"[FATAL] {parent} is world-writable; refusing\n")
+        sys.exit(2)
+
+    try:
+        os.unlink(sock_path)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(sock_path)
+    os.chmod(sock_path, 0o600)
+    s.listen(8)
+    sys.stderr.write(f"[raw-helper] listening on {sock_path}\n")
+    while True:
+        conn, _ = s.accept()
+        try:
+            handle_connection(conn)
+        except Exception as e:
+            sys.stderr.write(f"[raw-helper] connection error: {e!r}\n")
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def handle_connection(conn: socket.socket) -> None:
+    f = conn.makefile("rwb", buffering=0)
+    while True:
+        line = f.readline()
+        if not line:
+            return
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                resp = _err("not-object")
+            else:
+                resp = handle_request(req)
+        except Exception as e:
+            resp = _err(f"internal:{e.__class__.__name__}")
+        f.write((json.dumps(resp) + "\n").encode("utf-8"))
+
+
+def main() -> None:
+    sock_path = os.environ.get(
+        "WIREGUARDRTC_RAW_HELPER_SOCKET", "/run/wireguardrtc/raw.sock")
+    serve(sock_path)
+
+
+if __name__ == "__main__":
+    main()

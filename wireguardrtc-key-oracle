@@ -1,0 +1,378 @@
+#!/var/lib/wireguardrtc/venv/bin/python3
+# wireguardrtc-key-oracle — privileged side of the daemon's key-handling
+#
+# Shebang points at the venv the .deb's postinst builds; same as the
+# daemon.  The system /usr/bin/python3 typically does NOT have PyNaCl
+# installed, so a `#!/usr/bin/env python3` shebang would import-error
+# at startup, the systemd unit would Restart=on-failure-loop, and the
+# daemon (which Requires= this service) would just see "oracle socket
+# not reachable" forever.
+# privilege separation.
+#
+# Why this exists
+# ---------------
+# The daemon holds the only userspace copy of the WireGuard private keys
+# only because it needs them for two things:
+#   1. Deriving signalling/enrollment keys via X25519+BLAKE2b.
+#   2. Calling `wg set <iface> peer <pub> endpoint <ip>:<port>` after a
+#      successful hole-punch.
+# Both want the keys readable, both currently happen in the daemon's
+# address space, and both need CAP_NET_ADMIN to talk to the WireGuard
+# kernel module.  RCE on the network-facing daemon therefore yields the
+# raw private key — enough to fully impersonate the host on the
+# WireGuard mesh.
+#
+# This oracle moves those two capabilities into a tiny, side-channel-
+# accessible service: it holds the keys in memory, exposes only a small
+# JSON-RPC interface over a Unix socket, and the daemon talks to it
+# instead of touching the kernel directly.  Compromise of the daemon
+# now reduces to "ask oracle for derivations against attacker-chosen
+# peer pubkeys" (enough to MITM signalling, but the raw private key
+# never leaves this process and so cannot be lifted to impersonate the
+# host in the actual WireGuard handshake).
+#
+# Wire format
+# -----------
+# One newline-terminated JSON object per request, one per response.
+#
+# Requests:
+#   {"op": "derive_sigbox", "iface": "wg0", "peer_pub": "<b64>"}
+#   {"op": "derive_enroll", "iface": "wg0", "peer_pub": "<b64>", "token": "<urlsafe-b64-nopad>"}
+#   {"op": "set_endpoint",  "iface": "wg0", "peer_pub": "<b64>", "ip": "1.2.3.4", "port": 51820}
+#
+# Successful responses:
+#   {"ok": true, "key": "<b64-32-bytes>"}     # for derives
+#   {"ok": true}                              # for set_endpoint
+#
+# Failure response:
+#   {"ok": false, "error": "<short stable token>"}
+#
+# Validation
+# ----------
+# Every input is strictly typed and length-checked before the oracle
+# touches the kernel.  In particular:
+#   * iface must match wg<digits>(p<digits>)?
+#   * peer_pub must decode to exactly 32 bytes
+#   * token must be 43-char URL-safe base64 (nopad), decoding to 32 bytes
+#   * ip must pass is_valid_public_endpoint() — no loopback, link-local,
+#     multicast, unspecified, or otherwise reserved addresses
+#   * port must be 1..65535
+#   * for set_endpoint, peer_pub MUST already be a peer of the iface
+#     (queried via `wg show <iface> allowed-ips`).  The oracle refuses
+#     to create new peers on behalf of the daemon — that's a permission
+#     the broker holds, not the daemon, and it's specifically the wedge
+#     a daemon RCE would use to install a backdoor peer.
+
+import base64
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+
+PROTOCOL_LABEL = b"wg-peerjs/v1/sigbox"
+LABEL_ENROLL = b"wg-peerjs/v1/enroll"
+
+IFACE_RE = re.compile(r"\Awg[0-9]+(p[0-9]+)?\Z")
+B64_PUB_RE = re.compile(r"\A[A-Za-z0-9+/]{43}=\Z")
+B64URL_TOK_RE = re.compile(r"\A[A-Za-z0-9_\-]{43}\Z")
+
+# Allowlist of `wg show <iface> <field>` queries the daemon can ask
+# us to forward.  Excludes `private-key` (we never hand it out;
+# clients that need that key derivation should call derive_*) and
+# `preshared-key` (not used in this protocol).  Everything else is
+# information about the iface that the daemon needs to keep its
+# bookkeeping current.  This list mirrors the subset of `wg show`
+# that the daemon used to call directly before the per-iface fields
+# turned out to require CAP_NET_ADMIN on this kernel.
+WG_FIELDS_SCALAR = frozenset({"public-key", "listen-port"})
+WG_FIELDS_TABLE = frozenset({
+    "allowed-ips", "endpoints", "latest-handshakes", "persistent-keepalive",
+})
+
+
+def wg_show(*args) -> str:
+    """Run `wg show <args>` and return stdout, or "" on error.
+
+    Variadic so the same helper handles `wg show interfaces`,
+    `wg show <iface> <field>`, and `wg show <iface>` (full dump).  The
+    oracle invokes wg(8) the same way the daemon used to; the only
+    relevant difference is that THIS process has CAP_NET_ADMIN, so
+    privileged-only fields actually come back populated.
+    """
+    try:
+        res = subprocess.run(
+            ["wg", "show", *args],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return res.stdout if res.returncode == 0 else ""
+
+
+def wg_set(*args) -> bool:
+    try:
+        res = subprocess.run(
+            ["wg", "set", *args],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if res.returncode != 0:
+        # Stderr ends up in our journal; the daemon doesn't see it.
+        sys.stderr.write(
+            f"wg set {' '.join(args)} failed: {res.stderr.strip()}\n")
+        return False
+    return True
+
+
+def get_priv_for_iface(iface: str) -> bytes:
+    """Return raw 32-byte private key for `iface`, or b"" on error."""
+    s = wg_show(iface, "private-key").strip()
+    if not s or s in ("(none)", "(hidden)"):
+        return b""
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except Exception:
+        return b""
+    return raw if len(raw) == 32 else b""
+
+
+def get_peer_pubs_for_iface(iface: str) -> set:
+    """Return the set of base64 peer pubkeys currently known to the iface."""
+    out = wg_show(iface, "allowed-ips")
+    pubs = set()
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if parts:
+            pubs.add(parts[0])
+    return pubs
+
+
+def list_interfaces() -> list:
+    """Mirror of the daemon's list_interfaces helper, but here we have
+    the cap to actually invoke `wg show interfaces` reliably."""
+    return wg_show("interfaces").split()
+
+
+def iface_field(iface: str, field: str) -> str:
+    return wg_show(iface, field).strip()
+
+
+def iface_table(iface: str, field: str) -> dict:
+    """Same shape as the daemon's get_iface_table: {pubkey: rest}."""
+    out = {}
+    for line in wg_show(iface, field).splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
+        elif len(parts) == 1:
+            out[parts[0]] = ""
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Crypto helpers — must match the daemon's derivation byte-for-byte.
+
+try:
+    from nacl.bindings import crypto_scalarmult
+    from nacl.hash import blake2b as _nacl_blake2b
+    from nacl.encoding import RawEncoder as _NaclRawEncoder
+except ImportError:
+    sys.stderr.write(
+        "[FATAL] PyNaCl not available; "
+        "the oracle shares the daemon's runtime venv\n")
+    sys.exit(2)
+
+
+def derive_sigbox(my_priv: bytes, peer_pub: bytes) -> bytes:
+    shared = crypto_scalarmult(my_priv, peer_pub)
+    return _nacl_blake2b(
+        shared, digest_size=32,
+        key=PROTOCOL_LABEL[:32], encoder=_NaclRawEncoder)
+
+
+def derive_enroll(my_priv: bytes, peer_pub: bytes, token: bytes) -> bytes:
+    shared = crypto_scalarmult(my_priv, peer_pub)
+    enroll_key = _nacl_blake2b(
+        shared, digest_size=32,
+        key=LABEL_ENROLL[:32], encoder=_NaclRawEncoder)
+    return _nacl_blake2b(
+        enroll_key, digest_size=32, key=token, encoder=_NaclRawEncoder)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint validation — duplicated from the daemon so the oracle's check
+# stands on its own (defense-in-depth: the daemon already validates, but
+# the oracle doesn't trust the caller).
+
+def is_valid_public_endpoint(ip: str, port: int) -> bool:
+    """Same predicate the daemon uses; duplicated here so the oracle's
+    check stands on its own (defense in depth)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if (addr.is_loopback or addr.is_multicast or addr.is_link_local
+            or addr.is_unspecified or addr.is_reserved):
+        return False
+    if not (1 <= port <= 65535):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Request handlers.
+
+def _err(token: str) -> dict:
+    return {"ok": False, "error": token}
+
+
+def handle_request(req: dict) -> dict:
+    op = req.get("op")
+
+    # Ops that don't take an iface argument first.
+    if op == "list_interfaces":
+        return {"ok": True, "interfaces": list_interfaces()}
+
+    iface = req.get("iface")
+    if not isinstance(iface, str) or not IFACE_RE.match(iface):
+        return _err("bad-iface")
+
+    # Read-only iface-state queries (allowlisted fields only).  These
+    # do NOT need a private key and the result isn't sensitive — it's
+    # just that this kernel makes them privileged.  The oracle holds
+    # CAP_NET_ADMIN so it can answer them without exposing the cap to
+    # the daemon.
+    if op == "iface_field":
+        field = req.get("field")
+        if field not in WG_FIELDS_SCALAR:
+            return _err("bad-field")
+        return {"ok": True, "value": iface_field(iface, field)}
+    if op == "iface_table":
+        field = req.get("field")
+        if field not in WG_FIELDS_TABLE:
+            return _err("bad-field")
+        return {"ok": True, "table": iface_table(iface, field)}
+
+    priv = get_priv_for_iface(iface)
+    if not priv:
+        return _err("no-priv-for-iface")
+
+    if op in ("derive_sigbox", "derive_enroll"):
+        peer_pub_b64 = req.get("peer_pub")
+        if (not isinstance(peer_pub_b64, str)
+                or not B64_PUB_RE.match(peer_pub_b64)):
+            return _err("bad-peer-pub")
+        try:
+            peer_pub = base64.b64decode(peer_pub_b64, validate=True)
+        except Exception:
+            return _err("bad-peer-pub-b64")
+        if len(peer_pub) != 32:
+            return _err("bad-peer-pub-len")
+
+        if op == "derive_sigbox":
+            key = derive_sigbox(priv, peer_pub)
+        else:
+            tok_b64 = req.get("token")
+            if not isinstance(tok_b64, str) or not B64URL_TOK_RE.match(tok_b64):
+                return _err("bad-token")
+            try:
+                tok = base64.urlsafe_b64decode(tok_b64 + "=")
+            except Exception:
+                return _err("bad-token-b64")
+            if len(tok) != 32:
+                return _err("bad-token-len")
+            key = derive_enroll(priv, peer_pub, tok)
+        return {"ok": True, "key": base64.b64encode(key).decode("ascii")}
+
+    if op == "set_endpoint":
+        peer_pub_b64 = req.get("peer_pub")
+        ip = req.get("ip")
+        port = req.get("port")
+        if (not isinstance(peer_pub_b64, str)
+                or not B64_PUB_RE.match(peer_pub_b64)):
+            return _err("bad-peer-pub")
+        if not isinstance(ip, str) or not isinstance(port, int):
+            return _err("bad-endpoint-types")
+        if not is_valid_public_endpoint(ip, port):
+            return _err("bad-endpoint")
+        # Refuse to silently create a new peer.  An RCE attacker would
+        # love to ask the oracle to set_endpoint on a fabricated pubkey;
+        # `wg set` would happily create that peer.  Existing peers only.
+        if peer_pub_b64 not in get_peer_pubs_for_iface(iface):
+            return _err("peer-not-on-iface")
+        if not wg_set(iface, "peer", peer_pub_b64,
+                      "endpoint", f"{ip}:{port}"):
+            return _err("wg-set-failed")
+        return {"ok": True}
+
+    return _err("unknown-op")
+
+
+# ---------------------------------------------------------------------------
+# Server loop.
+
+def serve(sock_path: str) -> None:
+    # Refuse to start if the socket directory is world-writable; that
+    # would let any local user impersonate the daemon.  The systemd
+    # RuntimeDirectory= directive sets the right perms but a paranoid
+    # check up front is cheap.
+    parent = os.path.dirname(sock_path) or "/"
+    st = os.stat(parent)
+    if st.st_mode & 0o002:
+        sys.stderr.write(f"[FATAL] {parent} is world-writable; refusing\n")
+        sys.exit(2)
+
+    try:
+        os.unlink(sock_path)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(sock_path)
+    os.chmod(sock_path, 0o600)
+    s.listen(8)
+    sys.stderr.write(f"[oracle] listening on {sock_path}\n")
+    while True:
+        conn, _ = s.accept()
+        try:
+            handle_connection(conn)
+        except Exception as e:
+            sys.stderr.write(f"[oracle] connection error: {e!r}\n")
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def handle_connection(conn: socket.socket) -> None:
+    # One client connection serves many requests serially.  The daemon
+    # holds the connection across its whole lifetime and asyncio-locks
+    # request/response so we never see overlapping requests.
+    f = conn.makefile("rwb", buffering=0)
+    while True:
+        line = f.readline()
+        if not line:
+            return
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                resp = _err("not-object")
+            else:
+                resp = handle_request(req)
+        except Exception as e:
+            resp = _err(f"internal:{e.__class__.__name__}")
+        f.write((json.dumps(resp) + "\n").encode("utf-8"))
+
+
+def main() -> None:
+    sock_path = os.environ.get(
+        "WIREGUARDRTC_KEY_ORACLE_SOCKET", "/run/wireguardrtc/oracle.sock")
+    serve(sock_path)
+
+
+if __name__ == "__main__":
+    main()

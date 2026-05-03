@@ -1,0 +1,69 @@
+[Unit]
+Description=wireguardrtc raw-socket helper (privilege-separated CAP_NET_RAW holder)
+Documentation=man:wireguardrtc(8)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wireguardrtc-raw-helper
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wireguardrtc-raw-helper
+
+# Holds CAP_NET_RAW so the daemon doesn't have to.  Two narrow RPCs
+# (inject + wake) are the entire surface; see the script header for
+# the threat model.
+User=wireguardrtc
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+
+# Share the daemon's RuntimeDirectory.  systemd merges directives
+# across services that name the same RuntimeDirectory; this is what
+# the key oracle does too.
+RuntimeDirectory=wireguardrtc
+RuntimeDirectoryMode=0750
+# Shared with wireguardrtc.service and wireguardrtc-key-oracle.service.
+# Preserve=yes keeps the dir across stop/restart cycles so a daemon
+# restart doesn't transiently destroy this helper's socket path.
+RuntimeDirectoryPreserve=yes
+Environment=WIREGUARDRTC_RAW_HELPER_SOCKET=/run/wireguardrtc/raw.sock
+
+# Sandboxing.  Same shape as the key oracle — small process, no
+# filesystem writes outside its socket, no DNS, no shell.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+UMask=0077
+
+# AF_INET (raw + UDP), AF_NETLINK (`wg show listen-port`), AF_UNIX
+# (our listening socket).  No INET6 because raw_inject is IPv4-only
+# by design.
+RestrictAddressFamilies=AF_INET AF_NETLINK AF_UNIX
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug @mount @obsolete @cpu-emulation @module @reboot @swap
+
+ReadOnlyPaths=/usr/bin/wg /usr/lib/wireguardrtc
+
+[Install]
+WantedBy=multi-user.target

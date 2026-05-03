@@ -1,0 +1,103 @@
+[Unit]
+Description=WireGuard RTC Hole-Punching Daemon
+Documentation=man:wireguardrtc(8)
+After=network-online.target nss-lookup.target wireguardrtc-key-oracle.service wireguardrtc-raw-helper.service
+Wants=network-online.target
+# The privileged helpers MUST be up first.  The key-oracle holds the
+# WireGuard private keys; the raw-helper holds CAP_NET_RAW for the
+# hole-punch and wake-up packets.  Requires= (vs Wants=) means a
+# failure of either pulls the daemon down too — we want the daemon to
+# always run with the privsep boundary in place, never to fall back
+# to in-process privileged operations.
+Requires=wireguardrtc-key-oracle.service wireguardrtc-raw-helper.service
+# Do not attempt to start until the admin has created the config file.
+# The daemon exits 2 (fatal config error) if Salt is unset; pairing
+# ConditionPathExists with RestartPreventExitStatus=2 keeps the unit from
+# looping until the administrator completes setup.
+ConditionPathExists=/etc/wireguardrtc/wireguardrtc.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wireguardrtc
+Restart=on-failure
+RestartSec=10
+# Exit status 2 means a fatal configuration error; do not retry automatically.
+RestartPreventExitStatus=2
+TimeoutStopSec=15
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wireguardrtc
+
+# Privilege model: static system user, NO Linux capabilities at all.
+#
+# All privileged operations have been moved into helper services:
+#   wireguardrtc-key-oracle.service holds CAP_NET_ADMIN — reads
+#                 WireGuard private keys, runs `wg set` for endpoint
+#                 updates, serves key derivations over a Unix socket.
+#   wireguardrtc-raw-helper.service  holds CAP_NET_RAW   — sends the
+#                 spoofed-source-port hole-punch burst and the
+#                 SO_BINDTODEVICE wake-up packet, all on validated
+#                 inputs from the daemon.
+#
+# After RCE on the daemon an attacker can issue narrow RPCs to the
+# helpers (within their validation rules) but cannot read the raw
+# private key, cannot fire arbitrary spoofed packets, and cannot
+# call `wg set` on arbitrary peers.  The kernel will reject any
+# direct privileged syscall the daemon attempts.
+User=wireguardrtc
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Sandboxing.  The daemon's CAP_NET_ADMIN+CAP_NET_RAW set is the minimum
+# for the work it still does itself — read WG private keys (key derivation),
+# wg set (endpoint update for hole-punch), raw UDP inject + SO_BINDTODEVICE.
+# Provisioning has been moved to wireguardrtc-provision-broker so the
+# daemon can stay this restricted; future privsep refactors (key oracle,
+# endpoint-update helper, raw-inject helper) will let us drop these
+# capabilities too.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_PACKET AF_UNIX
+# Curated syscall set for "ordinary system service".  Excludes raw
+# CPU emulation, ptrace/kdebug, kernel module load, mount, kexec,
+# obsolete syscalls, privileged syscalls (we drop those via caps too),
+# and a few other classes the daemon has no business invoking.  See
+# systemd.exec(5) "System Call Filtering" for the exact membership.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug @mount @obsolete @cpu-emulation @module @reboot @swap
+
+# Config and requirements are read-only; wg binary must be executable.
+ReadOnlyPaths=/etc/wireguardrtc /usr/bin/wg /usr/lib/wireguardrtc
+# Venv lives under /var/lib/wireguardrtc (created by systemd, persists across reboots).
+StateDirectory=wireguardrtc
+# Single-instance lockfile lives under /run/wireguardrtc (created by systemd).
+# RuntimeDirectoryPreserve=yes keeps the directory alive when this unit
+# stops, so the helpers (which share the dir for their own sockets)
+# don't lose it during a daemon restart cycle.
+RuntimeDirectory=wireguardrtc
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

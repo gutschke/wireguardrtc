@@ -1,0 +1,30 @@
+Source: wireguardrtc
+Section: net
+Priority: optional
+Maintainer: Markus Gutschke <gutschke@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: wireguardrtc
+Architecture: all
+Depends: python3,
+         python3-venv,
+         wireguard-tools,
+         ${misc:Depends}
+Description: WireGuard NAT hole-punching daemon via WebRTC signalling
+ wireguardrtc maintains direct UDP tunnels between WireGuard peers behind
+ cone NATs (full-cone, address-restricted, port-restricted) without
+ requiring a relay server or a static public IP on either end.
+ .
+ Endpoint addresses are discovered via STUN and exchanged through a PeerJS
+ signalling broker using the standard PeerJS OFFER wire format. Payloads are
+ end-to-end encrypted using keys derived from the peers' WireGuard
+ Curve25519 identities; the broker cannot read or forge endpoint updates.
+ .
+ After receiving a valid update the daemon punches the local NAT by
+ injecting a raw UDP packet from the WireGuard listen port, updates the
+ kernel endpoint with wg-set(8), and triggers a fresh handshake.
+ .
+ Supported peer modes: active (proactive signalling), passive (accept
+ incoming only), dns-roam (track a dynamic DNS hostname), ignore.
