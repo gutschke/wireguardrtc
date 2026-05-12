@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-only overlay.  Allows cleartext WebSocket traffic so the alpha
+  build can talk to the local sandbox broker on ws://198.51.100.0:9000.
+  Release builds keep the platform default (cleartext disallowed) so
+  production must use wss:// (e.g. 0.peerjs.com).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:replace="android:networkSecurityConfig" />
+
+</manifest>

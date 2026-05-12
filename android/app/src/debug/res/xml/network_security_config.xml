@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Debug-only: allow cleartext for the lab subnets used by the
+         sandbox-enroll.sh test rig.  Release builds inherit the
+         platform default (cleartextTrafficPermitted=false). -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">198.51.100.0</domain>
+        <domain includeSubdomains="false">198.51.100.118</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

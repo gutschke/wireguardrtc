@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App display name.  All-lowercase to match the package id;
+         deliberately avoids embedding the WireGuard trademark in
+         the user-facing name (descriptive use in the tagline /
+         marketing copy is fine per the WireGuard trademark
+         policy). -->
+    <string name="app_name">wgrtc</string>
+    <!-- Tagline shown on the empty-state list and onboarding. -->
+    <string name="app_tagline">Self-hosted WireGuard with NAT traversal</string>
+</resources>

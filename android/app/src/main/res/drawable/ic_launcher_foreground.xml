@@ -1,0 +1,49 @@
+<!--
+  Adaptive-icon foreground.  Drawn on a 108x108 viewport with the
+  visible content kept inside the 72x72 safe zone (centred).  Same
+  hexagon-with-pierced-inner-ring concept as the in-app
+  BrandMark composable, redrawn in static SVG-like syntax because
+  the Android launcher takes a vector drawable, not a Compose
+  Canvas.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Pointy-top hexagon outline.  Centre 54,54.  Outer radius 30
+         keeps it inside the 36 safe zone; stroke width 6 matches
+         the BrandMark proportions. -->
+    <path
+        android:strokeColor="#006A6B"
+        android:strokeWidth="6"
+        android:fillColor="@android:color/transparent"
+        android:pathData="
+            M54,24
+            L80,39
+            L80,69
+            L54,84
+            L28,69
+            L28,39
+            Z" />
+
+    <!-- Inner glyph: open ring (centred, radius 12). -->
+    <path
+        android:strokeColor="#4B607C"
+        android:strokeWidth="4"
+        android:fillColor="@android:color/transparent"
+        android:pathData="
+            M54,42
+            a12,12 0 1,1 0,24
+            a12,12 0 1,1 0,-24" />
+
+    <!-- Stub line piercing the inner ring on the right edge. -->
+    <path
+        android:strokeColor="#4B607C"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="
+            M64,54
+            L78,54" />
+</vector>

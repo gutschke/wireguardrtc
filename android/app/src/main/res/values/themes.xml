@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose owns the runtime theme via [WgrtcTheme].  This style
+         exists only for the manifest's `android:theme=` slot + to
+         give the splash a non-jarring window background while the
+         Compose tree mounts. -->
+    <style name="Theme.Wireguardrtc" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">#FAFDFC</item>
+        <item name="android:navigationBarColor">#FAFDFC</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

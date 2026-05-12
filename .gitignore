@@ -1,27 +1,63 @@
-# Python
-venv/
-__pycache__/
-*.pyc
-*.pyo
+# ──────────────────────────────────────────────────────────────────
+# Daemon (Python / Debian)
+# ──────────────────────────────────────────────────────────────────
+daemon/venv/
+daemon/__pycache__/
+daemon/**/*.pyc
+daemon/**/*.pyo
 
 # Debian package build artifacts
-debian/wireguardrtc/
-debian/files
-debian/debhelper-build-stamp
-debian/*.debhelper.log
-debian/*.substvars
-debian/.debhelper/
-debian/*.debhelper
+daemon/debian/wireguardrtc/
+daemon/debian/files
+daemon/debian/debhelper-build-stamp
+daemon/debian/*.debhelper.log
+daemon/debian/*.substvars
+daemon/debian/.debhelper/
+daemon/debian/*.debhelper
 
-# Built packages (land in parent directory by default)
-../*.deb
-../*.buildinfo
-../*.changes
+# Built packages (land in the repo root by default)
+*.deb
+*.buildinfo
+*.changes
 
-# Documentation build outputs (generated from .md source)
-wg-holepunch-guide.html
-wg-holepunch-guide.pdf
+# Daemon doc build outputs (generated from .md source under docs/)
+docs/wg-holepunch-guide.html
+docs/wg-holepunch-guide.pdf
 
-# Test deps (PeerJS broker for fabric tests).  Re-create with:
-#   cd tests && npm install peer
-tests/node_modules/
+# Daemon test deps
+daemon/tests/node_modules/
+
+# ──────────────────────────────────────────────────────────────────
+# Android
+# ──────────────────────────────────────────────────────────────────
+android/build/
+android/.gradle/
+android/.kotlin/
+android/.idea/
+android/local.properties
+android/**/build/
+android/**/*.iml
+
+# Keystores — never commit
+android/app/keystore.properties
+android/**/*.keystore
+android/**/*.jks
+
+# Native (cgo) build outputs
+android/wgbridge_native/build/
+android/wgbridge_native/wgbridge_native
+android/wgbridge-native-aar/build/
+
+# Test reports + ad-hoc logs
+android/**/build/reports/
+android/**/build/test-results/
+*.log
+
+# Android packaging artifacts
+android/**/*.aab
+android/**/*.apk
+
+# ──────────────────────────────────────────────────────────────────
+# Misc
+# ──────────────────────────────────────────────────────────────────
+.DS_Store

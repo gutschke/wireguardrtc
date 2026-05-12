@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Network access; VPN consent is requested at runtime via
+         GoBackend.VpnService.prepare(context). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- specialUse foreground service type for the OFFER listener.
+         Doesn't fit the standard buckets (dataSync has tight time
+         limits; mediaPlayback / location / phoneCall are obviously
+         wrong).  The use-case explanation is required on Android 14+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ runtime-permission for posting notifications.
+         Without it the foreground service still runs but no badge
+         shows; the user can't dismiss-and-stop, which violates the
+         contract.  Requested at runtime when the service starts. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- QR scanning.  Only requested at runtime when the user opens the
+         scan screen; pasted/typed configs need no camera access. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <!-- ChromeOS / non-touchscreen Chromebooks: declaring touch as
+         optional lets the app surface on those devices.  Default
+         (required="true") quietly hides us from the Play Store on
+         non-touch Chromebooks. -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <!-- Other input methods are equally optional — keyboards and
+         pointing devices are present on Chromebooks + tablets with
+         hardware add-ons, absent on phones; we don't require any. -->
+    <uses-feature
+        android:name="android.hardware.faketouch"
+        android:required="false" />
+
+    <application
+        android:name=".WgrtcApp"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:resizeableActivity="true"
+        android:theme="@style/Theme.Wireguardrtc">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- URL handler: any QR scanner / browser / messaging app
+                 that follows a `wgrtc-enroll://` URI dispatches it
+                 here.  The activity reads `intent.data` and feeds
+                 the URI through the same auto-enrol path that the
+                 `am start` extra-config invocation uses for testing. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="wgrtc-enroll" />
+            </intent-filter>
+        </activity>
+        <!-- com.wireguard.android.backend.GoBackend$VpnService is registered
+             by the tunnel AAR's AndroidManifest; the manifest merger pulls
+             it in automatically. -->
+
+        <!-- Long-lived signalling listener — keeps the OFFER
+             websocket alive so the daemon's roaming public IP
+             reaches the client even when the user is in another app. -->
+        <service
+            android:name=".OfferListenerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Maintains a long-lived signalling-only WebSocket to a PeerJS broker so the user's tunnel endpoints stay current as the server's public IPv4 roams." />
+        </service>
+        <!-- Host-mode VpnService.  The intent-filter is the standard
+             VpnService discovery token (BIND_VPN_SERVICE permission
+             is implicit for services that declare it). -->
+        <service
+            android:name=".service.HostModeVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+        <!-- C1 joiner-mode VpnService.  Owns the kernel TUN fd and
+             hands it to wgbridge in TUN-fd mode.  Replaces the path
+             that goes through wireguard-android's
+             GoBackend$VpnService once C1g flips the joiner-backend
+             default. -->
+        <service
+            android:name=".service.JoinerVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+    </application>
+
+</manifest>

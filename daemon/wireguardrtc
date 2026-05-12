@@ -1,0 +1,3840 @@
+#!/var/lib/wireguardrtc/venv/bin/python3
+"""wireguardrtc — WireGuard NAT hole-punching via PeerJS signalling.
+
+Maintains direct UDP tunnels between WireGuard peers behind cone NATs by:
+
+  - resolving the local public IPv4 via STUN
+  - exchanging encrypted endpoint info via a (possibly-untrusted) PeerJS broker,
+    using the standard PeerJS OFFER wire format
+  - opening a NAT pinhole via raw UDP injection from the WG listen port
+  - waking the kernel WG module to fire a handshake immediately
+
+Configuration:
+
+  /etc/wireguardrtc/wireguardrtc.conf   global daemon settings
+  /etc/wireguardrtc/peers.d/*.conf      per-peer drop-in files (one per pubkey)
+
+Peers without a drop-in file are ignored. See wg-holepunch-guide.md for details.
+"""
+
+import argparse
+import asyncio
+import base64
+import configparser
+import dataclasses
+import enum
+import errno
+import fcntl
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+import re
+import secrets
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+try:
+    import websockets
+    from nacl.bindings import crypto_scalarmult
+    from nacl.hash import blake2b as _nacl_blake2b
+    from nacl.encoding import RawEncoder as _NaclRawEncoder
+    from nacl.secret import SecretBox
+except ImportError as e:
+    sys.stderr.write(
+        f"[FATAL] missing dependency: {e}\n"
+        "Install with: pip install websockets pynacl\n"
+    )
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path(os.environ.get("WIREGUARDRTC_CONFIG_DIR", "/etc/wireguardrtc"))
+GLOBAL_CONFIG = CONFIG_DIR / "wireguardrtc.conf"
+PEERS_DIR = CONFIG_DIR / "peers.d"
+LOCK_FILE = Path(os.environ.get("WIREGUARDRTC_LOCK_FILE",
+                                 "/run/wireguardrtc/lock"))
+
+__version__ = "0.2.0"          # unified across daemon + Android app
+PROTOCOL_VERSION = 1
+PROTOCOL_LABEL = b"wg-peerjs/v1/sigbox"  # wire format is locked; do not change
+PROTOCOL_FRESHNESS_WINDOW = 90.0  # seconds; reject older or further-in-future
+
+# Plaintext-size caps applied AFTER secretbox auth-tag verification.
+# A peer with the right private key could otherwise hand us
+# arbitrarily-large JSON to parse (memory exhaustion).  Real OFFER
+# plaintexts are ~80 bytes; ENROLL plaintexts ~300; ENROLL_OK ~500.
+# Caps are an order of magnitude over the largest legitimate case.
+MAX_SIGBOX_PLAINTEXT = 1024
+MAX_ENROLL_PLAINTEXT = 4096
+# Same idea for the wire-format ciphertext (post-base64) before we
+# even decrypt — attacker-controlled length, amortised over the
+# decode and the secretbox call.
+MAX_SIGBOX_CIPHERTEXT_B64 = 2048
+MAX_ENROLL_CIPHERTEXT_B64 = 8192
+
+POLL_INTERVAL = 30.0
+HANDSHAKE_DEAD_THRESHOLD = 180.0  # >120 s rekey + 60 s grace
+SIGNALING_BACKOFF_INITIAL = 30.0   # first retry after a failed hole-punch
+SIGNALING_BACKOFF_MAX = 300.0      # cap; also used as the steady-state interval
+SIGNALING_BACKOFF = SIGNALING_BACKOFF_MAX  # kept for log messages
+# CR-D9: a PeerJS session shorter than this counts as a "failed"
+# reconnect for backoff purposes.  Picked so a normal HEARTBEAT
+# round-trip (first heartbeat at t=5s) qualifies as stable but a
+# broker quick-close-after-OPEN doesn't reset the backoff to 5s.
+STABLE_SESSION_S = 10.0
+REINJECT_INTERVAL = 20.0  # re-inject while DOWN to keep conntrack entry alive
+PEERJS_HEARTBEAT = 5.0
+STUN_TIMEOUT = 2.5
+RAW_INJECT_REPEATS = 3
+RAW_INJECT_GAP = 0.05  # seconds between repeats
+WAKE_TARGET_BOGON = "192.0.2.1"  # TEST-NET-1, used for /0 catchall
+
+OFFER_RESPONSE_MIN_INTERVAL = 25.0   # min gap between outbound OFFERs (incl. responses)
+OFFER_EXCHANGE_QUARANTINE_THRESHOLD = 8   # exchanges without tunnel-up → quarantine
+OFFER_EXCHANGE_WINDOW = 600.0        # rolling window for exchange count (10 min)
+OFFER_QUARANTINE_DURATION = 300.0    # quarantine duration after threshold (5 min)
+
+DEFAULT_STUN_SERVERS = [
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.nextcloud.com:3478",
+]
+DEFAULT_PEERJS_SERVER = "wss://0.peerjs.com/peerjs"
+DEFAULT_PEERJS_KEY = "peerjs"
+
+STUN_MAGIC_COOKIE = 0x2112A442
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+class Mode(enum.Enum):
+    ACTIVE = "active"
+    PASSIVE = "passive"
+    DNS_ROAM = "dns-roam"
+    IGNORE = "ignore"
+
+
+@dataclasses.dataclass
+class PeerConfig:
+    public_key: str
+    mode: Mode
+    label: str  # filename stem, for logs
+    dns_host: Optional[str] = None  # only meaningful for DNS_ROAM
+
+
+@dataclasses.dataclass
+class GlobalConfig:
+    salt: bytes
+    peerjs_server: str
+    peerjs_key: str
+    stun_servers: list
+    public_ip: Optional[str] = None  # IPv4 override; bypasses STUN if set
+    stun_strict: bool = False  # if true, reject private/non-global STUN responses
+    enrollment_enabled: bool = False
+    provision_script: Optional[str] = None
+    state_dir: Path = Path("/var/lib/wireguardrtc")
+    max_pending_tokens: int = 32
+    # When the daemon successfully enrols a peer, write a peers.d-style
+    # drop-in to <state_dir>/auto-enrolled.d/ so the daemon pushes
+    # signalling OFFERs to it (Mode=active) without requiring the admin
+    # to hand-author a peers.d/<label>.conf.  An explicit drop-in in
+    # /etc/wireguardrtc/peers.d/ always wins over the auto-enrolled
+    # entry.  See [Enrollment] AutoActive in wireguardrtc(5).
+    auto_active_enrollment: bool = True
+    # Candidate-negotiation v2 knobs (Step B).  Used by the multi-
+    # candidate enumeration in Step C to override interface-level
+    # defaults: AdvertiseInterfaces explicitly opts in interfaces that
+    # would otherwise be soft-skipped (e.g., wg-mesh0 in a corp
+    # overlay deployment); SuppressInterfaces drops interfaces that
+    # would otherwise be enumerated (e.g., docker0 on a build host).
+
+    # rules".
+    advertise_interfaces: list = dataclasses.field(default_factory=list)
+    suppress_interfaces: list = dataclasses.field(default_factory=list)
+
+
+def load_global_config(path: Path) -> GlobalConfig:
+    cp = configparser.ConfigParser
+    cp.optionxform = str  # preserve case for base64 values
+    if not cp.read(path):
+        sys.stderr.write(f"[FATAL] config file not found: {path}\n")
+        sys.exit(2)
+
+    salt_str = cp.get("Global", "Salt", fallback="").strip
+    if not salt_str or salt_str == "CHANGE_ME_TO_A_SECURE_RANDOM_STRING":
+        sys.stderr.write(
+            f"[FATAL] {path}: [Global] Salt must be set to a unique random value.\n"
+            "Generate one with: head -c 32 /dev/urandom | base64\n"
+        )
+        sys.exit(2)
+    salt = salt_str.encode("utf-8")
+
+    peerjs_server = cp.get("Global", "PeerJsServer", fallback=DEFAULT_PEERJS_SERVER).strip
+    peerjs_key = cp.get("Global", "PeerJsKey", fallback=DEFAULT_PEERJS_KEY).strip
+
+    public_ip_str = cp.get("Global", "PublicIp", fallback="").strip
+    public_ip = None
+    if public_ip_str:
+        try:
+            addr = ipaddress.ip_address(public_ip_str)
+        except ValueError:
+            sys.stderr.write(
+                f"[FATAL] {path}: [Global] PublicIp = {public_ip_str!r} "
+                "is not a valid IP address.\n"
+            )
+            sys.exit(2)
+        if not isinstance(addr, ipaddress.IPv4Address):
+            sys.stderr.write(
+                f"[FATAL] {path}: [Global] PublicIp must be IPv4. "
+                "IPv6 endpoint publication is not yet implemented; "
+                "see wg-holepunch-guide.md §8 (Limitations).\n"
+            )
+            sys.exit(2)
+        if (addr.is_loopback or addr.is_multicast or addr.is_link_local
+                or addr.is_unspecified or addr.is_reserved):
+            sys.stderr.write(
+                f"[FATAL] {path}: [Global] PublicIp = {public_ip_str} "
+                "is not routable on the public internet.\n"
+            )
+            sys.exit(2)
+        public_ip = str(addr)
+
+    stun_raw = cp.get("Stun", "Servers", fallback=", ".join(DEFAULT_STUN_SERVERS))
+    stun = [s.strip for s in stun_raw.split(",") if s.strip]
+
+    # When `Strict = yes`, get_public_ipv4 rejects STUN responses
+    # that report a non-globally-routable address (private RFC 1918,
+    # CGN, loopback, link-local, multicast, unspecified, reserved).
+    # Catches a hijacked or misconfigured STUN server feeding us an
+    # internal IP that we'd otherwise advertise as the host's
+    # publicly-reachable endpoint.  Default off because LAN-only
+    # deployments legitimately need to advertise private addresses.
+    stun_strict = cp.getboolean("Stun", "Strict", fallback=False)
+
+    enrollment_enabled = cp.getboolean(
+        "Enrollment", "Enabled", fallback=False)
+    provision_script = cp.get(
+        "Enrollment", "ProvisionScript", fallback="").strip or None
+    state_dir_str = cp.get(
+        "Enrollment", "StateDir", fallback="/var/lib/wireguardrtc").strip
+    try:
+        max_pending = cp.getint("Enrollment", "MaxPendingTokens", fallback=32)
+    except ValueError:
+        sys.stderr.write(
+            f"[FATAL] {path}: [Enrollment] MaxPendingTokens must be an integer.\n")
+        sys.exit(2)
+    if max_pending < 1 or max_pending > 1000:
+        sys.stderr.write(
+            f"[FATAL] {path}: [Enrollment] MaxPendingTokens out of range "
+            f"(got {max_pending}, allowed 1..1000).\n")
+        sys.exit(2)
+    if enrollment_enabled and not provision_script:
+        sys.stderr.write(
+            f"[FATAL] {path}: [Enrollment] Enabled requires "
+            f"ProvisionScript to be set.\n")
+        sys.exit(2)
+    auto_active = cp.getboolean(
+        "Enrollment", "AutoActive", fallback=True)
+
+    advertise_raw = cp.get("Global", "AdvertiseInterfaces", fallback="")
+    advertise_interfaces = [
+        s.strip for s in advertise_raw.split(",") if s.strip
+    ]
+    suppress_raw = cp.get("Global", "SuppressInterfaces", fallback="")
+    suppress_interfaces = [
+        s.strip for s in suppress_raw.split(",") if s.strip
+    ]
+
+    return GlobalConfig(
+        salt=salt,
+        peerjs_server=peerjs_server,
+        peerjs_key=peerjs_key,
+        stun_servers=stun,
+        public_ip=public_ip,
+        stun_strict=stun_strict,
+        enrollment_enabled=enrollment_enabled,
+        provision_script=provision_script,
+        state_dir=Path(state_dir_str),
+        max_pending_tokens=max_pending,
+        auto_active_enrollment=auto_active,
+        advertise_interfaces=advertise_interfaces,
+        suppress_interfaces=suppress_interfaces,
+    )
+
+
+AUTO_ACTIVE_SUBDIR = "auto-enrolled.d"
+
+
+def auto_active_dir(state_dir: Path) -> Path:
+    """Path to the runtime drop-in directory the daemon writes to
+    when [Enrollment] AutoActive = yes.  Lives under state_dir
+    (writable by the daemon), separate from the read-only admin
+    dir at /etc/wireguardrtc/peers.d.  Per-pubkey filenames; the
+    daemon scans this in addition to the admin dir."""
+    return state_dir / AUTO_ACTIVE_SUBDIR
+
+
+def write_auto_active_peer(state_dir: Path, pubkey_b64: str,
+                           label: str, iface: str) -> None:
+    """Write a peers.d-style drop-in for a freshly-enrolled peer with
+    Mode=active.  Filename is the SHA-256 fingerprint of the pubkey
+    (truncated, hex) so admin and auto-enrolled drop-ins can never
+    collide on filename, and re-enrolment of the same pubkey
+    overwrites idempotently."""
+    aa_dir = auto_active_dir(state_dir)
+    aa_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(aa_dir, 0o700)
+    fp = hashlib.sha256(pubkey_b64.encode("utf-8")).hexdigest[:16]
+    # Sanitise label for use as a filename hint — admin-supplied
+    # via the URI's name field, but already validated by
+    # cmd_enroll_token to be free of path-injecting characters.
+    safe_label = "".join(c for c in label
+                         if c.isalnum or c in "-_.") or "peer"
+    path = aa_dir / f"{safe_label}-{fp}.conf"
+    body = (f"# auto-generated by wireguardrtc on enrolment.\n"
+            f"# An admin-authored entry in /etc/wireguardrtc/peers.d/\n"
+            f"# with the same PublicKey overrides this drop-in.\n"
+            f"# Manage / delete via the same flow as peers.d: this\n"
+            f"# file is a regular wireguardrtc peer drop-in.\n"
+            f"[Peer]\n"
+            f"PublicKey = {pubkey_b64}\n"
+            f"Mode = active\n"
+            f"# Iface = {iface}\n")
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+    os.replace(tmp, path)
+
+
+def load_peer_configs(directory: Path,
+                      auto_active_directory: Optional[Path] = None) -> dict:
+    """Load every drop-in. Returns {public_key: PeerConfig}.
+
+    Two source directories:
+      - `directory` — the admin-authored, read-only
+        /etc/wireguardrtc/peers.d.  Authoritative.
+      - `auto_active_directory` — the runtime drop-in dir under
+        state_dir, populated by write_auto_active_peer when
+        [Enrollment] AutoActive = yes.
+
+    Admin entries win on pubkey collision so an explicit override
+    never fires.  Pass None for auto_active_directory to skip the
+    auto-loaded set entirely (CLI tools that don't care about
+    runtime peers, e.g. --show-config).
+    """
+    out: dict = {}
+    # Auto-active first; admin overrides next so admin wins on
+    # collision.  Both dirs use the same drop-in format.
+    for d in [auto_active_directory, directory]:
+        if d is None or not d.is_dir:
+            continue
+        out = _merge_peer_dir(out, d, override=(d == directory))
+    return out
+
+
+def _merge_peer_dir(into: dict, directory: Path, override: bool) -> dict:
+    for path in sorted(directory.glob("*.conf")):
+        cp = configparser.ConfigParser
+        cp.optionxform = str
+        if not cp.read(path):
+            logging.warning("could not read %s", path)
+            continue
+        if "Peer" not in cp:
+            logging.warning("%s: no [Peer] section, skipping", path)
+            continue
+        sec = cp["Peer"]
+        pubkey = sec.get("PublicKey", "").strip
+        if not pubkey:
+            logging.warning("%s: no PublicKey in [Peer], skipping", path)
+            continue
+        mode_str = sec.get("Mode", "passive").striplower
+        try:
+            mode = Mode(mode_str)
+        except ValueError:
+            logging.warning("%s: unknown Mode=%r, defaulting to passive",
+                            path, mode_str)
+            mode = Mode.PASSIVE
+        dns_host = sec.get("DnsHost", "").strip or None
+        if mode == Mode.DNS_ROAM and not dns_host:
+            logging.warning("%s: dns-roam requires DnsHost, ignoring peer", path)
+            continue
+        if pubkey in into and not override:
+            # Auto-active dir runs first (override=False).  If admin
+            # later loads the same pubkey, that's the override path
+            # below — no warning.
+            logging.debug("%s: duplicate PublicKey already loaded from %s",
+                          path, into[pubkey].label)
+            continue
+        if pubkey in into and override:
+            # Admin override — silently replace the auto-active entry.
+            pass
+        into[pubkey] = PeerConfig(
+            public_key=pubkey,
+            mode=mode,
+            label=path.stem,
+            dns_host=dns_host,
+        )
+    return into
+
+
+# ---------------------------------------------------------------------------
+# Anti-spam logging
+# ---------------------------------------------------------------------------
+
+
+class StateLogger:
+    """Emit a line only when the (scope, key) value changes."""
+    def __init__(self):
+        self._state = {}
+
+    def event(self, scope, key, value, message, level=logging.INFO):
+        cell = (scope, key)
+        if self._state.get(cell) == value:
+            return
+        self._state[cell] = value
+        logging.log(level, "[%s] %s", scope, message)
+
+
+LOG = StateLogger
+
+
+# ---------------------------------------------------------------------------
+# WireGuard kernel state (via `wg`)
+# ---------------------------------------------------------------------------
+
+
+def wg_show(*args) -> str:
+    res = subprocess.run(
+        ["wg", "show", *args],
+        capture_output=True, text=True, timeout=5,
+    )
+    if res.returncode != 0:
+        # caller decides what to do; don't spam
+        return ""
+    return res.stdout
+
+
+def wg_set(*args) -> bool:
+    res = subprocess.run(
+        ["wg", "set", *args],
+        capture_output=True, text=True, timeout=5,
+    )
+    if res.returncode != 0:
+        logging.warning("wg set %s failed: %s",
+                        " ".join(args), res.stderr.strip)
+        return False
+    return True
+
+
+def list_interfaces -> list:
+    return wg_show("interfaces").split
+
+
+def get_iface_field(iface, field) -> str:
+    return wg_show(iface, field).strip
+
+
+def get_iface_table(iface, field) -> dict:
+    """For per-peer fields like endpoints/allowed-ips/latest-handshakes:
+    returns {pubkey: rest_of_line_with_whitespace_separated_values}."""
+    out = {}
+    for line in wg_show(iface, field).splitlines:
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
+        elif len(parts) == 1:
+            out[parts[0]] = ""
+    return out
+
+
+# ---------------------------------------------------------------------------
+# STUN client (async, validates txid)
+# ---------------------------------------------------------------------------
+
+
+async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
+    """Returns (external_ip, external_port) on success, or None."""
+    if ":" not in server:
+        return None
+    host, port_s = server.rsplit(":", 1)
+    try:
+        port = int(port_s)
+    except ValueError:
+        return None
+    loop = asyncio.get_running_loop
+    try:
+        infos = await loop.getaddrinfo(host, None, family=socket.AF_INET,
+                                       type=socket.SOCK_DGRAM)
+    except socket.gaierror:
+        return None
+    if not infos:
+        return None
+    server_ip = infos[0][4][0]
+
+    txid = os.urandom(12)
+    request = struct.pack("!HHL12s", 0x0001, 0, STUN_MAGIC_COOKIE, txid)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    sock.bind(("0.0.0.0", 0))
+    try:
+        sock.sendto(request, (server_ip, port))
+        deadline = loop.time + timeout
+        while loop.time < deadline:
+            remaining = deadline - loop.time
+            try:
+                data = await asyncio.wait_for(loop.sock_recv(sock, 2048),
+                                              timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            if len(data) < 20:
+                continue
+            msg_type, msg_len, magic, resp_txid = struct.unpack("!HHL12s",
+                                                                data[:20])
+            if (msg_type != 0x0101 or magic != STUN_MAGIC_COOKIE
+                    or resp_txid != txid):
+                continue
+            offset = 20
+            end = 20 + msg_len
+            while offset + 4 <= end:
+                atype, alen = struct.unpack("!HH", data[offset:offset + 4])
+                offset += 4
+                if atype == 0x0020 and alen >= 8:
+                    family = data[offset + 1]
+                    if family == 0x01:
+                        xport = struct.unpack("!H",
+                                              data[offset + 2:offset + 4])[0]
+                        xip = struct.unpack("!L",
+                                            data[offset + 4:offset + 8])[0]
+                        ext_port = xport ^ (STUN_MAGIC_COOKIE >> 16)
+                        ext_ip = socket.inet_ntoa(
+                            struct.pack("!L", xip ^ STUN_MAGIC_COOKIE))
+                        return ext_ip, ext_port
+                offset += alen + ((4 - (alen % 4)) % 4)
+        return None
+    finally:
+        sock.close
+
+
+def _stun_response_passes_strict(server, ext_ip) -> bool:
+    """Strict-mode filter: only globally-routable IPs accepted.  Logs
+    rejection with the server name so users can debug a hijacked /
+    misconfigured STUN server feeding internal addresses."""
+    try:
+        addr = ipaddress.ip_address(ext_ip)
+    except ValueError:
+        LOG.event("stun", "rejected", f"{server}:{ext_ip}",
+                  f"STUN strict: {server} returned malformed "
+                  f"address {ext_ip!r}; rejecting",
+                  level=logging.WARNING)
+        return False
+    if not addr.is_global:
+        LOG.event("stun", "rejected", f"{server}:{ext_ip}",
+                  f"STUN strict: {server} returned "
+                  f"non-routable {ext_ip}; rejecting",
+                  level=logging.WARNING)
+        return False
+    return True
+
+
+async def get_public_ipv4(stun_servers, state) -> Optional[str]:
+    """Return the host's public IPv4 address.
+
+    If the GlobalConfig has a `public_ip` override set, return it immediately
+    and skip STUN entirely.  Otherwise query all STUN servers in PARALLEL
+    and return the first valid response — the slowest server no longer
+    blocks the rest, which matters when the configured list mixes a
+    fast nearby server with an unreachable / slow one.
+
+    With `[Stun] Strict = yes`, STUN responses whose XOR-MAPPED-ADDRESS
+    is non-globally-routable (RFC 1918 private, CGN, loopback, etc.)
+    are skipped — guards against a hijacked or misconfigured STUN
+    server feeding us an internal IP.  Default is off because LAN-only
+    deployments legitimately advertise private addresses.
+
+    Step H of the candidate-negotiation v2 design (memory:
+    project_protocol_signal_wake_candidates.md).  Single-result API
+    preserved for back-compat; multi-homed daemons use
+    `get_public_ipv4_all` to discover every reflexive address at once.
+    """
+    if getattr(state, "public_ip", None):
+        LOG.event("stun", "public_ip", state.public_ip,
+                  f"public IPv4 = {state.public_ip} (configured override; "
+                  f"STUN skipped)")
+        return state.public_ip
+    if not stun_servers:
+        LOG.event("stun", "public_ip", None, "STUN: no servers configured")
+        return None
+    strict = getattr(state, "stun_strict", False)
+    # Fire all servers in parallel and process responses in completion
+    # order.  First valid response wins; remaining tasks are cancelled
+    # so their sockets close promptly.  Each task is the
+    # _stun_query_with_server wrapper so the awaited result carries
+    # the server name — `asyncio.as_completed` returns opaque future
+    # wrappers, not the original tasks, so we can't recover the
+    # server name from the future itself.
+    tasks = [
+        asyncio.create_task(_stun_query_with_server(server))
+        for server in stun_servers
+    ]
+    try:
+        for done in asyncio.as_completed(tasks):
+            server, result = await done
+            if result is None:
+                continue
+            ext_ip, _ = result
+            if strict and not _stun_response_passes_strict(server, ext_ip):
+                continue
+            LOG.event("stun", "public_ip", ext_ip,
+                      f"public IPv4 mapped as {ext_ip} via {server}")
+            return ext_ip
+    finally:
+        for t in tasks:
+            if not t.done:
+                t.cancel
+        # Drain cancellations — keeps asyncio's "Task was destroyed
+        # but it is pending" warnings out of the log.
+        await asyncio.gather(*tasks, return_exceptions=True)
+    LOG.event("stun", "public_ip", None, "STUN: no server responded")
+    return None
+
+
+async def get_public_ipv4_all(stun_servers, state) -> list:
+    """Parallel multi-result variant of `get_public_ipv4`.
+
+    Returns a deduped list of all valid public IPv4 addresses observed,
+    in completion order.  A single-homed daemon with three configured
+    servers gets back a one-element list (all three see the same NAT
+    mapping).  A multi-homed daemon — different upstream paths to
+    different STUN servers — gets back the full set of distinct
+    reflexive addresses.
+
+    Used by the Step C sender-side multi-candidate enumeration: every
+    distinct STUN-discovered IP becomes a `kind=stun` candidate.
+
+    PublicIp override returns `[public_ip]` (single-element list) and
+    skips STUN entirely — same semantics as `get_public_ipv4`.
+
+    Returns `[]` if no server responded with a valid (under strict
+    mode) IP.  Caller distinguishes `[]` from `None`: empty list
+    means "STUN ran, found nothing usable"; never returns None.
+    """
+    if getattr(state, "public_ip", None):
+        return [state.public_ip]
+    if not stun_servers:
+        return []
+    strict = getattr(state, "stun_strict", False)
+    tasks = [
+        asyncio.create_task(_stun_query_with_server(server))
+        for server in stun_servers
+    ]
+    # CR-10: return_exceptions=True so one misbehaving STUN server
+    # (network-down on its iface, hostname resolution exception, etc.)
+    # doesn't abort the whole gather and force an empty candidate list.
+    # Surviving servers still produce results.
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    seen = set
+    out: list = []
+    for entry in raw:
+        if isinstance(entry, BaseException):
+            LOG.event("stun", "task-error", repr(entry),
+                      f"STUN task raised {type(entry).__name__}: {entry}; "
+                      f"continuing with surviving responses",
+                      level=logging.WARNING)
+            continue
+        server, result = entry
+        if result is None:
+            continue
+        ext_ip, _ = result
+        if strict and not _stun_response_passes_strict(server, ext_ip):
+            continue
+        if ext_ip in seen:
+            continue
+        seen.add(ext_ip)
+        out.append(ext_ip)
+        LOG.event("stun", "public_ip", ext_ip,
+                  f"public IPv4 mapped as {ext_ip} via {server}")
+    if not out:
+        LOG.event("stun", "public_ip", None,
+                  "STUN: no valid response from any configured server")
+    return out
+
+
+async def _stun_query_with_server(server):
+    """Wrapper that pairs the server name with the result so the caller
+    can attribute responses for logging / strict-mode reporting."""
+    return server, await stun_query(server)
+
+
+# ---------------------------------------------------------------------------
+# Step C: multi-candidate enumeration
+# ---------------------------------------------------------------------------
+#
+#  —
+# replaces the single-candidate emission in `signal_peer` with a ranked
+# list built from PublicIp + parallel STUN + local interfaces.  The
+# `kind` tag is mostly diagnostic; `rank` (lower = better) drives the
+# receiver's pick order.
+
+# Tunnel-name patterns: default-skip unless explicitly allowlisted via
+# [Global] AdvertiseInterfaces.  See §"Sender rules / SOFT-SKIP".
+_TUNNEL_IFACE_RE = re.compile(
+    r"^("
+    r"tun\d+|"        r"tap\d+|"
+    r"ppp\d+|"
+    r"tailscale\d+|"
+    r"zt[0-9a-f]+|"   # ZeroTier: zt<10-hex-id>
+    r"gre\d+|gretap\d+|"
+    r"sit\d+|"
+    r"ipip\d+|"
+    r"ip6tnl\d+|ip6gre\d+|"
+    r"erspan\d+|"
+    r"ifb\d+|dummy\d+|"
+    r"ip_vti\d+|ip6_vti\d+"
+    r")$"
+)
+
+_BRIDGE_IFACE_RE = re.compile(r"^(br[\w-]*|vmbr\d+|virbr\d+)$")
+
+
+def _is_tunnel_iface_name(name: str) -> bool:
+    return bool(_TUNNEL_IFACE_RE.match(name)) or name.startswith("wg")
+
+
+def _is_bridge_iface_name(name: str) -> bool:
+    return bool(_BRIDGE_IFACE_RE.match(name))
+
+
+# RFC 7335 v4-only-host stub; never advertise (Pixel CLAT puts
+# `192.0.0.4/32` on the cellular CLAT iface — see
+# `9_interface_names.md`).
+_RFC7335_CLAT = ipaddress.ip_network("192.0.0.0/29")
+
+
+def _is_candidate_eligible_v4(ip_str: str) -> bool:
+    """True if `ip_str` is a v4 IP usable as a candidate.  Drops
+    loopback, link-local (169.254/16), multicast, unspecified
+    (0.0.0.0), and the RFC 7335 CLAT stub (192.0.0.0/29)."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+    if addr.is_loopback or addr.is_link_local: return False
+    if addr.is_multicast or addr.is_unspecified: return False
+    if addr.is_reserved: return False
+    if addr in _RFC7335_CLAT: return False
+    return True
+
+
+def _is_private_v4(ip_str: str) -> bool:
+    """RFC 1918 + CGNAT (100.64.0.0/10) → True; globally-routable → False.
+    We treat both classes the same for ranking purposes (rank 50,
+    kind=lan).  CGNAT is intentionally NOT dropped — many CGNAT
+    deployments hole-punch fine and the daemon's own STUN-discovered
+    address may itself be CGNAT."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return False
+    return not addr.is_global
+
+
+_IPROUTE2_MISSING_WARNED = False
+
+
+def _warn_iproute2_missing_once:
+    """One-shot WARN at startup-or-first-attempt when `ip` is missing.
+    Hardened containers without iproute2 can otherwise silently lose
+    the iface enumeration leg of candidate discovery (CR-8) — the
+    daemon then advertises only STUN-derived candidates with no log
+    explaining why local addresses are missing."""
+    global _IPROUTE2_MISSING_WARNED
+    if _IPROUTE2_MISSING_WARNED:
+        return
+    _IPROUTE2_MISSING_WARNED = True
+    LOG.event("candidates", "iproute2", "missing",
+              "iproute2 (`ip` command) not found in PATH; local "
+              "interface enumeration disabled — candidate list will "
+              "include STUN/PublicIp only.  Install iproute2 (`apt "
+              "install iproute2`) or accept reduced functionality.",
+              level=logging.WARNING)
+
+
+def _enumerate_iface_addrs_v4_ioctl -> list:
+    """Pure-stdlib fallback for iface enumeration: walk
+    `socket.if_nameindex` and SIOCGIFADDR each name.  Works without
+    iproute2 (or any subprocess) — needed inside the daemon's strict
+    systemd sandbox where `ip` sometimes returns empty output for
+    reasons we can't otherwise pin down.
+
+    Misses secondary IPv4 aliases (SIOCGIFADDR returns the primary
+    only); the practical loss is small since multi-address ifaces are
+    rare on hosts that need hole-punching.  Returns
+    [(iface, ip_str), ...]; empty on any failure."""
+    SIOCGIFADDR = 0x8915
+    addrs: list = []
+    try:
+        ifaces = socket.if_nameindex
+    except OSError:
+        return []
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _idx, name in ifaces:
+            try:
+                ifr = struct.pack("256s", name.encode("utf-8")[:15])
+                res = fcntl.ioctl(sock.fileno, SIOCGIFADDR, ifr)
+            except OSError:
+                # Many ifaces (notably IPv6-only and DOWN ones) refuse
+                # SIOCGIFADDR with EADDRNOTAVAIL; that's expected.
+                continue
+            try:
+                ip = socket.inet_ntoa(res[20:24])
+            except OSError:
+                continue
+            addrs.append((name, ip))
+    except OSError:
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close
+            except OSError:
+                pass
+    return addrs
+
+
+async def _enumerate_iface_addrs_v4 -> list:
+    """Default provider: shell out to `ip -4 -o addr show` and parse,
+    falling through to a SIOCGIFADDR-based stdlib enumeration when
+    `ip` is missing OR returns no usable lines.  Returns
+    [(iface_name, ip_str), ...].
+
+    The dual approach is deliberate: prefer `ip` because it sees
+    secondary aliases the SIOCGIFADDR ioctl doesn't, but inside hard
+    systemd sandboxes the subprocess sometimes succeeds with empty
+    output (no FileNotFoundError, no exception — just an empty stdout)
+    and we want the daemon to keep producing LAN candidates regardless.
+    Failure of both paths → empty list."""
+    out_str = ""
+    rc = -1
+    err_str = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip", "-4", "-o", "addr", "show",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate
+        rc = proc.returncode
+        out_str = out_b.decode("utf-8", errors="replace")
+        err_str = err_b.decode("utf-8", errors="replace").strip
+    except (FileNotFoundError, OSError):
+        _warn_iproute2_missing_once
+    addrs: list = []
+    for line in out_str.splitlines:
+        # Format: "<idx>: <iface> inet <ip>/<prefix> ... scope <scope> ..."
+        toks = line.split
+        try:
+            i_inet = toks.index("inet")
+            iface = toks[1]
+            ip_with_prefix = toks[i_inet + 1]
+            ip_str = ip_with_prefix.split("/")[0]
+        except (ValueError, IndexError):
+            continue
+        addrs.append((iface, ip_str))
+    if addrs:
+        return addrs
+    # `ip` produced nothing parseable.  Fall through to the ioctl
+    # enumeration so a sandboxed daemon still gets LAN candidates.
+    fallback = _enumerate_iface_addrs_v4_ioctl
+    LOG.event("candidates", "iface-enum-fallback",
+              f"rc={rc},nfb={len(fallback)}",
+              f"`ip -4 -o addr show` returned no usable lines "
+              f"(rc={rc}, stderr={err_str!r}); falling back to "
+              f"SIOCGIFADDR ioctl, found {len(fallback)} addrs")
+    return fallback
+
+
+def _default_route_iface_v4_proc -> Optional[str]:
+    """Pure-stdlib /proc-based default-route lookup.  Used as fallback
+    when iproute2 is missing.  /proc/net/route is universal on Linux
+    (containers, busybox, embedded) so this works where `ip` doesn't.
+
+    Format: column 0 is iface, column 1 is destination (hex
+    little-endian), column 7 is mask (hex le).  Default route =
+    destination 00000000 + mask 00000000."""
+    try:
+        with open("/proc/net/route", "r") as f:
+            for line in f:
+                cols = line.split
+                if len(cols) < 8:
+                    continue
+                if cols[0] == "Iface":
+                    continue
+                if cols[1] == "00000000" and cols[7] == "00000000":
+                    return cols[0]
+    except (OSError, IOError):
+        return None
+    return None
+
+
+async def _default_route_iface_v4 -> Optional[str]:
+    """Default provider: which iface holds the v4 default route?
+    Returns the iface name, or None if no default route is present.
+    Tries `ip` first, falls back to /proc/net/route on missing
+    iproute2 OR on empty `ip` output (the same sandbox-quirk path
+    that affects `_enumerate_iface_addrs_v4`)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip", "-4", "route", "show", "default",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate
+    except (FileNotFoundError, OSError):
+        # Fall back to /proc/net/route — works in any Linux container,
+        # iproute2 not required.
+        _warn_iproute2_missing_once
+        return _default_route_iface_v4_proc
+    for line in out.decode("utf-8", errors="replace").splitlines:
+        toks = line.split
+        try:
+            return toks[toks.index("dev") + 1]
+        except (ValueError, IndexError):
+            continue
+    # `ip` exited cleanly but produced nothing — fall through.
+    return _default_route_iface_v4_proc
+
+
+def _classify_iface_addr(
+    iface: str, ip_str: str,
+    default_iface: Optional[str],
+    advertise_set: set,
+    suppress_set: set,
+    own_wg_ifaces: set,
+) -> Optional[tuple]:
+    """Decide (rank, kind) for a (iface, ip) pair, or None to drop.
+    Pure function — easy to test in isolation."""
+    if iface in own_wg_ifaces:
+        return None
+    if iface in suppress_set:
+        return None
+    if not _is_candidate_eligible_v4(ip_str):
+        return None
+    if _is_tunnel_iface_name(iface) and iface not in advertise_set:
+        return None
+
+    # AdvertiseInterfaces allowlist — rank 60, kind=mesh.  The user
+    # explicitly opted this in; respect that even for "weird" addrs.
+    if iface in advertise_set:
+        return (60, "mesh")
+
+    # Private (RFC1918 + CGNAT) — rank 50, kind=lan.
+    if _is_private_v4(ip_str):
+        if _is_bridge_iface_name(iface):
+            return (40, "lan")
+        return (50, "lan")
+
+    # Globally-routable on a bridge — rank 40, kind=lan (bridges are
+    # typically LAN-side; if it's somehow public it still works).
+    if _is_bridge_iface_name(iface):
+        return (40, "lan")
+
+    # Globally-routable on a physical iface — depends on default route.
+    if default_iface is not None and iface == default_iface:
+        return (20, "stun")
+    return (30, "stun")
+
+
+CANDIDATE_LIST_CAP = 10
+
+
+async def discover_local_candidates(
+    global_config, listen_port: int,
+    own_wg_ifaces=None,
+    iface_addrs_provider=None,
+    default_iface_provider=None,
+    stun_provider=None,
+) -> list:
+    """Build the ranked candidate list this daemon advertises in
+    OFFERs.  Returns a list of `{"ip", "port", "kind"}` dicts in
+    rank order (lowest rank first).  Capped at
+    `CANDIDATE_LIST_CAP`.  Deduplicated by IP — a STUN response
+    that matches an admin-configured `PublicIp` only appears once.
+
+    Step C of the candidate-negotiation v2 design.
+
+    The provider arguments are dependency-injection seams for tests
+    (see `tests/27_candidate_enumerate.py`).  In production they
+    default to `_enumerate_iface_addrs_v4` /
+    `_default_route_iface_v4` / `get_public_ipv4_all`.
+    """
+    iface_addrs_provider = iface_addrs_provider or _enumerate_iface_addrs_v4
+    default_iface_provider = default_iface_provider or _default_route_iface_v4
+    stun_provider = stun_provider or get_public_ipv4_all
+    own_wg = set(own_wg_ifaces or [])
+    advertise_set = set(global_config.advertise_interfaces)
+    suppress_set = set(global_config.suppress_interfaces)
+
+    # Run STUN + iface enumeration + default route in parallel.  STUN
+    # is the slow leg (~2 s for unreachable servers); the others are
+    # local subprocess calls.  CR-10: return_exceptions=True so a
+    # raise from one provider degrades to an empty result for that
+    # leg rather than killing the whole enumeration.
+    raw = await asyncio.gather(
+        stun_provider(global_config.stun_servers, global_config),
+        iface_addrs_provider,
+        default_iface_provider,
+        return_exceptions=True,
+    )
+    def _unwrap(entry, default, label):
+        if isinstance(entry, BaseException):
+            LOG.event("candidates", f"{label}-error", repr(entry),
+                      f"{label} provider raised {type(entry).__name__}: "
+                      f"{entry}; degrading to empty",
+                      level=logging.WARNING)
+            return default
+        return entry
+    stun_ips      = _unwrap(raw[0], [],   "stun")
+    iface_addrs   = _unwrap(raw[1], [],   "iface-enum")
+    default_iface = _unwrap(raw[2], None, "default-route")
+
+    candidates: list = []
+    seen_ips: set = set
+
+    def _add(ip, kind, rank):
+        if ip in seen_ips:
+            return
+        seen_ips.add(ip)
+        candidates.append({
+            "ip": ip, "port": int(listen_port),
+            "kind": kind, "_rank": rank,
+        })
+
+    # Rank 0: PublicIp override.
+    if getattr(global_config, "public_ip", None):
+        if _is_candidate_eligible_v4(global_config.public_ip):
+            _add(global_config.public_ip, "stun", 0)
+
+    # Rank 10: STUN reflexive (deduped vs PublicIp).
+    for ip in (stun_ips or []):
+        if _is_candidate_eligible_v4(ip):
+            _add(ip, "stun", 10)
+
+    # Rank 20-60: local interface addresses.
+    # Per-iface accept/reject diagnostics at DEBUG so they're available
+    # when chasing a "why is candidate X missing" issue (the smoking
+    # gun for the iproute2-SIGSYS finding earlier in the project) but
+    # don't pollute INFO output during normal operation.
+    if logging.getLoggerisEnabledFor(logging.DEBUG):
+        raw_str = ",".join(f"{i}:{a}" for i, a in iface_addrs) or "<empty>"
+        LOG.event("candidates", "iface-enum-raw", raw_str,
+                  f"iface_addrs from provider: {raw_str}; "
+                  f"default_iface={default_iface}; "
+                  f"advertise={sorted(advertise_set)}; "
+                  f"suppress={sorted(suppress_set)}; "
+                  f"own_wg={sorted(own_wg)}",
+                  level=logging.DEBUG)
+    decisions: list = []
+    for iface, ip_str in iface_addrs:
+        if ip_str in seen_ips:
+            decisions.append(f"{iface}:{ip_str}=dup")
+            continue
+        cls = _classify_iface_addr(
+            iface, ip_str, default_iface,
+            advertise_set, suppress_set, own_wg,
+        )
+        if cls is None:
+            # Re-derive the reason for diagnostics (cheap).
+            if iface in own_wg:
+                why = "own-wg"
+            elif iface in suppress_set:
+                why = "suppress"
+            elif not _is_candidate_eligible_v4(ip_str):
+                why = "ineligible-ip"
+            elif _is_tunnel_iface_name(iface) and iface not in advertise_set:
+                why = "tunnel-not-advertised"
+            else:
+                why = "unknown"
+            decisions.append(f"{iface}:{ip_str}=drop({why})")
+            continue
+        rank, kind = cls
+        decisions.append(f"{iface}:{ip_str}=keep(rank={rank},kind={kind})")
+        _add(ip_str, kind, rank)
+    if logging.getLoggerisEnabledFor(logging.DEBUG):
+        decisions_str = ",".join(decisions) or "<empty>"
+        LOG.event("candidates", "iface-enum-decisions", decisions_str,
+                  f"iface decisions: {decisions_str}",
+                  level=logging.DEBUG)
+
+    # Sort by rank, then by original insertion order (stable sort).
+    candidates.sort(key=lambda c: c["_rank"])
+    # Cap and strip _rank.
+    candidates = candidates[:CANDIDATE_LIST_CAP]
+    for c in candidates:
+        c.pop("_rank", None)
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Crypto: domain-separated SecretBox
+# ---------------------------------------------------------------------------
+
+
+def derive_secretbox_key(my_priv_b64: str, peer_pub_b64: str) -> bytes:
+    """X25519 ECDH then BLAKE2b-keyed → 32-byte SecretBox key.
+
+    Domain separation: the resulting key is bound to PROTOCOL_LABEL; it can
+    never collide with WireGuard's own session keys or any other use of the
+    same Curve25519 keypair.
+    """
+    my_priv = base64.b64decode(my_priv_b64)
+    peer_pub = base64.b64decode(peer_pub_b64)
+    shared = crypto_scalarmult(my_priv, peer_pub)
+    # generichash(in, key=label, digest_size=32) is a keyed BLAKE2b.
+    return _nacl_blake2b(shared, digest_size=32, key=PROTOCOL_LABEL[:32], encoder=_NaclRawEncoder)
+
+
+def encrypt_envelope(key: bytes,
+                     candidates: list,
+                     ts: Optional[int] = None) -> str:
+    """Encrypt a signalling-OFFER blob carrying a list of candidate
+    endpoints in preference order.  Sender empties the list for a
+    `signal_wake` (it doesn't claim an endpoint).  See
+    project_protocol_signal_wake_candidates memo for rationale."""
+    payload = {
+        "v": PROTOCOL_VERSION,
+        "ts": int(ts if ts is not None else time.time),
+        "candidates": list(candidates or []),
+    }
+    box = SecretBox(key)
+    ct = box.encrypt(json.dumps(payload).encode("utf-8"))
+    return base64.b64encode(ct).decode("ascii")
+
+
+def decrypt_envelope(key: bytes, blob_b64: str) -> Optional[dict]:
+    """Decrypt + validate (version, freshness, structural shape).
+    Returns the plaintext dict on success or None on any failure
+    (silent — the receiver shouldn't leak per-step distinctions to
+    a probing attacker)."""
+    if not isinstance(blob_b64, str) or len(blob_b64) > MAX_SIGBOX_CIPHERTEXT_B64:
+        return None
+    try:
+        ct = base64.b64decode(blob_b64)
+        plain = SecretBox(key).decrypt(ct)
+        if len(plain) > MAX_SIGBOX_PLAINTEXT:
+            return None
+        msg = json.loads(plain.decode("utf-8"))
+    except Exception:
+        return None
+    if msg.get("v") != PROTOCOL_VERSION:
+        return None
+    ts = msg.get("ts")
+    if not isinstance(ts, int):
+        return None
+    if abs(time.time - ts) > PROTOCOL_FRESHNESS_WINDOW:
+        return None
+    # Normalise: every plaintext now carries `candidates` (list).
+    # Reject anything else.
+    cands = msg.get("candidates")
+    if not isinstance(cands, list):
+        return None
+    return msg
+
+
+def first_valid_candidate(msg: dict) -> Optional[tuple]:
+    """Return the first `(ip, port)` candidate from a decrypted
+    OFFER plaintext that passes [is_valid_public_endpoint], or None.
+    Validation is per-candidate; bad entries are skipped silently
+    (they're either typos or maliciously-injected garbage and the
+    receiver mustn't dump kernel WG state into them).
+    """
+    for c in msg.get("candidates", []) or []:
+        if not isinstance(c, dict):
+            continue
+        ip = c.get("ip")
+        port = c.get("port")
+        if not isinstance(ip, str) or not isinstance(port, int):
+            continue
+        if not is_valid_public_endpoint(ip, port):
+            continue
+        return ip, port
+    return None
+
+
+def is_valid_public_endpoint(ip: str, port: int) -> bool:
+    """Reject loopback, link-local, multicast, unspecified, reserved, and
+    weirdly-low ports. A malicious peer could otherwise redirect WG to dump
+    handshakes onto a metadata service or local link."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if (addr.is_loopback or addr.is_multicast or addr.is_link_local
+            or addr.is_unspecified or addr.is_reserved):
+        return False
+    if isinstance(addr, ipaddress.IPv4Address) and addr.is_private:
+        # Private addresses can be legitimate on LAN deployments. Allow for now;
+        # an admin who wants strict global-only behaviour can add a filter.
+        pass
+    if not (1 <= port <= 65535):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Auto-enrollment crypto helpers
+# ---------------------------------------------------------------------------
+
+
+def derive_enroll_key(local_priv_b64: str, peer_pub_b64: str,
+                      token: bytes) -> bytes:
+    """Compute final_key = BLAKE2b(BLAKE2b(ECDH, key=LABEL_ENROLL), key=token).
+
+    Domain separation:
+      - LABEL_ENROLL guards against any cross-protocol key reuse
+        (signalling uses LABEL_PROTOCOL = b"wg-peerjs/v1/sigbox").
+      - Re-keying with `token` binds this key to a specific single-use
+        enrollment voucher.  An attacker who lacks `token` cannot derive
+        final_key even if they hold one of the long-term private keys.
+    """
+    local_priv = base64.b64decode(local_priv_b64)
+    peer_pub = base64.b64decode(peer_pub_b64)
+    shared = crypto_scalarmult(local_priv, peer_pub)
+    enroll_key = _nacl_blake2b(shared, digest_size=32,
+                               key=LABEL_ENROLL[:32],
+                               encoder=_NaclRawEncoder)
+    final_key = _nacl_blake2b(enroll_key, digest_size=32,
+                              key=token,
+                              encoder=_NaclRawEncoder)
+    return final_key
+
+
+def decrypt_enroll_blob(key: bytes, blob_b64: str) -> Optional[dict]:
+    """Decrypt and JSON-parse an enrollment ciphertext.  Returns None on
+    auth-tag failure, malformed JSON, or unknown protocol version.
+
+    Enforces a ciphertext-length cap before decoding and a plaintext
+    cap after decryption — defense-in-depth against memory exhaustion
+    by an attacker who somehow ended up with a valid token (so they
+    can produce real auth-tagged ciphertexts) and feeds us oversized
+    JSON to parse."""
+    if not isinstance(blob_b64, str) or len(blob_b64) > MAX_ENROLL_CIPHERTEXT_B64:
+        return None
+    try:
+        ct = base64.b64decode(blob_b64)
+        plain = SecretBox(key).decrypt(ct)
+        if len(plain) > MAX_ENROLL_PLAINTEXT:
+            return None
+        msg = json.loads(plain.decode("utf-8"))
+    except Exception:
+        return None
+    if msg.get("v") != PROTOCOL_VERSION:
+        return None
+    return msg
+
+
+def encrypt_enroll_blob(key: bytes, plaintext: dict) -> str:
+    box = SecretBox(key)
+    ct = box.encrypt(json.dumps(plaintext).encode("utf-8"))
+    return base64.b64encode(ct).decode("ascii")
+
+
+def build_enroll_envelope(dst_routing_id: str, kind: str,
+                          server_pub_b64: str,
+                          ciphertext_b64: str) -> dict:
+    """Wrap an enrollment response (ENROLL_OK / ENROLL_ERR) in the same
+    WebRTC OFFER envelope used by signalling, so the public PeerJS broker
+    forwards it.  Discriminator is `metadata.kind`."""
+    conn_id = "dc_" + secrets.token_hex(6)
+    return {
+        "type": "OFFER",
+        "dst": dst_routing_id,
+        "payload": {
+            "sdp": {"sdp": build_peerjs_sdp, "type": "offer"},
+            "type": "data",
+            "connectionId": conn_id,
+            "label": conn_id,
+            "reliable": False,
+            "serialization": "binary",
+            "metadata": {
+                "v": PROTOCOL_VERSION,
+                "kind": kind,
+                "server_pub": server_pub_b64,
+                "blob": ciphertext_b64,
+            },
+        },
+    }
+
+
+PROVISION_PERMITS_DIR = "/var/lib/wireguardrtc-provision-broker/permits"
+
+
+def remove_provision_permit(token: bytes) -> None:
+    """Best-effort: remove a previously-written provisioning permit.
+
+    Used when a token is superseded (re-mint of the same name) so a
+    stale URL the admin might already have shipped cannot sneak through
+    the broker.  Honours the same env-var override
+    (``WIREGUARDRTC_PROVISION_PERMITS_DIR``) that
+    write_provision_permit uses.
+    """
+    permits_dir = os.environ.get(
+        "WIREGUARDRTC_PROVISION_PERMITS_DIR", PROVISION_PERMITS_DIR)
+    safe_token = (
+        base64.urlsafe_b64encode(token).rstrip(b"=").decode("ascii"))
+    try:
+        os.unlink(os.path.join(permits_dir, safe_token))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Permission / IO error — broker permit may now be stale,
+        # but we deliberately don't fail the new mint over it.
+        pass
+
+
+def write_provision_permit(token: bytes, name_hint: str,
+                           expires_at: int) -> None:
+    """Drop a permit file the broker uses to gate provisioning requests.
+
+    Permits live in a directory the daemon process cannot write to (mode
+    0700, root-owned; only writable from the admin-invoked
+    `wireguardrtc --enroll-token` mint flow which runs under sudo).
+    The broker checks for a matching permit before invoking the
+    Provisioner, so a daemon RCE outside the mint→consumption window
+    cannot synthesize a permit and therefore cannot provision peers.
+
+    Best-effort.  On systems without the broker installed, the permits
+    directory will not exist; in that case we skip silently and the
+    legacy direct-ProvisionScript path remains usable.
+    """
+    permits_dir = os.environ.get(
+        "WIREGUARDRTC_PROVISION_PERMITS_DIR", PROVISION_PERMITS_DIR)
+    if not os.path.isdir(permits_dir):
+        # Broker not deployed (or override pointing elsewhere) — direct
+        # ProvisionScript users don't need permits.
+        return
+    safe_token = (
+        base64.urlsafe_b64encode(token).rstrip(b"=").decode("ascii"))
+    permit_path = os.path.join(permits_dir, safe_token)
+    permit = {
+        "name_hint": name_hint,
+        "expires_at": int(expires_at),
+        "created_at": int(time.time),
+    }
+    try:
+        fd = os.open(permit_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(permit, f)
+    except PermissionError as e:
+        # Most likely cause: the user ran `wireguardrtc --enroll-token`
+        # without sudo, so the mint succeeded into pending-tokens.json
+        # (which the wireguardrtc group can write) but the permits dir
+        # is root-only.  The mint isn't actually broken — the daemon
+        # will accept the ENROLL — but the broker will refuse to
+        # provision.  Warn loudly on stderr so the admin notices and
+        # rerun under sudo, but don't fail the mint.
+        sys.stderr.write(
+            f"[WARN] could not write provisioning permit "
+            f"({e.__class__.__name__}: {e}).  The token is valid but "
+            f"the privileged provisioning broker will refuse to "
+            f"provision unless the permit exists.  Did you forget "
+            f"`sudo`?\n")
+    except Exception:
+        # Any other write failure: clean up any partial file and
+        # re-raise so the mint command fails clearly.
+        try:
+            os.unlink(permit_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def run_provision_script(script_path: str, iface: str, name: str,
+                         client_pub_b64: str,
+                         token: bytes = b"",
+                         timeout: float = 15.0) -> tuple:
+    """Invoke the user-supplied provisioning hook.
+
+    Contract:
+        script_path IFACE NAME PUBKEY_BASE64
+        env: WIREGUARDRTC_PROVISION_TOKEN = url-safe-b64(token, no padding)
+    The script must add the peer to the running WireGuard interface (via
+    `wg set`, writing to a config file, calling other tooling, etc.) and
+    exit with status 0 on success.  The daemon then reads back the
+    allocation via `wg show`.
+
+    The optional `token` parameter is the 32-byte token we just claimed
+    for this enrollment, encoded into the env var so that the script
+    (typically wireguardrtc-provision-client) can forward it to the
+    privileged broker for permit lookup.  Backward-compatible with
+    older provision scripts: if the env var is absent and the script
+    doesn't read it, no harm done.
+
+    Inputs are validated first to refuse anything that would expand
+    unsafely as shell metacharacters or as path components.  The script
+    is invoked with subprocess.run (no shell=True), arguments passed
+    individually — the validation here is defensive.
+
+    Returns (ok: bool, error_message: str).
+    """
+    # Defensive input validation — even though we never use shell=True,
+    # we want to refuse anything weird up front so a bad provision script
+    # can't be tricked into doing something unintended.
+    if not script_path:
+        return False, "ProvisionScript not configured"
+    script = Path(script_path)
+    if not script.is_file or not os.access(script_path, os.X_OK):
+        return False, f"ProvisionScript {script_path} is not an executable file"
+    if not iface or any(c in iface for c in "\x00/"):
+        return False, f"refusing bad iface name: {iface!r}"
+    # WireGuard public keys are 32 raw bytes encoded as 44 chars of
+    # standard base64 (alphabet A-Za-z0-9+/=).  base64.b64decode with
+    # validate=True does the right thing — any other character or
+    # length anomaly raises.
+    try:
+        raw = base64.b64decode(client_pub_b64, validate=True)
+    except Exception:
+        return False, f"client_pub is not valid base64: {client_pub_b64!r}"
+    if len(raw) != 32:
+        return False, (f"client_pub decodes to {len(raw)} bytes, "
+                       f"expected 32: {client_pub_b64!r}")
+    # Name hint is admin-supplied via the URI's name field; treat it as
+    # untrusted (it could be tampered with).  Refuse control chars and
+    # things that look like path injections.
+    if (not name or len(name) > 64
+            or any(c in name for c in "\x00\n\r\t/\\$`")):
+        return False, f"refusing bad name hint: {name!r}"
+
+    env = dict(os.environ)
+    if token:
+        # URL-safe base64, no padding — same encoding the URI uses, and
+        # the form filenames in the broker's permits dir take.
+        env["WIREGUARDRTC_PROVISION_TOKEN"] = (
+            base64.urlsafe_b64encode(token).rstrip(b"=").decode("ascii"))
+    try:
+        res = subprocess.run(
+            [str(script), iface, name, client_pub_b64],
+            capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return False, f"ProvisionScript timed out after {timeout}s"
+    except OSError as e:
+        return False, f"failed to invoke ProvisionScript: {e}"
+    if res.returncode != 0:
+        # Truncate stderr defensively for log output.
+        err = (res.stderr or res.stdout or "").strip
+        if len(err) > 200:
+            err = err[:200] + "..."
+        return False, (f"ProvisionScript exited {res.returncode}"
+                       + (f": {err}" if err else ""))
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# PeerJS client (single websocket, WebRTC-shaped wrapper)
+# ---------------------------------------------------------------------------
+
+
+def routing_id(pubkey_b64: str, salt: bytes) -> str:
+    h = hashlib.sha256
+    h.update(pubkey_b64.encode("utf-8"))
+    h.update(salt)
+    return h.hexdigest
+
+
+def build_peerjs_sdp -> str:
+    """Generate the SDP body for a PeerJS datachannel OFFER. Fields are
+    freshly randomised per-message as the standard PeerJS client does."""
+    sid = secrets.randbits(63)
+    ufrag = secrets.token_hex(2)
+    pwd = secrets.token_hex(12)
+    fp = ":".join(f"{b:02X}" for b in secrets.token_bytes(32))
+    return (
+        "v=0\r\n"
+        f"o=- {sid} 2 IN IP4 127.0.0.1\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE 0\r\n"
+        "a=extmap-allow-mixed\r\n"
+        "a=msid-semantic: WMS\r\n"
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+        "c=IN IP4 0.0.0.0\r\n"
+        f"a=ice-ufrag:{ufrag}\r\n"
+        f"a=ice-pwd:{pwd}\r\n"
+        "a=ice-options:trickle\r\n"
+        f"a=fingerprint:sha-256 {fp}\r\n"
+        "a=setup:actpass\r\n"
+        "a=mid:0\r\n"
+        "a=sctp-port:5000\r\n"
+        "a=max-message-size:262144\r\n"
+    )
+
+
+def build_offer_envelope(dst_routing_id: str, blob_b64: str) -> dict:
+    conn_id = "dc_" + secrets.token_hex(6)
+    return {
+        "type": "OFFER",
+        "dst": dst_routing_id,
+        "payload": {
+            "sdp": {"sdp": build_peerjs_sdp, "type": "offer"},
+            "type": "data",
+            "connectionId": conn_id,
+            "label": conn_id,
+            "reliable": False,
+            "serialization": "binary",
+            "metadata": {"v": PROTOCOL_VERSION, "blob": blob_b64},
+        },
+    }
+
+
+def extract_envelope(message: dict) -> Optional[tuple]:
+    """Pull (src, metadata) out of a forwarded server message, or None.
+
+    Both signalling OFFERs and enrollment messages ride inside the same
+    WebRTC OFFER envelope — they're discriminated by the `kind` field
+    inside `metadata`.  Absence of `kind` means a signalling OFFER.
+    """
+    if not isinstance(message, dict):
+        return None
+    if message.get("type") != "OFFER":
+        return None
+    src = message.get("src")
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    md = payload.get("metadata")
+    if not isinstance(md, dict):
+        return None
+    if md.get("v") != PROTOCOL_VERSION:
+        return None
+    return src, md
+
+
+class PeerJSClient:
+    """Single long-lived websocket connection to the broker.
+
+    Holds the daemon's routing-id slot, sends our outbound OFFERs, dispatches
+    incoming OFFERs to a callback. Reconnects on disconnect with exponential
+    backoff (capped at SIGNALING_BACKOFF). Sends HEARTBEAT every 5 s.
+    """
+    def __init__(self, server, key, our_routing_id, on_incoming, on_open=None):
+        self.server = server
+        self.key = key
+        self.our_id = our_routing_id
+        self.on_incoming = on_incoming
+        self.on_open = on_open  # called with no args each time session opens
+        self.ws = None
+        self._send_lock = asyncio.Lock
+        self._stopped = asyncio.Event
+        self._connected = asyncio.Event
+
+    def _uri(self) -> str:
+        sep = "&" if "?" in self.server else "?"
+        token = secrets.token_hex(8)
+        return (f"{self.server}{sep}key={self.key}&id={self.our_id}"
+                f"&token={token}&version=1.5.2")
+
+    async def stop(self):
+        self._stopped.set
+        if self.ws is not None:
+            try:
+                await self.ws.close
+            except Exception:
+                pass
+
+    async def send(self, envelope: dict) -> bool:
+        if self.ws is None or not self._connected.is_set:
+            return False
+        async with self._send_lock:
+            try:
+                await self.ws.send(json.dumps(envelope))
+                return True
+            except Exception as e:
+                LOG.event("peerjs", "send", "fail",
+                          f"send failed: {e!r}", level=logging.WARNING)
+                return False
+
+    async def run(self):
+        backoff = 5.0
+        while not self._stopped.is_set:
+            session_start = None
+            try:
+                async with websockets.connect(self._uri) as ws:
+                    self.ws = ws
+                    LOG.event("peerjs", "conn", "connecting",
+                              f"connected to {self.server}")
+                    # First server message should be OPEN.
+                    raw = await asyncio.wait_for(ws.recv, timeout=10.0)
+                    msg = json.loads(raw)
+                    if msg.get("type") != "OPEN":
+                        LOG.event("peerjs", "conn", "no-open",
+                                  f"unexpected first message: {msg}",
+                                  level=logging.WARNING)
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, SIGNALING_BACKOFF)
+                        continue
+                    # CR-D9: only mark the session "started" once OPEN
+                    # arrived.  Backoff resets at the END of the loop
+                    # iff (now - session_start) >= STABLE_SESSION_S —
+                    # mirrors the Android OfferListener fix.  Without
+                    # this, a broker that quick-closes after sending
+                    # OPEN keeps backoff pinned at 5s indefinitely,
+                    # producing a tight reconnect storm.
+                    session_start = time.monotonic
+                    self._connected.set
+                    LOG.event("peerjs", "conn", "open", "PeerJS session OPEN")
+                    if self.on_open is not None:
+                        asyncio.create_task(self.on_open)
+
+                    hb_task = asyncio.create_task(self._heartbeat_loop)
+                    try:
+                        while not self._stopped.is_set:
+                            raw = await ws.recv
+                            try:
+                                msg = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            extracted = extract_envelope(msg)
+                            if extracted is not None:
+                                src, metadata = extracted
+                                try:
+                                    await self.on_incoming(src, metadata)
+                                except Exception as e:
+                                    logging.exception(
+                                        "on_incoming raised: %r", e)
+                    finally:
+                        hb_task.cancel
+                        try:
+                            await hb_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+            except websockets.exceptions.ConnectionClosed as e:
+                LOG.event("peerjs", "conn", f"closed-{e.code}",
+                          f"PeerJS connection closed (code={e.code})")
+            except Exception as e:
+                LOG.event("peerjs", "conn", f"err-{type(e).__name__}",
+                          f"PeerJS error: {e!r}", level=logging.WARNING)
+            finally:
+                self.ws = None
+                self._connected.clear
+            if self._stopped.is_set:
+                return
+            # CR-D9: reset backoff iff the session was alive long
+            # enough to count as "stable".  A broker quick-close
+            # leaves session_start either None (closed before OPEN)
+            # or recent (< STABLE_SESSION_S ago) — both keep backoff
+            # advancing exponentially, capped at SIGNALING_BACKOFF.
+            if (session_start is not None and
+                    time.monotonic - session_start >= STABLE_SESSION_S):
+                backoff = 5.0
+            else:
+                backoff = min(backoff * 2, SIGNALING_BACKOFF)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, SIGNALING_BACKOFF)
+
+    async def _heartbeat_loop(self):
+        while not self._stopped.is_set:
+            await asyncio.sleep(PEERJS_HEARTBEAT)
+            if self.ws is None:
+                return
+            try:
+                await self.ws.send(json.dumps({"type": "HEARTBEAT"}))
+            except Exception:
+                return
+
+
+# ---------------------------------------------------------------------------
+# Hole-punch raw-socket inject
+# ---------------------------------------------------------------------------
+
+
+def build_raw_udp_packet(src_port, dst_ip, dst_port, payload=b""):
+    ip_hdr = struct.pack(
+        "!BBHHHBBH4s4s",
+        (4 << 4) | 5,                # version=4 IHL=5
+        0,                            # DSCP/ECN
+        20 + 8 + len(payload),        # total length
+        0,                            # ID (kernel may overwrite)
+        0,                            # flags + frag offset
+        64,                           # TTL
+        socket.IPPROTO_UDP,
+        0,                            # IP checksum (kernel fills)
+        b"\x00\x00\x00\x00",          # src IP (kernel fills from routing)
+        socket.inet_aton(dst_ip),
+    )
+    udp_hdr = struct.pack(
+        "!HHHH",
+        src_port, dst_port,
+        8 + len(payload),
+        0,                            # UDP checksum=0 is legal for IPv4
+    )
+    return ip_hdr + udp_hdr + payload
+
+
+def raw_inject(src_port, dst_ip, dst_port):
+    """Send 3 empty UDP packets from a "stolen" source port. UDP is lossy and
+    NAT mapping creation can race with the peer's incoming handshake; sending
+    a small burst is cheap insurance."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        s.setsockopt(socket.SOL_IP, socket.IP_HDRINCL, 1)
+    except PermissionError:
+        LOG.event("hole-punch", "perm", "denied",
+                  "cannot create raw socket — daemon needs CAP_NET_RAW",
+                  level=logging.ERROR)
+        return False
+    try:
+        packet = build_raw_udp_packet(src_port, dst_ip, dst_port)
+        for i in range(RAW_INJECT_REPEATS):
+            s.sendto(packet, (dst_ip, dst_port))
+            if i + 1 < RAW_INJECT_REPEATS:
+                time.sleep(RAW_INJECT_GAP)
+    except Exception as e:
+        logging.warning("raw-inject failed: %r", e)
+        return False
+    finally:
+        s.close
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Wake mechanism (force kernel WG to fire a handshake immediately)
+# ---------------------------------------------------------------------------
+
+
+def filter_candidates_for_peer(candidates: list, allowed_ips_str: str) -> list:
+    """Sender-side per-peer trim: drop candidates whose IP falls inside
+    any of the peer's `AllowedIPs` ranges.
+
+    Using such an IP as Endpoint would make the peer's kernel route
+    WG handshake packets back into the very tunnel needing the
+    handshake to come up — a bootstrap deadlock.  Step B of the
+    candidate-negotiation v2 design (memory:
+    project_protocol_signal_wake_candidates.md): sender pre-trims so
+    a misconfigured / pre-Step-A receiver still doesn't get served a
+    deadlock candidate.  Step A's receiver-side check is
+    defense-in-depth on top of this.
+
+    [allowed_ips_str] is the raw `wg show <iface> allowed-ips` field
+    for this peer (whitespace- or comma-separated CIDR list, possibly
+    "(none)" or empty).  Returns a fresh list preserving the input
+    order of survivors.
+    """
+    if not candidates:
+        return []
+    if not allowed_ips_str or allowed_ips_str.strip == "(none)":
+        return list(candidates)
+    nets: list = []
+    for token in allowed_ips_str.replace(",", " ").split:
+        token = token.strip
+        if not token:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(token, strict=False))
+        except ValueError:
+            # Malformed entry — skip so a typo in one peers.d line
+            # doesn't disable the filter for the whole list.
+            continue
+    if not nets:
+        return list(candidates)
+    out: list = []
+    for c in candidates:
+        ip = c.get("ip")
+        try:
+            addr = ipaddress.ip_address(ip)
+        except (ValueError, TypeError):
+            # Malformed candidate — drop, since we can't reason about it.
+            continue
+        if any(addr in net for net in nets):
+            continue
+        out.append(c)
+    return out
+
+
+def pick_wake_target(allowed_ips_str: str) -> Optional[str]:
+    """Return an IPv4 host address that, when sent to via the WG iface,
+    will route to the given peer (so kernel WG initiates a handshake to it).
+
+    For /32 host routes: the host itself.
+    For wider IPv4 networks: the first usable host inside.
+    For /0 catchall: a TEST-NET-1 bogon — any IP works since /0 covers all,
+                     and 192.0.2.1 won't be confused with real local hosts.
+    For IPv6-only allowed-ips with no v4 entry: None (no v4 wake possible).
+    """
+    if not allowed_ips_str or allowed_ips_str.strip == "(none)":
+        return None
+    has_catchall_v4 = False
+    v4_host = None
+    v4_net = None
+    for token in allowed_ips_str.replace(",", " ").split:
+        try:
+            net = ipaddress.ip_network(token, strict=False)
+        except ValueError:
+            continue
+        if not isinstance(net, ipaddress.IPv4Network):
+            continue
+        if net.prefixlen == 0:
+            has_catchall_v4 = True
+            continue
+        if net.prefixlen == 32 and v4_host is None:
+            v4_host = net.network_address
+            continue
+        if v4_net is None:
+            v4_net = net
+    if v4_host is not None:
+        return str(v4_host)
+    if v4_net is not None:
+        hosts = list(v4_net.hosts)
+        if hosts:
+            return str(hosts[0])
+        return str(v4_net.network_address)
+    if has_catchall_v4:
+        return WAKE_TARGET_BOGON
+    return None
+
+
+def wake_via_iface(iface: str, target_ip: str):
+    """Send one byte through the WG interface. Kernel WG sees outbound traffic
+    for the matching peer and initiates a handshake with the current endpoint.
+
+    Uses SO_BINDTODEVICE so the packet is forced through `iface`, regardless
+    of routing-table preference. Requires CAP_NET_RAW (already granted)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                         iface.encode("utf-8"))
+        except OSError as e:
+            if e.errno == errno.EPERM:
+                LOG.event("wake", "perm", "denied",
+                          "cannot SO_BINDTODEVICE — daemon needs CAP_NET_RAW",
+                          level=logging.WARNING)
+            return
+        s.setblocking(False)
+        try:
+            s.sendto(b"\x00", (target_ip, 9))  # discard port
+        except OSError:
+            # Unreachable host or routing failure — kernel still saw the
+            # outbound, which is enough to trigger WG handshake initiation.
+            pass
+    finally:
+        s.close
+
+
+# ---------------------------------------------------------------------------
+# DNS roaming
+# ---------------------------------------------------------------------------
+
+
+async def resolve_v4(host: str) -> Optional[str]:
+    loop = asyncio.get_running_loop
+    try:
+        infos = await loop.getaddrinfo(
+            host, None, family=socket.AF_INET, type=socket.SOCK_DGRAM)
+    except socket.gaierror:
+        return None
+    if not infos:
+        return None
+    return infos[0][4][0]
+
+
+# ---------------------------------------------------------------------------
+# Per-peer logic
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class PeerRuntime:
+    config: PeerConfig
+    iface: str
+    last_signal_attempt: float = 0.0
+    signal_backoff: float = SIGNALING_BACKOFF_INITIAL
+    reinjector_task: Optional[asyncio.Task] = None
+    last_dns_check: float = 0.0
+    last_dns_resolved_ip: Optional[str] = None
+    offer_exchange_count: int = 0       # OFFERs exchanged without tunnel-up
+    offer_exchange_window_start: float = 0.0  # start of current exchange window
+    offer_quarantine_until: float = 0.0  # suppress responses until this time
+
+
+def parse_handshake_age(handshakes_table: dict, pubkey: str) -> float:
+    raw = handshakes_table.get(pubkey, "0")
+    try:
+        ts = int(raw.strip)
+    except ValueError:
+        return float("inf")
+    if ts == 0:
+        return float("inf")
+    return time.time - ts
+
+
+# ---------------------------------------------------------------------------
+# Auto-enrollment: storage for pending tokens and recent-response cache
+# ---------------------------------------------------------------------------
+
+# Wire-format constants for the enrollment protocol.
+LABEL_ENROLL = b"wg-peerjs/v1/enroll"  # domain separator for enrollment keys
+ENROLL_FRESHNESS_WINDOW = 90.0          # ±seconds for ENROLL ts validation
+ENROLL_REPLAY_TTL = 300.0               # cached response retention (5 min)
+TOKEN_BYTES = 32                        # 256-bit enrollment tokens
+TOKEN_DEFAULT_EXPIRY = 600.0            # 10 minutes if not specified
+
+
+class PendingTokensStore:
+    """Persistent state for the auto-enrollment protocol.
+
+    Holds two lists in a single JSON file (default
+    /var/lib/wireguardrtc/pending-tokens.json, mode 0600):
+
+      tokens[]              pending and used enrollment tokens
+      recent_enrollments[]  cached ENROLL_OK responses for retry safety
+
+    All mutating operations take an exclusive flock on the state file
+    so concurrent racers (multiple ENROLL handlers, the
+    --enroll-token CLI, etc.) serialize cleanly.  Atomic writes via
+    write-temp + os.replace.
+    """
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.path = self.state_dir / "pending-tokens.json"
+
+    # ------------ low-level IO ------------
+
+    def _load_locked(self) -> dict:
+        """Read the state file.  Returns the default schema if missing."""
+        try:
+            with open(self.path, "rb") as f:
+                return json.loads(f.readdecode("utf-8") or "{}")
+        except FileNotFoundError:
+            return {"version": 1, "tokens": [], "recent_enrollments": []}
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"corrupt {self.path}: {e}; refusing to overwrite") from e
+
+    def _chown_to_match_dir(self, target) -> None:
+        """When running as root (CLI mints, package upgrades), make sure
+        a freshly-created state file ends up with the same uid/gid as
+        the state directory itself — otherwise the daemon (running as
+        the unprivileged ``wireguardrtc`` user) can't open it.
+        Best-effort; silently skipped when not root or on filesystems
+        that don't support chown."""
+        if os.geteuid != 0:
+            return
+        try:
+            st = os.stat(self.state_dir)
+        except OSError:
+            return
+        try:
+            if isinstance(target, int):
+                os.fchown(target, st.st_uid, st.st_gid)
+            else:
+                os.chown(str(target), st.st_uid, st.st_gid)
+        except OSError:
+            pass
+
+    def _save_locked(self, state: dict) -> None:
+        """Atomic write: temp + os.replace under the same dir."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.state_dir, 0o700)
+        tmp = self.path.with_suffix(".tmp")
+        # Open with O_NOFOLLOW + 0600 to refuse symlink attacks
+        fd = os.open(str(tmp),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     0o600)
+        try:
+            self._chown_to_match_dir(fd)
+            with os.fdopen(fd, "wb") as f:
+                f.write(json.dumps(state, indent=2,
+                                   sort_keys=True).encode("utf-8") + b"\n")
+        except BaseException:
+            # Best-effort cleanup before re-raising.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp, self.path)
+
+    def _open_locked(self):
+        """Yield (fd, state).  Caller must save state via self._save_locked
+        and then release the lock by closing fd.  Used as a CM via _txn
+        """
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.state_dir, 0o700)
+        # Lock file is the state file itself.  If it doesn't exist yet,
+        # create it empty so flock has something to grab.
+        if not self.path.exists:
+            fd = os.open(str(self.path),
+                         os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            self._chown_to_match_dir(fd)
+            os.close(fd)
+        # If a previous root-as-CLI mint left the file root-owned and the
+        # daemon (unprivileged) is now opening it, repair ownership before
+        # the O_RDWR open below would EACCES.  No-op when already correct.
+        self._chown_to_match_dir(self.path)
+        fd = os.open(str(self.path), os.O_RDWR | os.O_NOFOLLOW)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    class _Txn:
+        """Context manager that holds the file lock for read-modify-write."""
+
+        def __init__(self, store: "PendingTokensStore"):
+            self._store = store
+            self._fd: Optional[int] = None
+            self.state: Optional[dict] = None
+
+        def __enter__(self):
+            self._fd = self._store._open_locked
+            self.state = self._store._load_locked
+            return self
+
+        def commit(self):
+            assert self.state is not None
+            self._store._save_locked(self.state)
+
+        def __exit__(self, exc_type, exc, tb):
+            if self._fd is not None:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(self._fd)
+            return False  # don't suppress
+
+    def _txn(self):
+        return PendingTokensStore._Txn(self)
+
+    # ------------ public API ------------
+
+    def mint(self, name_hint: str, expires_in: float = TOKEN_DEFAULT_EXPIRY,
+             iface: Optional[str] = None,
+             max_pending: int = 32) -> tuple:
+        """Mint a fresh single-use enrollment token.
+
+        Returns ``(token_bytes, superseded_meta)``: the raw token (caller
+        serialises into the URI) and metadata for the previously-pending
+        unexpired token with the same ``name_hint`` if one existed (None
+        otherwise).  When superseded_meta is not None the previous token
+        has been removed from the store; the caller should warn the admin
+        that they have replaced an outstanding token (lost QR / refresh
+        before expiry are the supported scenarios).
+
+        Raises RuntimeError if the max-pending cap would be exceeded
+        after purging expired entries and any same-name supersede.
+        """
+        token = secrets.token_bytes(TOKEN_BYTES)
+        now = time.time
+        with self._txn as txn:
+            # Purge expired tokens and consumed-then-cached entries.
+            txn.state.setdefault("tokens", [])
+            txn.state.setdefault("recent_enrollments", [])
+            txn.state["tokens"] = [
+                t for t in txn.state["tokens"]
+                if not t.get("used") and t.get("expires_at", 0) > now
+            ]
+            # Same-name supersede: at most one unexpired pending token per
+            # name_hint at any time.  Re-minting the same name (lost QR,
+            # refresh before expiry) replaces the previous token rather
+            # than stacking another valid one alongside it.  See
+            # docs/duplicate-label-policy notes / project memory.
+            superseded_meta = None
+            kept = []
+            for t in txn.state["tokens"]:
+                if t.get("name_hint") == name_hint and superseded_meta is None:
+                    superseded_meta = t
+                else:
+                    kept.append(t)
+            txn.state["tokens"] = kept
+            active = len(txn.state["tokens"])
+            if active >= max_pending:
+                raise RuntimeError(
+                    f"refusing to mint: {active} unconsumed tokens already "
+                    f"pending (max {max_pending}).  Wait for them to be "
+                    f"used or expire, or raise [Enrollment] MaxPendingTokens.")
+            txn.state["tokens"].append({
+                "token_b64":   base64.b64encode(token).decode,
+                "name_hint":   name_hint,
+                "iface":       iface,
+                "created_at":  int(now),
+                "expires_at":  int(now + expires_in),
+                "used":        False,
+                "used_at":     None,
+                "used_by":     None,
+            })
+            txn.commit
+        return token, superseded_meta
+
+    def unmint(self, token: bytes) -> bool:
+        """Roll back a [mint] that the caller couldn't follow up on
+        (e.g., write_provision_permit raised after we already
+        committed the token to disk).  Removes the token from the
+        active-tokens list iff it's there and not yet consumed.
+        Returns True if removed, False if not found / already used.
+        CR-D1 of the candidate-negotiation v2 review."""
+        token_b64 = base64.b64encode(token).decode
+        with self._txn as txn:
+            tokens = txn.state.setdefault("tokens", [])
+            removed = False
+            kept = []
+            for t in tokens:
+                if (t.get("token_b64") == token_b64 and not t.get("used")):
+                    removed = True
+                    continue
+                kept.append(t)
+            if removed:
+                txn.state["tokens"] = kept
+                txn.commit
+            return removed
+
+    def try_claim(self, token: bytes,
+                  client_pub_b64: str) -> Optional[dict]:
+        """Atomically mark a token as consumed, returning its metadata
+        dict on success or None if not found / expired / already used.
+
+        The caller then runs ProvisionScript and, on success, calls
+        cache_response to persist the encrypted ENROLL_OK for retry
+        safety.
+        """
+        token_b64 = base64.b64encode(token).decode
+        now = time.time
+        with self._txn as txn:
+            for entry in txn.state.get("tokens", []):
+                if entry.get("token_b64") != token_b64:
+                    continue
+                if entry.get("used"):
+                    return None
+                if entry.get("expires_at", 0) <= now:
+                    return None
+                entry["used"] = True
+                entry["used_at"] = int(now)
+                entry["used_by"] = client_pub_b64
+                txn.commit
+                return dict(entry)  # defensive copy
+            return None
+
+    def find_token(self, token: bytes) -> Optional[dict]:
+        """Look up a token without claiming it.  Returns metadata dict
+        for unused/unexpired tokens, dict with used=True for already-
+        consumed ones, or None if unknown / expired-and-purged."""
+        token_b64 = base64.b64encode(token).decode
+        now = time.time
+        with self._txn as txn:
+            for entry in txn.state.get("tokens", []):
+                if entry.get("token_b64") != token_b64:
+                    continue
+                if not entry.get("used") and entry.get("expires_at", 0) <= now:
+                    return None
+                return dict(entry)
+            return None
+
+    def cache_response(self, client_pub_b64: str,
+                       envelope: dict,
+                       ttl: float = ENROLL_REPLAY_TTL) -> None:
+        """Cache a built ENROLL_OK envelope keyed by the client's pubkey.
+        Only the holder of the corresponding private key can decrypt it,
+        so caching is safe.  Used to make legitimate retries (lost
+        response over a flaky network) idempotent."""
+        now = time.time
+        with self._txn as txn:
+            cache = txn.state.setdefault("recent_enrollments", [])
+            # Remove any earlier entry for this client.
+            cache[:] = [e for e in cache
+                        if e.get("client_pub_b64") != client_pub_b64
+                        and e.get("expires_at", 0) > now]
+            cache.append({
+                "client_pub_b64": client_pub_b64,
+                "envelope":       envelope,
+                "expires_at":     int(now + ttl),
+            })
+            txn.commit
+
+    def find_recent(self, client_pub_b64: str) -> Optional[dict]:
+        """Return a previously cached envelope for this client_pub, or None."""
+        now = time.time
+        with self._txn as txn:
+            for e in txn.state.get("recent_enrollments", []):
+                if (e.get("client_pub_b64") == client_pub_b64
+                        and e.get("expires_at", 0) > now):
+                    return e["envelope"]
+            return None
+
+    def list_tokens(self) -> list:
+        """Return a copy of all tokens for diagnostics (--show-config etc.)."""
+        with self._txn as txn:
+            return [dict(t) for t in txn.state.get("tokens", [])]
+
+    def purge_expired(self) -> int:
+        """Drop expired tokens and stale cached responses.  Returns
+        the number of removed entries (for logging)."""
+        now = time.time
+        removed = 0
+        with self._txn as txn:
+            tokens_before = len(txn.state.get("tokens", []))
+            txn.state["tokens"] = [
+                t for t in txn.state.get("tokens", [])
+                if (not t.get("used") and t.get("expires_at", 0) > now)
+                or (t.get("used") and t.get("used_at", 0) > now - 86400)
+            ]
+            cache_before = len(txn.state.get("recent_enrollments", []))
+            txn.state["recent_enrollments"] = [
+                e for e in txn.state.get("recent_enrollments", [])
+                if e.get("expires_at", 0) > now
+            ]
+            removed = ((tokens_before - len(txn.state["tokens"]))
+                       + (cache_before - len(txn.state["recent_enrollments"])))
+            if removed > 0:
+                txn.commit
+        return removed
+
+
+# ---------------------------------------------------------------------------
+# Privsep IPC clients
+# ---------------------------------------------------------------------------
+
+KEY_ORACLE_DEFAULT_SOCKET = "/run/wireguardrtc/oracle.sock"
+RAW_HELPER_DEFAULT_SOCKET = "/run/wireguardrtc/raw.sock"
+
+
+class KeyOracleClient:
+    """Client for the privileged key-oracle service.
+
+    The oracle is a separate process that holds the WireGuard private
+    keys in memory; the daemon talks to it over a Unix socket so that
+    raw key bytes never enter the daemon's address space.  See
+    SECURITY/Auto-enrollment privilege separation in wireguardrtc(8)
+    for the threat model.
+
+    All RPCs are async-await so the daemon can issue them from its
+    asyncio coroutines without blocking; one oracle connection is
+    held for the daemon's whole lifetime, with a lock serialising
+    requests because the wire protocol is one request → one response.
+    """
+    def __init__(self, sock_path: str):
+        self.sock_path = sock_path
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self._lock = asyncio.Lock
+
+    async def connect(self) -> bool:
+        try:
+            self.reader, self.writer = await asyncio.open_unix_connection(
+                self.sock_path)
+            return True
+        except (FileNotFoundError, ConnectionRefusedError, PermissionError,
+                OSError) as e:
+            logging.info("key oracle socket %s not reachable: %s",
+                         self.sock_path, e)
+            return False
+
+    async def _rpc(self, req: dict) -> dict:
+        if self.writer is None or self.reader is None:
+            raise IOError("oracle not connected")
+        async with self._lock:
+            self.writer.write((json.dumps(req) + "\n").encode("utf-8"))
+            await self.writer.drain
+            line = await self.reader.readline
+        if not line:
+            raise IOError("oracle closed connection")
+        try:
+            return json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            raise IOError(f"oracle returned non-JSON: {e}")
+
+    async def derive_sigbox(self, iface: str, peer_pub_b64: str) -> bytes:
+        resp = await self._rpc({
+            "op": "derive_sigbox",
+            "iface": iface, "peer_pub": peer_pub_b64,
+        })
+        if not resp.get("ok"):
+            raise IOError(f"oracle derive_sigbox: {resp.get('error')}")
+        return base64.b64decode(resp["key"])
+
+    async def derive_enroll(self, iface: str, peer_pub_b64: str,
+                            token: bytes) -> bytes:
+        token_url = (base64.urlsafe_b64encode(token)
+                     .rstrip(b"=").decode("ascii"))
+        resp = await self._rpc({
+            "op": "derive_enroll",
+            "iface": iface, "peer_pub": peer_pub_b64,
+            "token": token_url,
+        })
+        if not resp.get("ok"):
+            raise IOError(f"oracle derive_enroll: {resp.get('error')}")
+        return base64.b64decode(resp["key"])
+
+    async def set_endpoint(self, iface: str, peer_pub_b64: str,
+                           ip: str, port: int) -> bool:
+        try:
+            resp = await self._rpc({
+                "op": "set_endpoint",
+                "iface": iface, "peer_pub": peer_pub_b64,
+                "ip": ip, "port": int(port),
+            })
+        except IOError as e:
+            logging.warning("oracle set_endpoint IPC failed: %s", e)
+            return False
+        if not resp.get("ok"):
+            logging.warning("oracle set_endpoint refused: %s",
+                            resp.get("error"))
+            return False
+        return True
+
+    async def list_interfaces(self) -> list:
+        try:
+            resp = await self._rpc({"op": "list_interfaces"})
+        except IOError as e:
+            logging.warning("oracle list_interfaces failed: %s", e)
+            return []
+        return resp.get("interfaces", []) if resp.get("ok") else []
+
+    async def iface_field(self, iface: str, field: str) -> str:
+        try:
+            resp = await self._rpc({
+                "op": "iface_field", "iface": iface, "field": field})
+        except IOError as e:
+            logging.warning("oracle iface_field(%s,%s) failed: %s",
+                            iface, field, e)
+            return ""
+        return resp.get("value", "") if resp.get("ok") else ""
+
+    async def iface_table(self, iface: str, field: str) -> dict:
+        try:
+            resp = await self._rpc({
+                "op": "iface_table", "iface": iface, "field": field})
+        except IOError as e:
+            logging.warning("oracle iface_table(%s,%s) failed: %s",
+                            iface, field, e)
+            return {}
+        return resp.get("table", {}) if resp.get("ok") else {}
+
+
+class RawHelperClient:
+    """Client for the privileged raw-socket helper service.
+
+    Same single-connection-with-async-lock pattern as KeyOracleClient.
+    The helper holds CAP_NET_RAW; this lets the daemon process drop
+    *all* capabilities while still being able to do the spoofy
+    hole-punch and SO_BINDTODEVICE-via-WG-iface wakeups.
+    """
+    def __init__(self, sock_path: str):
+        self.sock_path = sock_path
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self._lock = asyncio.Lock
+
+    async def connect(self) -> bool:
+        try:
+            self.reader, self.writer = await asyncio.open_unix_connection(
+                self.sock_path)
+            return True
+        except (FileNotFoundError, ConnectionRefusedError, PermissionError,
+                OSError) as e:
+            logging.info("raw-helper socket %s not reachable: %s",
+                         self.sock_path, e)
+            return False
+
+    async def _rpc(self, req: dict) -> dict:
+        if self.writer is None or self.reader is None:
+            raise IOError("raw-helper not connected")
+        async with self._lock:
+            self.writer.write((json.dumps(req) + "\n").encode("utf-8"))
+            await self.writer.drain
+            line = await self.reader.readline
+        if not line:
+            raise IOError("raw-helper closed connection")
+        try:
+            return json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            raise IOError(f"raw-helper returned non-JSON: {e}")
+
+    async def inject(self, iface: str, src_port: int,
+                     dst_ip: str, dst_port: int) -> bool:
+        try:
+            resp = await self._rpc({
+                "op": "inject",
+                "iface": iface, "src_port": int(src_port),
+                "dst_ip": dst_ip, "dst_port": int(dst_port),
+            })
+        except IOError as e:
+            logging.warning("raw-helper inject IPC failed: %s", e)
+            return False
+        if not resp.get("ok"):
+            logging.warning("raw-helper inject refused: %s",
+                            resp.get("error"))
+            return False
+        return True
+
+    async def wake(self, iface: str, target_ip: str) -> bool:
+        try:
+            resp = await self._rpc({
+                "op": "wake",
+                "iface": iface, "target_ip": target_ip,
+            })
+        except IOError as e:
+            logging.warning("raw-helper wake IPC failed: %s", e)
+            return False
+        if not resp.get("ok"):
+            logging.warning("raw-helper wake refused: %s",
+                            resp.get("error"))
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Daemon main
+# ---------------------------------------------------------------------------
+
+
+class Daemon:
+    def __init__(self, args):
+        self.args = args
+        self.global_config = load_global_config(args.config)
+        self.peer_configs = load_peer_configs(
+            args.peers_dir,
+            auto_active_directory=auto_active_dir(self.global_config.state_dir)
+            if self.global_config.auto_active_enrollment else None,
+        )
+        self.peerjs: Optional[PeerJSClient] = None
+        self.shutdown_event = asyncio.Event
+        # Per-iface state.  Holds (pub_b64, listen_port) — NOT the
+        # private key.  All operations that would need the priv go
+        # through self.oracle (KeyOracleClient), which is the only
+        # process in our trust boundary that holds raw key bytes.
+        self._iface_keys = {}      # iface -> (pub_b64, listen_port)
+        self._iface_peers = {}     # iface -> set of pubkey strings
+        self._runtimes = {}        # (iface, pubkey) -> PeerRuntime
+        self._chosen_iface = None  # which iface's pubkey is our PeerJS routing ID
+        self.oracle: Optional[KeyOracleClient] = None
+        self.raw: Optional[RawHelperClient] = None
+
+    # --- self-test: verify configured peers exist somewhere in WG ---
+
+    async def validate_peer_configs(self):
+        live_peers = set
+        for iface in list_interfaces:
+            allowed = await self.oracle.iface_table(iface, "allowed-ips")
+            for pk in allowed.keys:
+                live_peers.add(pk)
+        ok = True
+        for pk, cfg in self.peer_configs.items:
+            if pk not in live_peers:
+                logging.warning(
+                    "%s: PublicKey %s not present on any WireGuard interface "
+                    "(typo? wrong host?)", cfg.label, pk[:16] + "...")
+                ok = False
+            elif cfg.mode in (Mode.ACTIVE, Mode.PASSIVE):
+                peer_broker_id = routing_id(pk, self.global_config.salt)
+                logging.info("%s: broker id (peer) ...%s  [mode=%s]",
+                             cfg.label, peer_broker_id[-8:], cfg.mode.value)
+        return ok
+
+    # --- iface state cache (refresh once per poll) ---
+
+    async def refresh_iface_state(self):
+        """Read pub/port and peer set for every WG iface via the oracle.
+
+        Per-iface `wg show` queries require CAP_NET_ADMIN on this
+        kernel (the daemon has no caps) so each field lookup is an
+        RPC to the key-oracle.  Each RPC is a Unix-socket round-trip
+        (microseconds) — sequential awaits are fine for the typical
+        number of interfaces; switch to asyncio.gather if it ever
+        matters.
+        """
+        new_keys = {}
+        new_peers = {}
+        for iface in list_interfaces:
+            pub = await self.oracle.iface_field(iface, "public-key")
+            port_s = await self.oracle.iface_field(iface, "listen-port")
+            if not pub or pub == "(none)" or not port_s:
+                # Diagnostic — log which field came back empty so the
+                # admin can investigate.  StateLogger de-dupes so a
+                # persistently-skipped iface logs once, not once per
+                # poll.
+                LOG.event("iface", "skipped", iface,
+                          f"skipping {iface}: pub={pub!r} port={port_s!r}",
+                          level=logging.WARNING)
+                continue
+            try:
+                port = int(port_s)
+            except ValueError:
+                LOG.event("iface", "skipped", iface,
+                          f"skipping {iface}: non-int listen-port {port_s!r}",
+                          level=logging.WARNING)
+                continue
+            new_keys[iface] = (pub, port)
+            # Use allowed-ips (not latest-handshakes) so peers with no
+            # handshake yet are still discovered and signalled.
+            allowed = await self.oracle.iface_table(iface, "allowed-ips")
+            new_peers[iface] = set(allowed.keys)
+        self._iface_keys = new_keys
+        self._iface_peers = new_peers
+
+    def select_listening_iface(self) -> Optional[str]:
+        """Pick which interface's pubkey to use as our PeerJS routing ID.
+
+        We hold ONE long-lived PeerJS connection — peers reach us at
+        SHA-256(<pubkey> ‖ salt). Peers on different WG interfaces would
+        normally use different pubkeys, so peers across multiple interfaces
+        can't all reach a single routing ID.
+
+        Picks the interface that hosts the most non-IGNORE configured peers.
+        Warns if some configured peers will be unreachable as a result.
+        Future versions should open one PeerJS connection per interface.
+        """
+        if not self._iface_keys:
+            return None
+        scoreboard = {iface: 0 for iface in self._iface_keys}
+        for pk, cfg in self.peer_configs.items:
+            if cfg.mode == Mode.IGNORE or cfg.mode == Mode.DNS_ROAM:
+                continue
+            for iface, peers in self._iface_peers.items:
+                if pk in peers:
+                    scoreboard[iface] += 1
+                    break
+        ranked = [iface for iface, n in
+                  sorted(scoreboard.items, key=lambda kv: (-kv[1], kv[0]))
+                  if n > 0]
+        if not ranked:
+            # Fallback: enrollment-only mode has no configured peers yet.
+            # If enrollment is enabled, pick the alphabetically-first
+            # interface so we still open a PeerJS slot for incoming
+            # ENROLL requests.
+            if self.global_config.enrollment_enabled:
+                return sorted(self._iface_keys.keys)[0]
+            return None
+        chosen = ranked[0]
+        if len(ranked) > 1:
+            unreachable = []
+            for pk, cfg in self.peer_configs.items:
+                if cfg.mode in (Mode.IGNORE, Mode.DNS_ROAM):
+                    continue
+                if pk not in self._iface_peers.get(chosen, set):
+                    unreachable.append(cfg.label)
+            if unreachable:
+                logging.warning(
+                    "non-IGNORE peers configured on multiple interfaces; "
+                    "PeerJS routing-id is keyed to %s, so peers on other "
+                    "interfaces (%s) will not reach this daemon over PeerJS. "
+                    "Workaround: split per-interface deployments, or wait for "
+                    "multi-interface support",
+                    chosen, ", ".join(unreachable))
+        return chosen
+
+    def our_routing_id(self) -> Optional[str]:
+        if self._chosen_iface is None or self._chosen_iface not in self._iface_keys:
+            return None
+        pub, _ = self._iface_keys[self._chosen_iface]
+        return routing_id(pub, self.global_config.salt)
+
+    # --- incoming message dispatcher (called by PeerJSClient) ---
+
+    async def on_incoming(self, src_id: str, metadata: dict):
+        """Top-level handler for incoming PeerJS messages.
+
+        Both signalling OFFERs and ENROLL requests ride inside the same
+        WebRTC OFFER envelope; they're discriminated by `metadata.kind`.
+        Absence of `kind` means a signalling OFFER (backward compatibility).
+        """
+        # Universal self-loop guard.
+        our_id = self.our_routing_id
+        if our_id and src_id == our_id:
+            LOG.event("peerjs", "self-loop", src_id,
+                      "received message with our own routing ID — possible "
+                      "misconfiguration (same salt+key on two hosts); ignoring",
+                      level=logging.WARNING)
+            return
+
+        kind = metadata.get("kind")
+        blob = metadata.get("blob")
+        if not isinstance(blob, str):
+            return
+
+        if kind is None or kind == "offer":
+            await self._handle_signaling(src_id, blob, is_wake=False)
+        elif kind == "signal_wake":
+            await self._handle_signaling(src_id, blob, is_wake=True)
+        elif kind == "enroll":
+            client_pub = metadata.get("client_pub")
+            if not isinstance(client_pub, str):
+                return
+            await self._handle_enroll(src_id, client_pub, blob)
+        # ENROLL_OK / ENROLL_ERR responses are not processed by the daemon
+        # in its server role — those are handled by enrolling clients.
+        # Silently ignore.
+
+    async def _handle_signaling(self, src_id: str, blob_b64: str,
+                                is_wake: bool = False):
+        """Top-level dispatch for both ordinary signalling OFFERs and
+        client-initiated `signal_wake` messages.
+
+        is_wake = False:  legacy "I'm at <candidate>" — we apply the
+            candidate to kernel WG and respond with our own endpoint
+            unless the tunnel is already UP (anti-spam guard).
+        is_wake = True:   "I want to reach you, please tell me where
+            you are" — we DO NOT touch kernel WG state from the wake
+            (the sender hasn't claimed an endpoint), but we DO send
+            a responsive OFFER bypassing the tunnel-already-UP guard
+            since the wake is an explicit user request.
+        """
+        # We listen on a single chosen iface's pubkey — only peers configured
+        # on that iface (and not in IGNORE mode) can have legitimately sent us
+        # an OFFER. Try each, decrypt fast on src_id mismatch.
+        if self._chosen_iface is None:
+            return
+        iface = self._chosen_iface
+        if iface not in self._iface_keys:
+            return
+        _pub, listen_port = self._iface_keys[iface]
+        peers_on_iface = self._iface_peers.get(iface, set)
+        for pk, cfg in self.peer_configs.items:
+            if cfg.mode == Mode.IGNORE:
+                continue
+            if pk not in peers_on_iface:
+                continue
+            expected_src = routing_id(pk, self.global_config.salt)
+            if src_id != expected_src:
+                continue
+            try:
+                key = await self.oracle.derive_sigbox(iface, pk)
+            except IOError as e:
+                LOG.event(cfg.label, "oracle-derive", "fail",
+                          f"OFFER from {cfg.label}: oracle derive_sigbox "
+                          f"failed: {e}", level=logging.WARNING)
+                return
+            msg = decrypt_envelope(key, blob_b64)
+            if msg is None:
+                LOG.event(cfg.label, "decrypt", "fail",
+                          f"OFFER from {cfg.label}: decryption/freshness failed",
+                          level=logging.WARNING)
+                return
+
+            if not is_wake:
+                # Ordinary signalling OFFER: apply the first valid
+                # candidate (or skip the apply step entirely if none).
+                # Kernel WG endpoint roaming will pick up the rest from
+                # real handshake traffic — no point time-sharing.
+                cand = first_valid_candidate(msg)
+                if cand is None:
+                    LOG.event(cfg.label, "rejected", "no-valid-candidate",
+                              "OFFER from peer carried no usable candidate",
+                              level=logging.WARNING)
+                    # Fall through to the responsive-OFFER path so the
+                    # peer at least learns where we are.
+                else:
+                    ip, port = cand
+                    LOG.event(cfg.label, "incoming-endpoint", f"{ip}:{port}",
+                              f"received endpoint {ip}:{port} via PeerJS "
+                              f"(src broker id ...{src_id[-8:]})")
+                    injected = await self.raw.inject(iface, listen_port, ip, port)
+                    LOG.event(cfg.label, "hole-punch",
+                              "ok" if injected else "fail",
+                              f"raw UDP inject {listen_port} -> {ip}:{port}: "
+                              f"{'ok' if injected else 'FAILED (raw-helper refused)'}")
+                    if await self.oracle.set_endpoint(iface, pk, ip, port):
+                        LOG.event(cfg.label, "wg-set", f"{ip}:{port}",
+                                  f"wg set {iface} peer ...{pk[-8:]} endpoint {ip}:{port}")
+                    ai = (await self.oracle.iface_table(iface, "allowed-ips")).get(pk, "")
+                    target = pick_wake_target(ai)
+                    if target is not None:
+                        LOG.event(cfg.label, "wake", target,
+                                  f"waking handshake via {iface} -> {target}")
+                        await self.raw.wake(iface, target)
+                    self._start_reinjector(pk, iface, cfg)
+            else:
+                # signal_wake: don't touch kernel WG state.  The sender
+                # is asking "where are you" — we fall through to the
+                # responsive-OFFER path which advertises our endpoint.
+                LOG.event(cfg.label, "wake-received", str(int(time.time)),
+                          f"signal_wake from {cfg.label} "
+                          f"(src broker id ...{src_id[-8:]})")
+
+            # Responsive OFFER: advertise our own endpoint so the peer can
+            # punch their NAT toward us. Applies to all non-IGNORE modes.
+            # Guards prevent OFFER loops and broker overuse.
+            now = time.time
+            runtime = self._peer_runtime(pk, iface, cfg)
+
+            # If the tunnel is already up, the peer's hole-punch worked
+            # and there's nothing to bootstrap.  But a `signal_wake` is
+            # an explicit user request to refresh the peer's stored
+            # endpoint for us, so we always honour it (rate-limit still
+            # applies — see the rolling-window counter below).
+            if not is_wake:
+                hs_age = parse_handshake_age(
+                    await self.oracle.iface_table(iface, "latest-handshakes"), pk)
+                if hs_age < HANDSHAKE_DEAD_THRESHOLD:
+                    runtime.offer_exchange_count = 0
+                    runtime.offer_exchange_window_start = 0.0
+                    runtime.offer_quarantine_until = 0.0
+                    return
+
+            # Quarantine: too many exchanges without a working tunnel.
+            if now < runtime.offer_quarantine_until:
+                return
+
+            # Rolling-window exchange counter.
+            if now - runtime.offer_exchange_window_start > OFFER_EXCHANGE_WINDOW:
+                runtime.offer_exchange_count = 0
+                runtime.offer_exchange_window_start = now
+            runtime.offer_exchange_count += 1
+
+            if runtime.offer_exchange_count >= OFFER_EXCHANGE_QUARANTINE_THRESHOLD:
+                logging.warning(
+                    "[%s] %d OFFER exchanges in %.0fs without tunnel-up; "
+                    "quarantining for %.0fs — verify NAT type and routing",
+                    cfg.label, runtime.offer_exchange_count,
+                    OFFER_EXCHANGE_WINDOW, OFFER_QUARANTINE_DURATION)
+                runtime.offer_quarantine_until = now + OFFER_QUARANTINE_DURATION
+                runtime.offer_exchange_count = 0
+                runtime.offer_exchange_window_start = now
+                return
+
+            # Rate-limit: one outbound OFFER per OFFER_RESPONSE_MIN_INTERVAL.
+            if now - runtime.last_signal_attempt < OFFER_RESPONSE_MIN_INTERVAL:
+                return
+
+            runtime.last_signal_attempt = now
+            LOG.event(cfg.label, "offer-response", str(int(now)),
+                      f"sending OFFER response to {cfg.label} "
+                      f"(exchange {runtime.offer_exchange_count})")
+            asyncio.create_task(self.signal_peer(iface, cfg, listen_port))
+            return
+
+    # --- enrollment handler (called from on_incoming for kind=="enroll") ---
+
+    async def _handle_enroll(self, src_id: str, client_pub_b64: str,
+                             ciphertext_b64: str):
+        """Process an inbound ENROLL request.
+
+        Security-critical sequence:
+          1. fast rejects (enrollment off, missing iface, malformed pubkey)
+          2. cached-response lookup (legitimate retry safety)
+          3. try-decrypt over each pending unexpired token
+          4. validate plaintext (token_check, freshness window)
+          5. atomic token claim (single-use enforcement)
+          6. ProvisionScript invocation
+          7. read back allocated WG state
+          8. build, encrypt, send ENROLL_OK; cache for retries
+        Any failure short-circuits without leaking which step failed —
+        attackers should not be able to distinguish "no such token" from
+        "wrong key" from "expired token" via timing or response shape.
+        """
+        gcfg = self.global_config
+
+        # Fast reject: enrollment disabled.
+        if not gcfg.enrollment_enabled:
+            LOG.event("enroll", "disabled", "1",
+                      "received ENROLL but [Enrollment] Enabled = no; ignoring",
+                      level=logging.DEBUG)
+            return
+
+        # Need an active WG interface to anchor the response.
+        if self._chosen_iface is None or self._chosen_iface not in self._iface_keys:
+            LOG.event("enroll", "no-iface", "1",
+                      "received ENROLL but no usable WG interface yet; ignoring",
+                      level=logging.WARNING)
+            return
+        iface = self._chosen_iface
+        server_pub_b64, listen_port = self._iface_keys[iface]
+
+        # Validate client pubkey shape (must decode to 32 bytes).
+        try:
+            client_pub_raw = base64.b64decode(client_pub_b64)
+        except Exception:
+            return
+        if len(client_pub_raw) != 32:
+            return
+
+        # The src routing ID in the envelope must match what we'd compute
+        # from client_pub.  Attackers couldn't forge this through the broker
+        # (it's set by the broker based on the sender's registered ID), but
+        # we check anyway as a sanity guard against malformed messages.
+        expected_src = routing_id(client_pub_b64, gcfg.salt)
+        if src_id != expected_src:
+            LOG.event("enroll", "src-mismatch", expected_src[-8:],
+                      f"ENROLL src_id {src_id[-8:]} doesn't match "
+                      f"routing_id(client_pub); ignoring",
+                      level=logging.WARNING)
+            return
+
+        store = PendingTokensStore(gcfg.state_dir)
+
+        # Replay safety: legitimate retry from same client_pub returns the
+        # cached envelope.  Only the holder of client_priv can decrypt it.
+        cached = store.find_recent(client_pub_b64)
+        if cached is not None:
+            LOG.event(client_pub_b64[:12], "enroll-cached", "1",
+                      f"retry from already-enrolled client "
+                      f"(broker id ...{src_id[-8:]}); returning cached response",
+                      level=logging.INFO)
+            await self.peerjs.send(cached)
+            return
+
+        # Try-decrypt over each token (used + unused), checking expiry.
+        # We DO try used tokens, because a client racing for an
+        # already-consumed token deserves an authenticated TOKEN_USED
+        # response — the user-noticing property
+        tokens = store.list_tokens
+        now = time.time
+        matched_token: Optional[bytes] = None
+        matched_key:   Optional[bytes] = None
+        matched_plaintext: Optional[dict] = None
+        matched_meta: Optional[dict] = None
+        for entry in tokens:
+            # Skip expired, including used-but-old purgeable entries.
+            if entry.get("expires_at", 0) <= now and not entry.get("used"):
+                continue
+            try:
+                token_bytes = base64.b64decode(entry["token_b64"])
+            except Exception:
+                continue
+            try:
+                key = await self.oracle.derive_enroll(
+                    iface, client_pub_b64, token_bytes)
+            except IOError as e:
+                # Oracle unreachable; cannot proceed safely.
+                LOG.event("enroll", "oracle-unreachable", "1",
+                          f"oracle derive_enroll failed: {e}",
+                          level=logging.WARNING)
+                return
+            decrypted = decrypt_enroll_blob(key, ciphertext_b64)
+            if decrypted is None:
+                continue
+            # Belt-and-braces token_check inside the auth-tagged ciphertext.
+            if decrypted.get("token_check") != entry["token_b64"]:
+                continue
+            # Freshness window.
+            ts = decrypted.get("ts")
+            if not isinstance(ts, int) or abs(now - ts) > ENROLL_FRESHNESS_WINDOW:
+                continue
+            matched_token = token_bytes
+            matched_key = key  # reuse for the response encryption below
+            matched_plaintext = decrypted
+            matched_meta = entry
+            break
+
+        if matched_token is None:
+            # Silent ignore (per threat model: don't leak which case failed).
+            LOG.event("enroll", "unmatched", str(int(now / 5)),  # rate-limit
+                      f"ENROLL from broker id ...{src_id[-8:]}: no matching "
+                      f"token (or wrong key, or expired, or stale ts)",
+                      level=logging.WARNING)
+            return
+
+        # Was the matched token already used by a *different* client?
+        # That's a race-loss: respond with authenticated TOKEN_USED so the
+        # losing client surfaces the failure to its user.
+        if matched_meta.get("used"):
+            err_blob = encrypt_enroll_blob(
+                matched_key,
+                {"v": PROTOCOL_VERSION, "ts": int(now),
+                 "code": "TOKEN_USED", "retry_after": 0})
+            envelope = build_enroll_envelope(
+                src_id, "enroll_err", server_pub_b64, err_blob)
+            await self.peerjs.send(envelope)
+            LOG.event(client_pub_b64[:12], "enroll-token-used", "1",
+                      f"ENROLL race lost: token for "
+                      f"{matched_meta.get('name_hint','?')} already consumed "
+                      f"by {matched_meta.get('used_by','?')[:12]}",
+                      level=logging.WARNING)
+            return
+
+        # Atomic claim.  Returns None if someone else claimed the token
+        # between list_tokens and try_claim (a different in-flight ENROLL
+        # or a parallel CLI op).  In that race-loss case, fall through to the
+        # same TOKEN_USED response.
+        claim = store.try_claim(matched_token, client_pub_b64)
+        if claim is None:
+            err_blob = encrypt_enroll_blob(
+                matched_key,
+                {"v": PROTOCOL_VERSION, "ts": int(now),
+                 "code": "TOKEN_USED", "retry_after": 0})
+            envelope = build_enroll_envelope(
+                src_id, "enroll_err", server_pub_b64, err_blob)
+            await self.peerjs.send(envelope)
+            LOG.event(client_pub_b64[:12], "enroll-token-used", "1",
+                      f"ENROLL claim race lost between try-decrypt and "
+                      f"atomic-claim",
+                      level=logging.WARNING)
+            return
+
+        # We won the claim.  Run the provisioning hook.
+        name_hint = matched_meta.get("name_hint", "unknown")
+        ok, errmsg = run_provision_script(
+            gcfg.provision_script, iface, name_hint, client_pub_b64,
+            token=matched_token)
+        if not ok:
+            err_blob = encrypt_enroll_blob(
+                matched_key,
+                {"v": PROTOCOL_VERSION, "ts": int(now),
+                 "code": "PROVISION_FAILED",
+                 "note": errmsg or "provisioning script failed"})
+            envelope = build_enroll_envelope(
+                src_id, "enroll_err", server_pub_b64, err_blob)
+            await self.peerjs.send(envelope)
+            LOG.event(client_pub_b64[:12], "enroll-provision-fail", "1",
+                      f"ENROLL provisioning failed for {name_hint}: {errmsg}",
+                      level=logging.ERROR)
+            return
+
+        # Read back allocated WG state.
+        await self.refresh_iface_state
+        allowed = (await self.oracle.iface_table(iface, "allowed-ips")
+                   ).get(client_pub_b64, "")
+        if not allowed:
+            err_blob = encrypt_enroll_blob(
+                matched_key,
+                {"v": PROTOCOL_VERSION, "ts": int(now),
+                 "code": "PROVISION_FAILED",
+                 "note": "ProvisionScript returned ok but peer not visible "
+                         "in `wg show`"})
+            envelope = build_enroll_envelope(
+                src_id, "enroll_err", server_pub_b64, err_blob)
+            await self.peerjs.send(envelope)
+            LOG.event(client_pub_b64[:12], "enroll-not-visible", "1",
+                      f"ProvisionScript returned 0 but {client_pub_b64[:12]}... "
+                      f"not in `wg show {iface} allowed-ips`",
+                      level=logging.ERROR)
+            return
+
+        # Build ENROLL_OK plaintext.  The first /32 (or /128) entry in
+        # allowed-ips is the address; if there are wider routes we list
+        # them under "allowed_ips" for the client to add to its config.
+        addr = ""
+        for tok in allowed.replace(",", " ").split:
+            try:
+                net = ipaddress.ip_network(tok, strict=False)
+            except ValueError:
+                continue
+            if isinstance(net, ipaddress.IPv4Network) and net.prefixlen == 32:
+                addr = str(net)
+                break
+        # Endpoint hint: prefer the static [Global] PublicIp override, but
+        # fall back to a fresh STUN lookup so the client gets a usable
+        # endpoint even on hosts that don't pin a public IP.  Mirrors
+        # signal_peer; STUN failure here is non-fatal — the client will
+        # still hole-punch, just without a server endpoint pre-populated.
+        endpoint_ip = gcfg.public_ip
+        if not endpoint_ip:
+            endpoint_ip = await get_public_ipv4(gcfg.stun_servers, gcfg)
+        # Build the full ranked candidate list (Step C path) so the
+        # client can race LAN/STUN/PublicIp from the very first connect
+        # — without this, the embedded `server_endpoint_hint` (always
+        # the public IP) gets used as the sole endpoint and a same-LAN
+        # phone needlessly hairpins through the carrier.  Per-peer trim
+        # uses the just-allocated /32 so the new peer never gets served
+        # a candidate inside its own AllowedIPs (a deadlock case).
+        own_wg = set(self._iface_keys.keys)
+        try:
+            cand_list = await discover_local_candidates(
+                gcfg, listen_port, own_wg_ifaces=own_wg,
+            )
+            cand_list = filter_candidates_for_peer(cand_list, allowed)
+        except Exception as e:
+            LOG.event(client_pub_b64[:12], "enroll-candidates", "fail",
+                      f"discover_local_candidates failed during enroll: {e!r}; "
+                      f"client gets server_endpoint_hint only",
+                      level=logging.WARNING)
+            cand_list = []
+        ok_plaintext = {
+            "v":          PROTOCOL_VERSION,
+            "ts":         int(now),
+            "address":    addr or allowed.split(",")[0].strip,
+            "allowed_ips": "0.0.0.0/0, ::/0",  # client's view
+            "keepalive":  25,
+            "server_pubkey":         server_pub_b64,
+            "server_endpoint_hint":  (f"{endpoint_ip}:{listen_port}"
+                                      if endpoint_ip else None),
+            # Full ranked list — clients that understand the field race
+            # the entire list on first connect; older clients ignore it
+            # and fall back to server_endpoint_hint.  Each entry:
+            # {"ip": "<v4-addr>", "port": <int>, "kind": "stun|lan|mesh"}.
+            "candidates": cand_list,
+            "name":       name_hint,
+        }
+        ok_blob = encrypt_enroll_blob(matched_key, ok_plaintext)
+        envelope = build_enroll_envelope(
+            src_id, "enroll_ok", server_pub_b64, ok_blob)
+
+        # Cache before sending.  Cache is the source of truth for retry safety;
+        # if send fails after this, the next retry returns the same envelope.
+        store.cache_response(client_pub_b64, envelope)
+        await self.peerjs.send(envelope)
+        LOG.event(client_pub_b64[:12], "enroll-ok", addr,
+                  f"enrolled {name_hint} (...{client_pub_b64[-8:]}) "
+                  f"with address={addr or '?'}",
+                  level=logging.INFO)
+
+        # Auto-active: write a peers.d-style drop-in into the writable
+        # state dir so the daemon will push OFFERs to this newly-
+        # enrolled peer without requiring the admin to hand-author a
+        # peers.d/<label>.conf entry.  The Phase-2 long-lived
+        # OfferListener on the Android side relies on these OFFERs to
+        # follow the daemon's roaming public IP.  An admin-authored
+        # peers.d/ entry with the same pubkey overrides this drop-in
+        # (the explicit /etc/wireguardrtc/peers.d wins).
+        if gcfg.auto_active_enrollment:
+            try:
+                write_auto_active_peer(
+                    state_dir=gcfg.state_dir,
+                    pubkey_b64=client_pub_b64,
+                    label=name_hint,
+                    iface=iface,
+                )
+                # Refresh in-memory peer configs so the next poll
+                # sends an OFFER without waiting for a daemon restart.
+                self.peer_configs = load_peer_configs(
+                    self.args.peers_dir,
+                    auto_active_directory=auto_active_dir(gcfg.state_dir),
+                )
+            except Exception as e:
+                LOG.event(client_pub_b64[:12], "auto-active", "fail",
+                          f"could not write auto-active drop-in: {e!r}",
+                          level=logging.WARNING)
+
+    # --- conntrack keepalive: re-inject every REINJECT_INTERVAL while DOWN ---
+
+    async def _reinjector_loop(self, pk: str, iface: str, cfg: PeerConfig):
+        """Keep our NAT hole open after a hole-punch until the handshake lands.
+
+        The raw-inject creates a conntrack entry (~30 s TTL). If the peer's NAT
+        opens after our entry has expired we miss the handshake. Re-injecting
+        every REINJECT_INTERVAL (20 s) keeps the entry perpetually fresh on our
+        side, decoupling our NAT state from the peer's inject timing.
+        """
+        while True:
+            await asyncio.sleep(REINJECT_INTERVAL)
+            endpoints = await self.oracle.iface_table(iface, "endpoints")
+            ep = endpoints.get(pk, "").strip
+            if not ep or ep == "(none)":
+                continue
+            handshakes = await self.oracle.iface_table(iface, "latest-handshakes")
+            age = parse_handshake_age(handshakes, pk)
+            if age < HANDSHAKE_DEAD_THRESHOLD:
+                return  # tunnel is up, stop
+            try:
+                dst_ip, dst_port_s = ep.rsplit(":", 1)
+                dst_port = int(dst_port_s)
+            except (ValueError, AttributeError):
+                continue
+            listen_port_s = await self.oracle.iface_field(iface, "listen-port")
+            try:
+                listen_port = int(listen_port_s)
+            except (ValueError, TypeError):
+                continue
+            aips = (await self.oracle.iface_table(iface, "allowed-ips")).get(pk, "")
+            target = pick_wake_target(aips)
+            logging.debug("[%s] re-inject %s -> %s:%s (conntrack refresh)",
+                          cfg.label, listen_port, dst_ip, dst_port)
+            await self.raw.inject(iface, listen_port, dst_ip, dst_port)
+            if target is not None:
+                await self.raw.wake(iface, target)
+
+    def _start_reinjector(self, pk: str, iface: str, cfg: PeerConfig):
+        runtime = self._peer_runtime(pk, iface, cfg)
+        if runtime.reinjector_task is None or runtime.reinjector_task.done:
+            runtime.reinjector_task = asyncio.create_task(
+                self._reinjector_loop(pk, iface, cfg))
+
+    # --- outbound: try to signal a peer that's currently dead ---
+
+    async def signal_peer(self, iface: str, cfg: PeerConfig, listen_port: int):
+        try:
+            key = await self.oracle.derive_sigbox(iface, cfg.public_key)
+        except IOError as e:
+            LOG.event(cfg.label, "oracle-derive", "fail",
+                      f"OFFER not sent to {cfg.label}: oracle derive_sigbox "
+                      f"failed: {e}", level=logging.WARNING)
+            return
+        # Step C: build a ranked multi-candidate list (PublicIp +
+        # parallel STUN + local interfaces).  Replaces the v1
+        # single-candidate emission.  phone-host fills
+        # [LAN, STUN] for free under this same path.
+        own_wg = set(self._iface_keys.keys)
+        candidates = await discover_local_candidates(
+            self.global_config, listen_port,
+            own_wg_ifaces=own_wg,
+        )
+        if not candidates:
+            LOG.event(cfg.label, "offer-sent", "fail",
+                      f"OFFER not sent to {cfg.label}: no candidates "
+                      f"discovered (STUN failed AND no usable local "
+                      f"interface address)",
+                      level=logging.WARNING)
+            return
+        # Step B: trim candidates that would deadlock THIS peer's
+        # kernel-WG bringup (IPs inside its own AllowedIPs).
+        peer_aips = (await self.oracle.iface_table(iface, "allowed-ips")
+                     ).get(cfg.public_key, "")
+        candidates = filter_candidates_for_peer(candidates, peer_aips)
+        if not candidates:
+            LOG.event(cfg.label, "offer-sent", "fail",
+                      f"OFFER not sent to {cfg.label}: every discovered "
+                      f"candidate is inside that peer's AllowedIPs "
+                      f"({peer_aips}) — would deadlock kernel-WG handshake",
+                      level=logging.WARNING)
+            return
+        blob_b64 = encrypt_envelope(key, candidates)
+        dst_id = routing_id(cfg.public_key, self.global_config.salt)
+        envelope = build_offer_envelope(dst_id, blob_b64)
+        if self.peerjs is None:
+            return
+        ok = await self.peerjs.send(envelope)
+        if ok:
+            advertised = ",".join(f"{c['ip']}:{c['port']}" for c in candidates)
+            LOG.event(cfg.label, "offer-sent", str(int(time.time)),
+                      f"sent OFFER to {cfg.label} (broker id ...{dst_id[-8:]})"
+                      f" advertising {advertised}")
+        else:
+            LOG.event(cfg.label, "offer-sent", "fail",
+                      f"OFFER not sent to {cfg.label}: PeerJS unavailable",
+                      level=logging.WARNING)
+
+    async def signal_all_active_peers(self):
+        """Signal all ACTIVE peers that are currently DOWN. Called when the
+        PeerJS session opens so we don't wait a full SIGNALING_BACKOFF cycle
+        after a reconnect or startup race."""
+        await self.refresh_iface_state
+        for iface, (pub, listen_port) in self._iface_keys.items:
+            handshakes = await self.oracle.iface_table(iface, "latest-handshakes")
+            peers_here = self._iface_peers.get(iface, set)
+            for pk, cfg in self.peer_configs.items:
+                if cfg.mode != Mode.ACTIVE:
+                    continue
+                if pk not in peers_here:
+                    continue
+                age = parse_handshake_age(handshakes, pk)
+                if age < HANDSHAKE_DEAD_THRESHOLD:
+                    continue
+                runtime = self._peer_runtime(pk, iface, cfg)
+                runtime.last_signal_attempt = time.time
+                asyncio.create_task(
+                    self.signal_peer(iface, cfg, listen_port))
+
+    # --- per-iface DNS roam check ---
+
+    async def repair_dns(self, iface: str, listen_port: int):
+        endpoints = await self.oracle.iface_table(iface, "endpoints")
+        for pk, cfg in self.peer_configs.items:
+            if cfg.mode != Mode.DNS_ROAM or not cfg.dns_host:
+                continue
+            host_port = cfg.dns_host
+            if ":" not in host_port:
+                continue
+            host, p = host_port.rsplit(":", 1)
+            try:
+                target_port = int(p)
+            except ValueError:
+                continue
+            ip = await resolve_v4(host)
+            if ip is None:
+                continue
+            if not is_valid_public_endpoint(ip, target_port):
+                continue
+            new_ep = f"{ip}:{target_port}"
+            current = endpoints.get(pk)
+            if current == new_ep:
+                continue
+            LOG.event(cfg.label, "dns-roam", new_ep,
+                      f"DNS {host} -> {ip}:{target_port}; updating endpoint")
+            await self.oracle.set_endpoint(iface, pk, ip, target_port)
+            ai = (await self.oracle.iface_table(iface, "allowed-ips")).get(pk, "")
+            target = pick_wake_target(ai)
+            if target is not None:
+                await self.raw.wake(iface, target)
+
+    # --- per-poll work ---
+
+    async def poll_once(self):
+        await self.refresh_iface_state
+        # Drop stale enrollment state on every poll cycle.  This is the
+        # single mechanism that prevents pending-tokens.json from
+        # growing unbounded across "admin minted N tokens that nobody
+        # ever used" episodes.  purge_expired is cheap (in-memory
+        # filter + atomic write) and only writes when something
+        # actually changed.
+        if self.global_config.enrollment_enabled:
+            removed = await asyncio.to_thread(
+                PendingTokensStore(self.global_config.state_dir).purge_expired)
+            if removed:
+                LOG.event("enroll", "purged", str(removed),
+                          f"purged {removed} expired token/cache entries")
+        for iface, (pub, listen_port) in self._iface_keys.items:
+            await self.repair_dns(iface, listen_port)
+            handshakes = await self.oracle.iface_table(iface, "latest-handshakes")
+            peers_here = self._iface_peers.get(iface, set)
+            for pk, cfg in self.peer_configs.items:
+                if cfg.mode != Mode.ACTIVE:
+                    continue
+                if pk not in peers_here:
+                    continue  # not on this interface
+                age = parse_handshake_age(handshakes, pk)
+                up = age < HANDSHAKE_DEAD_THRESHOLD
+                LOG.event(cfg.label, "status",
+                          "UP" if up else "DOWN",
+                          f"tunnel {'UP' if up else 'DOWN'} "
+                          f"(last handshake age: "
+                          f"{age:.0f}s)" if age != float('inf')
+                          else "tunnel DOWN (no handshake yet)")
+                runtime = self._peer_runtime(pk, iface, cfg)
+                if up:
+                    # Reset all transient state so the next outage starts fresh.
+                    runtime.signal_backoff = SIGNALING_BACKOFF_INITIAL
+                    runtime.offer_exchange_count = 0
+                    runtime.offer_exchange_window_start = 0.0
+                    runtime.offer_quarantine_until = 0.0
+                    if (runtime.reinjector_task is not None
+                            and not runtime.reinjector_task.done):
+                        runtime.reinjector_task.cancel
+                        runtime.reinjector_task = None
+                    continue
+                if (time.time - runtime.last_signal_attempt
+                        > runtime.signal_backoff):
+                    runtime.last_signal_attempt = time.time
+                    runtime.signal_backoff = min(
+                        runtime.signal_backoff * 2, SIGNALING_BACKOFF_MAX)
+                    asyncio.create_task(
+                        self.signal_peer(iface, cfg, listen_port))
+
+    def _peer_runtime(self, pk: str, iface: str, cfg: PeerConfig) -> PeerRuntime:
+        key = (iface, pk)
+        if key not in self._runtimes:
+            self._runtimes[key] = PeerRuntime(config=cfg, iface=iface)
+        return self._runtimes[key]
+
+    # --- main loop ---
+
+    async def run(self):
+        # Connect to the privileged key-oracle FIRST.  The daemon does
+        # not hold any private keys itself; every derivation and every
+        # `wg set` for an endpoint goes through the oracle.
+        oracle_sock = os.environ.get(
+            "WIREGUARDRTC_KEY_ORACLE_SOCKET", KEY_ORACLE_DEFAULT_SOCKET)
+        self.oracle = KeyOracleClient(oracle_sock)
+        for attempt in range(1, 31):
+            if await self.oracle.connect:
+                logging.info("connected to key oracle at %s", oracle_sock)
+                break
+            # The oracle is started by its own systemd unit; wait a bit
+            # in case we got scheduled before it.
+            await asyncio.sleep(min(attempt, 5))
+        else:
+            sys.stderr.write(
+                "[FATAL] could not connect to wireguardrtc-key-oracle "
+                f"at {oracle_sock} after 30 attempts.\n"
+                "Is wireguardrtc-key-oracle.service running?\n")
+            sys.exit(2)
+
+        # And to the raw-socket helper.  CAP_NET_RAW lives there now,
+        # not in our process; raw_inject and wake_via_iface go
+        # through the helper RPC.
+        raw_sock = os.environ.get(
+            "WIREGUARDRTC_RAW_HELPER_SOCKET", RAW_HELPER_DEFAULT_SOCKET)
+        self.raw = RawHelperClient(raw_sock)
+        for attempt in range(1, 31):
+            if await self.raw.connect:
+                logging.info("connected to raw-socket helper at %s", raw_sock)
+                break
+            await asyncio.sleep(min(attempt, 5))
+        else:
+            sys.stderr.write(
+                "[FATAL] could not connect to wireguardrtc-raw-helper "
+                f"at {raw_sock} after 30 attempts.\n"
+                "Is wireguardrtc-raw-helper.service running?\n")
+            sys.exit(2)
+
+        await self.refresh_iface_state
+        await self.validate_peer_configs
+
+        # Boot-time cleanup of any stale enrollment state from the
+        # previous instance.  Tokens whose `expires_at` is in the past
+        # are invalid by definition; keeping them in the file just
+        # makes the daemon scan more entries on each ENROLL.  Same for
+        # the recent-enrollments retry cache.
+        if self.global_config.enrollment_enabled:
+            removed = await asyncio.to_thread(
+                PendingTokensStore(self.global_config.state_dir).purge_expired)
+            if removed:
+                logging.info(
+                    "boot recovery: purged %d expired enrollment-state entries",
+                    removed)
+
+        if not self._iface_keys:
+            sys.stderr.write(
+                "[FATAL] no usable WireGuard interfaces found "
+                "(missing pubkey/listen-port; check `wg show interfaces`)\n"
+            )
+            sys.exit(2)
+
+        self._chosen_iface = self.select_listening_iface
+        our_id = self.our_routing_id
+        if not our_id:
+            if self.global_config.enrollment_enabled:
+                logging.warning(
+                    "no active/passive peers configured but enrollment is "
+                    "enabled; expected --enroll-token to mint vouchers but "
+                    "found no WG interface to anchor the routing-id to")
+            else:
+                logging.warning(
+                    "no active/passive peers configured; daemon will run for "
+                    "DNS roaming only (no PeerJS connection will be opened)")
+
+        peerjs_task = None
+        if our_id:
+            logging.info("PeerJS broker id (this peer): ...%s", our_id[-8:])
+            self.peerjs = PeerJSClient(
+                server=self.global_config.peerjs_server,
+                key=self.global_config.peerjs_key,
+                our_routing_id=our_id,
+                on_incoming=self.on_incoming,
+                on_open=self.signal_all_active_peers,
+            )
+            peerjs_task = asyncio.create_task(self.peerjs.run)
+
+        logging.info("daemon started (%d active, %d passive, %d dns-roam, "
+                     "%d ignore peers configured)",
+                     sum(1 for c in self.peer_configs.values
+                         if c.mode == Mode.ACTIVE),
+                     sum(1 for c in self.peer_configs.values
+                         if c.mode == Mode.PASSIVE),
+                     sum(1 for c in self.peer_configs.values
+                         if c.mode == Mode.DNS_ROAM),
+                     sum(1 for c in self.peer_configs.values
+                         if c.mode == Mode.IGNORE))
+
+        try:
+            while not self.shutdown_event.is_set:
+                try:
+                    await self.poll_once
+                except Exception as e:
+                    logging.exception("poll error: %r", e)
+                # PeerJS skipped at startup because WireGuard interfaces weren't
+                # up yet (race with wg-quick).  Re-check on each poll so we open
+                # the connection as soon as the interfaces appear.
+                if self.peerjs is None:
+                    self._chosen_iface = self.select_listening_iface
+                    late_id = self.our_routing_id
+                    if late_id:
+                        logging.info(
+                            "PeerJS broker id (this peer): ...%s  "
+                            "[interfaces appeared after daemon start]",
+                            late_id[-8:])
+                        self.peerjs = PeerJSClient(
+                            server=self.global_config.peerjs_server,
+                            key=self.global_config.peerjs_key,
+                            our_routing_id=late_id,
+                            on_incoming=self.on_incoming,
+                            on_open=self.signal_all_active_peers,
+                        )
+                        peerjs_task = asyncio.create_task(self.peerjs.run)
+                try:
+                    await asyncio.wait_for(self.shutdown_event.wait,
+                                           timeout=POLL_INTERVAL)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if self.peerjs is not None:
+                await self.peerjs.stop
+            if peerjs_task is not None:
+                peerjs_task.cancel
+                try:
+                    await peerjs_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Privilege & entry
+# ---------------------------------------------------------------------------
+
+
+def acquire_lock(lock_path: Path):
+    """Single-instance guard. Returns the lock fd; callers should keep it.
+
+    Best-effort `mkdir` of the parent so manual / non-systemd invocations
+    work, but under the systemd unit the parent is supposed to be
+    created via `RuntimeDirectory=wireguardrtc`.  If the parent doesn't
+    exist AND we can't create it, surface a clear error rather than a
+    Python traceback — almost always the cause is that systemd's view
+    of the unit is stale (forgot to `systemctl daemon-reload` after
+    upgrading), or the dependency chain that pulls in the helpers
+    didn't fire (forgot to `systemctl enable` them).
+    """
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        if not lock_path.parent.exists:
+            sys.stderr.write(
+                f"[FATAL] lock-file directory {lock_path.parent} does "
+                f"not exist and this process cannot create it "
+                f"(EACCES on mkdir).\n"
+                f"\n"
+                f"Under systemd, the directory is normally created via "
+                f"RuntimeDirectory=wireguardrtc.  After a package upgrade "
+                f"that adds new helper units, you typically need:\n"
+                f"\n"
+                f"  sudo systemctl daemon-reload\n"
+                f"  sudo systemctl enable --now \\\n"
+                f"      wireguardrtc-key-oracle.service \\\n"
+                f"      wireguardrtc-raw-helper.service \\\n"
+                f"      wireguardrtc-provision-broker.socket\n"
+                f"  sudo systemctl restart wireguardrtc.service\n"
+                f"\n"
+                f"For non-systemd invocations, override --lock-file to a "
+                f"path under a directory you can write.\n")
+            sys.exit(2)
+        # Race: the dir exists now even though we got EACCES on mkdir;
+        # treat that as success and fall through to the open
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.stderr.write(
+            f"[FATAL] another wireguardrtc daemon already holds {lock_path}\n"
+        )
+        sys.exit(2)
+    return fd
+
+
+def probe_capabilities:
+    """Daemon has no Linux capabilities after the privsep refactors —
+    raw inject lives in wireguardrtc-raw-helper, key derivation lives
+    in wireguardrtc-key-oracle, peer mutation lives in either of
+    those depending on the operation.  All this needs to do is verify
+    that the WireGuard kernel module is reachable for `wg show`."""
+    out = wg_show("interfaces")
+    if not out:
+        sys.stderr.write("[FATAL] `wg show interfaces` returned nothing — "
+                         "wireguard-tools missing or no interfaces?\n")
+        sys.exit(2)
+
+
+def _fmt_handshake_age(ts_str: str) -> str:
+    """Convert a wg latest-handshakes timestamp string to a human-readable age."""
+    try:
+        ts = int(ts_str.strip)
+    except (ValueError, AttributeError):
+        return "never"
+    if ts == 0:
+        return "never"
+    age = int(time.time) - ts
+    if age < 0:
+        return "just now"
+    if age < 120:
+        return f"{age}s ago"
+    if age < 7200:
+        return f"{age // 60}m ago"
+    return f"{age // 3600}h ago"
+
+
+def cmd_show_config(args):
+    """Print identity and suggested peer config; no lock or raw-socket needed."""
+    gcfg = load_global_config(args.config)
+    peer_cfgs = load_peer_configs(args.peers_dir)
+
+    salt_fp = hashlib.sha256(gcfg.salt).hexdigest[:16]
+
+    iface_filter = getattr(args, "iface", None)
+
+    # Gather kernel state for all (or one) WG interfaces.
+    all_ifaces = list_interfaces
+    if iface_filter:
+        if iface_filter not in all_ifaces:
+            print(f"ERROR: interface '{iface_filter}' not found by `wg show interfaces`")
+            print(f"Available interfaces: {' '.join(all_ifaces) or '(none)'}")
+            return
+        all_ifaces = [iface_filter]
+
+    iface_info = {}   # iface -> (pub, port_str)
+    iface_peers = {}  # iface -> set of peer pubkeys
+    iface_endpoints = {}    # iface -> {peer_pk: endpoint_str}
+    iface_handshakes = {}   # iface -> {peer_pk: ts_str}
+    iface_allowedips = {}   # iface -> {peer_pk: allowed_ips_str}
+    iface_keepalive = {}    # iface -> {peer_pk: keepalive_str}
+    for iface in all_ifaces:
+        pub = get_iface_field(iface, "public-key")
+        port_s = get_iface_field(iface, "listen-port")
+        if not pub:
+            continue
+        iface_info[iface] = (pub, port_s)
+        aips = get_iface_table(iface, "allowed-ips")
+        iface_allowedips[iface] = aips
+        iface_peers[iface] = set(aips.keys)
+        iface_endpoints[iface] = get_iface_table(iface, "endpoints")
+        iface_handshakes[iface] = get_iface_table(iface, "latest-handshakes")
+        iface_keepalive[iface] = get_iface_table(iface, "persistent-keepalive")
+
+    # ------------------------------------------------------------------ #
+    # Section 1 — THIS PEER: kernel WG state cross-referenced with peers.d
+    # ------------------------------------------------------------------ #
+    print("=" * 72)
+    print("THIS PEER  (kernel WireGuard state)")
+    print("=" * 72)
+    print(f"  salt-fingerprint : {salt_fp}"
+          "  (SHA-256 of Salt; must match on every peer)")
+    if not iface_info:
+        print("  WARNING: no WireGuard interfaces found")
+    for iface, (pub, port) in iface_info.items:
+        our_id = routing_id(pub, gcfg.salt)
+        print
+        print(f"  INTERFACE  {iface}")
+        print(f"    public-key   {pub}")
+        print(f"    listen-port  {port or '(not set)'}")
+        print(f"    broker-id    {our_id}")
+        peers_here = iface_peers.get(iface, set)
+        if not peers_here:
+            print(f"    (no WireGuard peers configured on {iface})")
+            continue
+        print(f"    WireGuard peers ({len(peers_here)}):")
+        for peer_pk in sorted(peers_here):
+            pid = routing_id(peer_pk, gcfg.salt)
+            ep = iface_endpoints.get(iface, {}).get(peer_pk, "(none)").strip
+            hs = _fmt_handshake_age(iface_handshakes.get(iface, {}).get(peer_pk, "0"))
+            aip = iface_allowedips.get(iface, {}).get(peer_pk, "").strip
+            ka = iface_keepalive.get(iface, {}).get(peer_pk, "off").strip
+            if peer_pk in peer_cfgs:
+                cfg_label = peer_cfgs[peer_pk].label
+                cfg_mode = peer_cfgs[peer_pk].mode.value
+                cfg_tag = f"peers.d: [{cfg_label}]  mode={cfg_mode}"
+            else:
+                cfg_tag = "peers.d: (no entry — daemon ignores this peer)"
+            print(f"      peer {peer_pk}")
+            print(f"        broker-id        {pid}")
+            print(f"        allowed-ips      {aip or '(none)'}")
+            print(f"        endpoint         {ep}")
+            print(f"        last-handshake   {hs}")
+            print(f"        keepalive        {ka}")
+            print(f"        {cfg_tag}")
+    print
+
+    # ------------------------------------------------------------------ #
+    # Section 2 — PEERS.D entries: cross-reference with kernel state
+    # ------------------------------------------------------------------ #
+    print("=" * 72)
+    print(f"PEERS.D  ({args.peers_dir})")
+    print("=" * 72)
+    if not peer_cfgs:
+        print(f"  (no peer drop-ins found under {args.peers_dir})")
+    for pk, cfg in peer_cfgs.items:
+        found_on = sorted(i for i, ps in iface_peers.items if pk in ps)
+        if iface_filter and iface_filter not in found_on:
+            # In filtered mode only show peers relevant to that interface,
+            # but still show entries that claim this interface but aren't found.
+            pass  # included below via the warning block
+        wg_status = f"on {', '.join(found_on)}" if found_on else "NOT FOUND IN KERNEL WG PEERS"
+
+        print
+        print(f"  PEER [{cfg.label}]  mode={cfg.mode.value}  kernel-status={wg_status}")
+        print(f"    public-key  {pk}")
+
+        if cfg.mode == Mode.IGNORE:
+            print("    (mode=ignore — daemon takes no action for this peer)")
+        elif cfg.mode == Mode.DNS_ROAM:
+            print(f"    dns-host    {cfg.dns_host}")
+            print("    (mode=dns-roam — endpoint updated from DNS, no PeerJS)")
+        else:  # ACTIVE or PASSIVE
+            peer_broker_id = routing_id(pk, gcfg.salt)
+            print(f"    broker-id   {peer_broker_id}")
+            if not found_on:
+                print
+                print("    !!! PUBLIC KEY NOT FOUND AS A WG PEER ON THIS MACHINE.")
+                print("    !!! peers.d PublicKey must match a key in `wg show` output")
+                print("    !!! on THIS host — i.e. the REMOTE host's interface public key")
+                print("    !!! as seen by this machine, not the remote's peers.d key.")
+                all_peers = {p for ps in iface_peers.values for p in ps}
+                if all_peers:
+                    print
+                    print("    All WireGuard peers on this machine:")
+                    for candidate in sorted(all_peers):
+                        on = [i for i, ps in iface_peers.items if candidate in ps]
+                        clabel = peer_cfgs[candidate].label if candidate in peer_cfgs else ""
+                        csuffix = f"  [{clabel}]" if clabel else ""
+                        cid = routing_id(candidate, gcfg.salt)
+                        print(f"      {candidate}  (on {', '.join(on)}){csuffix}")
+                        print(f"        broker-id {cid}")
+            else:
+                suggested_mode = "passive" if cfg.mode == Mode.ACTIVE else "active"
+                for iface in found_on:
+                    pub_us, port_us = iface_info[iface]
+                    our_broker_id = routing_id(pub_us, gcfg.salt)
+                    print
+                    print(f"    Suggested peers.d drop-in on the remote host [{cfg.label}]"
+                          f" for its side of {iface}:")
+                    print(f"      [Peer]")
+                    print(f"      PublicKey = {pub_us}  # this host's {iface} public-key")
+                    print(f"      Mode = {suggested_mode}")
+                    print(f"      # broker-id this host will use on {iface}: {our_broker_id}")
+        print
+
+
+def _b64url_nopad(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def cmd_enroll_token(args):
+    """Mint a single-use enrollment token, persist it, print the
+    `wgrtc-enroll://v1?...` URI to stdout (and a terminal QR if isatty
+    and qrencode is available)."""
+    gcfg = load_global_config(args.config)
+    if not gcfg.enrollment_enabled:
+        sys.stderr.write(
+            f"[FATAL] {args.config}: [Enrollment] Enabled = no.\n"
+            "Set Enabled = yes and ProvisionScript = ... to use enrollment.\n")
+        sys.exit(2)
+
+    # Pick the WG interface whose pubkey we'll embed in the URI.
+    all_ifaces = list_interfaces
+    iface = args.iface
+    if iface is None:
+        if not all_ifaces:
+            sys.stderr.write(
+                "[FATAL] no WireGuard interfaces found; cannot mint enrollment "
+                "token without a server pubkey to embed in the URI.\n")
+            sys.exit(2)
+        if len(all_ifaces) == 1:
+            iface = all_ifaces[0]
+        else:
+            sys.stderr.write(
+                f"[FATAL] multiple WireGuard interfaces present "
+                f"({', '.join(all_ifaces)}); pick one with --iface.\n")
+            sys.exit(2)
+    elif iface not in all_ifaces:
+        sys.stderr.write(
+            f"[FATAL] interface {iface!r} not found "
+            f"(have: {', '.join(all_ifaces) or 'none'}).\n")
+        sys.exit(2)
+
+    server_pub = get_iface_field(iface, "public-key")
+    if not server_pub:
+        sys.stderr.write(
+            f"[FATAL] could not read public key of {iface}; daemon needs "
+            "CAP_NET_ADMIN (or root) for `wg show <iface> public-key`.\n")
+        sys.exit(2)
+
+    # Validate name hint.
+    name_hint = (args.enroll_token or "").strip
+    if not name_hint:
+        sys.stderr.write("[FATAL] empty NAME for --enroll-token.\n")
+        sys.exit(2)
+    if len(name_hint) > 64:
+        sys.stderr.write(
+            f"[FATAL] NAME too long ({len(name_hint)} chars; max 64).\n")
+        sys.exit(2)
+    if any(c in name_hint for c in "\x00\n\r"):
+        sys.stderr.write(
+            "[FATAL] NAME may not contain NUL or newlines.\n")
+        sys.exit(2)
+
+    expires_in = float(args.expires) if args.expires else TOKEN_DEFAULT_EXPIRY
+    if expires_in < 60 or expires_in > 7 * 86400:
+        sys.stderr.write(
+            f"[FATAL] --expires {expires_in:.0f}s out of range (60..604800).\n")
+        sys.exit(2)
+
+    store = PendingTokensStore(gcfg.state_dir)
+    try:
+        token, superseded = store.mint(
+            name_hint, expires_in=expires_in,
+            iface=iface,
+            max_pending=gcfg.max_pending_tokens)
+    except RuntimeError as e:
+        sys.stderr.write(f"[FATAL] {e}\n")
+        sys.exit(2)
+    if superseded is not None:
+        # Same-name re-mint: previous unexpired token was just removed
+        # in favour of the one we're about to print.  Warn the admin —
+        # the supported scenarios are "QR was lost" or "token close to
+        # expiry, refresh now"; either way they should know that any
+        # outstanding URL is now invalid.
+        prev_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                 time.gmtime(superseded.get("created_at", 0)))
+        prev_exp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                 time.gmtime(superseded.get("expires_at", 0)))
+        sys.stderr.write(
+            f"note: replaced previous unexpired token for "
+            f"\"{name_hint}\" (issued {prev_iso}, was valid until "
+            f"{prev_exp}); the previously-printed URL is now invalid.\n")
+        # Best-effort: also remove the broker permit for the superseded
+        # token so a stale URL can't sneak through if the admin shipped
+        # it before the supersede.
+        try:
+            prev_token = base64.b64decode(superseded.get("token_b64", ""))
+            if prev_token:
+                remove_provision_permit(prev_token)
+        except Exception:
+            pass
+
+    # Decode server pubkey to raw bytes for compact URL-safe encoding.
+    try:
+        server_pub_raw = base64.b64decode(server_pub)
+    except Exception:
+        sys.stderr.write(
+            f"[FATAL] {iface} public key is not valid base64: {server_pub!r}\n")
+        sys.exit(2)
+
+    salt_b64url = _b64url_nopad(gcfg.salt)
+    pk_b64url = _b64url_nopad(server_pub_raw)
+    token_b64url = _b64url_nopad(token)
+    expires_at = int(time.time + expires_in)
+
+    # Drop a single-use permit file in the broker's trust directory
+    # (mode 0700, root-only).  When the broker later receives a
+    # provisioning request from the daemon, it looks for this permit;
+    # without it the request is refused.  Effect: a daemon RCE cannot
+    # provision arbitrary peers outside the window between mint and
+    # legitimate consumption.  See SECURITY/Auto-enrollment privilege
+    # separation in wireguardrtc(8).
+    #
+    # CR-D1: PermissionError is handled inside write_provision_permit
+    # itself (mint stays valid, broker just won't auto-provision —
+    # admin re-runs under sudo).  Any other OSError (ENOSPC, EIO,
+    # etc.) leaves the just-minted token orphaned in pending-tokens.json
+    # — the daemon would accept the ENROLL but the broker would
+    # refuse for lack of permit.  Roll back by calling unmint
+    try:
+        write_provision_permit(token, name_hint, expires_at)
+    except Exception as e:
+        try:
+            store.unmint(token)
+        except Exception as rollback_err:
+            sys.stderr.write(
+                f"[FATAL] permit write failed AND rollback failed: "
+                f"{type(e).__name__}: {e}; rollback: "
+                f"{type(rollback_err).__name__}: {rollback_err}.  "
+                f"Manually edit pending-tokens.json to remove the "
+                f"orphaned token if necessary.\n")
+            sys.exit(2)
+        sys.stderr.write(
+            f"[FATAL] could not write provisioning permit "
+            f"({type(e).__name__}: {e}).  Mint rolled back; no token "
+            f"was committed.  Resolve the underlying I/O issue and "
+            f"retry the mint command.\n")
+        sys.exit(2)
+
+    # Build URI.  urlencode does the right thing with reserved chars.
+    params = [
+        ("pk",        pk_b64url),
+        ("salt",      salt_b64url),
+        ("broker",    gcfg.peerjs_server),
+        ("brokerkey", gcfg.peerjs_key),
+        ("token",     token_b64url),
+        ("expires",   str(expires_at)),
+        ("server",    name_hint),  # hint for the phone's UI
+    ]
+    import urllib.parse as _up
+    qs = _up.urlencode(params, safe="-_.~")
+    uri = f"wgrtc-enroll://v1?{qs}"
+
+    print(uri)
+
+    # Render QR code if stdout is a TTY and qrencode is available.
+    if sys.stdout.isatty:
+        try:
+            res = subprocess.run(
+                ["qrencode", "-t", "ansiutf8", "-o", "-", uri],
+                capture_output=True, text=True, timeout=5)
+            if res.returncode == 0:
+                print
+                sys.stdout.write(res.stdout)
+                print
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # Diagnostics on stderr (no secrets, just a confirmation).
+    sys.stderr.write(
+        f"\nMinted enrollment token for '{name_hint}':\n"
+        f"  expires: {expires_in:.0f}s from now ({expires_at} unix)\n"
+        f"  iface:   {iface}\n"
+        f"  state:   {store.path}\n"
+    )
+
+
+def main:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", type=Path, default=GLOBAL_CONFIG)
+    ap.add_argument("--peers-dir", type=Path, default=PEERS_DIR)
+    ap.add_argument("--lock-file", type=Path, default=LOCK_FILE,
+                    help=f"path to single-instance lock file "
+                         f"(default: {LOCK_FILE}; also via "
+                         f"WIREGUARDRTC_LOCK_FILE env)")
+    ap.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"),
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ap.add_argument("--show-config", action="store_true",
+                    help="print identity, broker IDs, and suggested peer config; then exit")
+    ap.add_argument("--iface", metavar="IFACE", default=None,
+                    help="with --show-config or --enroll-token: WireGuard interface to use")
+    ap.add_argument("--enroll-token", metavar="NAME", default=None,
+                    help="mint a single-use enrollment token for NAME and "
+                         "print the wgrtc-enroll:// URI; then exit")
+    ap.add_argument("--expires", metavar="SECONDS", type=int, default=None,
+                    help=f"with --enroll-token: token validity window "
+                         f"(default {int(TOKEN_DEFAULT_EXPIRY)}s, range 60..604800)")
+    args = ap.parse_args
+
+    if args.show_config:
+        cmd_show_config(args)
+        return
+    if args.enroll_token:
+        cmd_enroll_token(args)
+        return
+
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
+    # Validate config up-front, BEFORE the lock and the capability probe.
+    # This way a config-error message is the first thing the user sees,
+    # not "cannot create raw socket" — far better UX for misconfigurations.
+    load_global_config(args.config)
+    load_peer_configs(args.peers_dir)
+
+    lock_fd = acquire_lock(args.lock_file)  # noqa: F841 — keep it open
+    probe_capabilities
+
+    daemon = Daemon(args)
+
+    loop = asyncio.new_event_loop
+    asyncio.set_event_loop(loop)
+
+    def _shutdown(*_):
+        logging.info("shutdown signalled")
+        loop.call_soon_threadsafe(daemon.shutdown_event.set)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _shutdown)
+
+    try:
+        loop.run_until_complete(daemon.run)
+    finally:
+        loop.close
+
+
+if __name__ == "__main__":
+    main

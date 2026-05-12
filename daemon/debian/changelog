@@ -1,0 +1,18 @@
+wireguardrtc (0.2.0-1) unstable; urgency=low
+
+  * Repository restructured to host the daemon and the Android client
+    side by side on a unified version tag.  The daemon source moves
+    from the repo root to `daemon/`; behaviour is unchanged.
+  * Relicensed from MIT to Apache License 2.0 (the daemon's source
+    has no GPL or otherwise-incompatible dependencies; Apache 2.0 was
+    chosen for its explicit patent grant).
+  * Repo renamed from `wireguardrtc` to `wgrtc` to match the Android
+    package id and avoid confusion with the trademarked WireGuard name.
+
+ -- Markus Gutschke <gutschke@users.noreply.github.com>  Mon, 12 May 2026 00:00:00 +0000
+
+wireguardrtc (0.1.0-1) unstable; urgency=low
+
+  * Initial release.
+
+ -- Markus Gutschke <gutschke@users.noreply.github.com>  Sun, 03 May 2026 00:00:00 +0000

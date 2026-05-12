@@ -58,9 +58,10 @@ are stored).
 
 ## Open-source verification
 
-Both the Android client and the `wireguardrtc` daemon are open-source. The
-behaviours described above can be verified against the source in this
-repository.
+Both the Android client and the `wireguardrtc` daemon are open-source under
+the Apache License 2.0. The behaviours described above can be verified
+against the source in this repository — `android/` for the app, `daemon/`
+for the server-side daemon.
 
 ## Contact
 

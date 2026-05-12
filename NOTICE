@@ -1,0 +1,40 @@
+wgrtc
+Copyright 2026 Markus Gutschke
+
+This product is licensed under the Apache License, Version 2.0.
+See LICENSE for the full text.
+
+It bundles or links against the following third-party software,
+each with its own license. See THIRD_PARTY_LICENSES/ for the full
+texts.
+
+  wireguard-go              MIT
+    https://github.com/WireGuard/wireguard-go
+
+  gVisor                    Apache License 2.0
+    https://github.com/google/gvisor
+
+  Jetpack Compose,          Apache License 2.0
+  AndroidX libraries,
+  kotlinx-coroutines,
+  kotlinx-serialization,
+  okhttp
+    https://developer.android.com/jetpack/androidx
+    https://github.com/Kotlin/kotlinx.coroutines
+    https://github.com/square/okhttp
+
+  lazysodium-android        Mozilla Public License 2.0
+    https://github.com/terl/lazysodium-android
+
+  libsodium                 ISC License
+    https://github.com/jedisct1/libsodium
+
+  Java Native Access (JNA)  Apache License 2.0 / LGPL 2.1
+    https://github.com/java-native-access/jna
+
+  ZXing Embedded            Apache License 2.0
+    https://github.com/journeyapps/zxing-android-embedded
+
+The Apache License requires that this NOTICE file be distributed with
+substantial portions of the work. When redistributing, please keep it
+intact and add your own attribution lines as needed.
