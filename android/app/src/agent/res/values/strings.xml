@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Distinct launcher label for the agent buildType so the
+         adb-driven test rig is visually distinguishable on a device
+         that also has release/debug installed.  Never shipped to
+         Play Store; verifyAgentNotInRelease guards against leaks. -->
+    <string name="app_name">wgrtc-agent</string>
+</resources>

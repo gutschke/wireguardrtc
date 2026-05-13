@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Distinct launcher label for the debug buildType so it's
+         visually distinguishable when installed alongside release
+         and agent variants. -->
+    <string name="app_name">wgrtc-debug</string>
+</resources>
