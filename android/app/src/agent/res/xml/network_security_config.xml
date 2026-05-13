@@ -4,24 +4,20 @@
 
   Default Android policy (release + debug) denies cleartext HTTP/WS
   to every domain — correct production behaviour, and exactly what
-  blocked our first sandbox enrollment attempt (`ws://10.10.50.0:9000/peerjs`).
-  The agent buildType is an adb-driven instrumented test channel
-  with applicationId `com.gutschke.wgrtc.agent`, never published.
-  Allowing cleartext to RFC 1918 + TEST-NET-1 ranges only is the
-  smallest blast-radius unblock for sandbox-broker tests.
+  blocked our first sandbox enrollment attempt against a plain `ws://`
+  broker.  The agent buildType is an adb-driven instrumented test
+  channel with applicationId `com.gutschke.wgrtc.agent`, never
+  published to Play Store and never present in `release/` or `debug/`
+  source sets, so a broadly permissive cleartext policy here has no
+  blast radius beyond test rigs.
 
   The release variant does NOT pick this file up: `src/agent/` is
   absent from the release source set, and the `network_security_config`
   attribute is only declared in `src/agent/AndroidManifest.xml`.
+  `:app:verifyAgentNotInRelease` (a Gradle task) scans the release
+  APK's dex/resources for any `agent` traces and fails the build if
+  one slips through.
 -->
 <network-security-config>
-    <!-- Test-rig brokers: 10.0.0.0/8 (LAN sandbox), 192.0.2.0/24
-         (RFC 5737 TEST-NET-1), 198.51.100.0/24 (TEST-NET-2),
-         203.0.113.0/24 (TEST-NET-3), and 127.0.0.0/8 (loopback).
-         Cleartext WS to anything else still rejected. -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">10.10.50.0</domain>
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>
