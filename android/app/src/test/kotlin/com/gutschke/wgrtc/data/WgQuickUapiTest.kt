@@ -49,7 +49,15 @@ class WgQuickUapiTest {
         assertEquals(expected, uapi)
     }
 
-    @Test fun `joiner config without keepalive omits the line`() {
+    @Test fun `joiner config without keepalive defaults to 25 when endpoint is set`() {
+        // Bug: wireguard-go won't initiate a handshake until either
+        // outbound traffic hits the tun or keepalive fires. The
+        // candidate race only calls setEndpoint, so a peer config
+        // with Endpoint but no PersistentKeepalive deadlocks the race.
+        // The renderer fills in the WireGuard handbook's recommended
+        // 25 s default. Enrollment-emitted configs already include
+        // an explicit value; this fallback covers manually-imported
+        // configs.
         val cfg = """
             [Interface]
             PrivateKey = $privB64
@@ -62,8 +70,46 @@ class WgQuickUapiTest {
         """.trimIndent()
         val uapi = WgQuickUapi.render(cfg)
         assertTrue(uapi.contains("endpoint=192.0.2.1:51820"))
+        assertTrue(uapi.contains("persistent_keepalive_interval=25"),
+            "default keepalive=25 expected when peer has endpoint but no PersistentKeepalive:\n$uapi")
+    }
+
+    @Test fun `explicit PersistentKeepalive zero is preserved`() {
+        // Some users explicitly disable keepalive (privacy, battery,
+        // pinned-host scenarios). Honour the explicit 0 instead of
+        // overwriting it with the default.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = 192.0.2.1:51820
+            PersistentKeepalive = 0
+        """.trimIndent()
+        val uapi = WgQuickUapi.render(cfg)
+        assertTrue(uapi.contains("persistent_keepalive_interval=0"),
+            "explicit =0 must be preserved verbatim:\n$uapi")
+        assertTrue(!uapi.contains("persistent_keepalive_interval=25"),
+            "must NOT inject the default when an explicit value is present:\n$uapi")
+    }
+
+    @Test fun `peer with no endpoint does not gain a keepalive line`() {
+        // A peer without an Endpoint is server-only (won't initiate).
+        // Keepalive is pointless there — leave the line out so the
+        // UAPI matches the user's intent.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 10.0.0.0/24
+        """.trimIndent()
+        val uapi = WgQuickUapi.render(cfg)
         assertTrue(!uapi.contains("persistent_keepalive_interval"),
-            "no keepalive line expected when [Peer] doesn't set one:\n$uapi")
+            "no keepalive expected for endpoint-less peer:\n$uapi")
     }
 
     @Test fun `multiple AllowedIPs become multiple allowed_ip lines`() {

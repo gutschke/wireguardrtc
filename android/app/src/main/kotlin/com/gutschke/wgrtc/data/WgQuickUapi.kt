@@ -114,7 +114,22 @@ object WgQuickUapi {
         for (p in peers) {
             sb.append("public_key=").append(b64ToHex(p.publicKeyB64)).append('\n')
             p.endpoint?.let { sb.append("endpoint=").append(it).append('\n') }
-            p.keepalive?.let { sb.append("persistent_keepalive_interval=").append(it).append('\n') }
+            // wireguard-go only initiates a handshake when it has
+            // outbound traffic to encrypt (or when keepalive fires).
+            // The candidate race calls setEndpoint and then polls
+            // for a handshake, but it doesn't generate any tun
+            // traffic itself — so a peer config that omits
+            // PersistentKeepalive deadlocks the race even when the
+            // endpoint is fully reachable. Enrollment-emitted
+            // configs always set 25 explicitly; this fallback keeps
+            // manually-imported configs (no keepalive line) working
+            // through the same code path. An explicit `= 0` is
+            // preserved so users who really want no keepalive can
+            // still opt out.
+            val effectiveKeepalive = p.keepalive ?: if (p.endpoint != null) DEFAULT_KEEPALIVE_SECONDS else null
+            effectiveKeepalive?.let {
+                sb.append("persistent_keepalive_interval=").append(it).append('\n')
+            }
             sb.append("replace_allowed_ips=true\n")
             for (cidr in p.allowedIps) {
                 sb.append("allowed_ip=").append(cidr).append('\n')
@@ -122,6 +137,8 @@ object WgQuickUapi {
         }
         return sb.toString()
     }
+
+    private const val DEFAULT_KEEPALIVE_SECONDS = 25
 
     private data class PeerUapi(
         val publicKeyB64: String,
