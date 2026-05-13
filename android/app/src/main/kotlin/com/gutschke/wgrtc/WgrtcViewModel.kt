@@ -808,7 +808,21 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  Log.i("wgrtc-vm", "connect: joiner bound + started for $id")
  val controller: com.gutschke.wgrtc.signalling
  .TunnelEndpointController = WgBridgeTunnelEndpointController(recfg, hub)
- val runner = ConnectionRunner(controller)
+ // PS25: the JoinerVpnService is now up, which means *this*
+ // process's default network is the VPN tun. The tun has only
+ // the joiner's v4 /32 address (from `[Interface] Address`),
+ // so any v6 candidate probe fails source-address selection
+ // with ENETUNREACH before a packet even leaves the kernel.
+ // Route the probe through VpnService.protect() so it uses
+ // the underlying WiFi/cellular network, which is typically
+ // dual-stack.
+ val joinerService = binding.service
+ val probe = com.gutschke.wgrtc.signalling.RealUdpProbe(
+ protector = com.gutschke.wgrtc.signalling.SocketProtector {
+ s -> joinerService.protect(s)
+ },
+ )
+ val runner = ConnectionRunner(controller, probe = probe)
  val ifaces = withContext(Dispatchers.IO) { enumerateLocalInterfaces() }
  // strictHotspot=false: picker returns same-subnet
  // candidates first, then non-same-subnet — runner races

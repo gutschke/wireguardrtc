@@ -69,6 +69,31 @@ interface UdpProbe {
     suspend fun probeOnce(ip: String, port: Int, timeoutMs: Long): ProbeResult
 }
 
+/**
+ * Optional pre-connect hook: called with the freshly-allocated
+ * DatagramSocket before [RealUdpProbe] does `connect()`. Used to
+ * bypass the joiner's VpnService — once the VpnService is up the
+ * app's default network is the v4-only tun, so any v6 destination
+ * gets ENETUNREACH at source-address selection. Calling
+ * `VpnService.protect(socket)` here puts the socket on the
+ * underlying WiFi network instead, which is dual-stack on most
+ * deployments.
+ *
+ * Default impl is a no-op — fine for unit tests and for the
+ * pre-VPN code paths (host-mode probes during candidate
+ * enumeration).
+ */
+fun interface SocketProtector {
+    /** Return true on success; false if the protector failed but the
+     * caller should still try the probe (we'd rather a
+     * captured-and-fails attempt than no attempt at all). */
+    fun protect(socket: DatagramSocket): Boolean
+}
+
+private object NoopSocketProtector : SocketProtector {
+    override fun protect(socket: DatagramSocket): Boolean = true
+}
+
 /** Production probe. Connects a UDP socket, sends a 1-byte payload,
  * reads with the supplied timeout. Catches the OS-level errors that
  * surface as exceptions and maps to [ProbeResult].
@@ -77,12 +102,15 @@ interface UdpProbe {
  * message, so the daemon's WG kernel silently drops it. We're not
  * trying to elicit a reply — we're trying to provoke an ICMP error
  * if the path is broken at the network layer. */
-class RealUdpProbe : UdpProbe {
+class RealUdpProbe(
+    private val protector: SocketProtector = NoopSocketProtector,
+) : UdpProbe {
     override suspend fun probeOnce(
         ip: String, port: Int, timeoutMs: Long,
     ): ProbeResult = withContext(Dispatchers.IO) {
         val socket = DatagramSocket()
         try {
+            protector.protect(socket)
             socket.connect(InetSocketAddress(ip, port))
             socket.soTimeout = timeoutMs.coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
             socket.send(DatagramPacket(byteArrayOf(0), 1))
