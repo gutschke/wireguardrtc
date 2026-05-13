@@ -1,3 +1,30 @@
+wireguardrtc (0.2.3-1) unstable; urgency=high
+
+  * Release blocker: restore daemon from v0.2.0 corruption.  A
+    code-cleanup pass in the v0.2.0 restructure stripped ~80
+    trailing `()` from function calls plus three test files'
+    indentation; the file remained syntax-valid because each
+    corrupted site is a legal bound-method reference (e.g. `main`
+    instead of `main()` at module bottom).  Every fresh-install of
+    v0.2.0's .deb produced a daemon that exited 0 silently and did
+    nothing.  Existing v0.1.0 installs kept working only because
+    they were still running the old binary; v0.1.0 -> v0.2.0
+    upgrades silently broke.
+  * Daemon repair touched ~96 call sites across `wireguardrtc`,
+    three test files (`25_parallel_stun.py`, `26_candidate_trim.py`,
+    `27_candidate_enumerate.py`), and `fabric.sh`'s nine function
+    definitions.  Restored `get_public_ipv4_all`'s missing
+    `LOG.event` for the PublicIp override (test 09 caught it).
+  * Two CI safeguards added: `tests/28_help_smoke.py` (runs
+    `wireguardrtc --help` and fails on empty stdout) and
+    `tests/29_ast_lint.py` (flags bare Name/Attribute expressions,
+    method refs in boolean contexts, and method-shaped attr
+    assignments).
+  * Full test pass: 175 daemon assertions + 11 fabric end-to-end
+    PASS across the unit and shell/fabric suites.
+
+ -- Markus Gutschke <gutschke@users.noreply.github.com>  Wed, 13 May 2026 12:00:00 +0000
+
 wireguardrtc (0.2.0-1) unstable; urgency=low
 
   * Repository restructured to host the daemon and the Android client

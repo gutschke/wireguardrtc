@@ -16,4 +16,4 @@ peers.d.example/dns-roam.conf usr/share/doc/wireguardrtc/examples/peers.d/
 peers.d.example/passive-mobile.conf usr/share/doc/wireguardrtc/examples/peers.d/
 provisioning.conf.example usr/share/doc/wireguardrtc/examples/
 provision-broker.conf.example usr/share/doc/wireguardrtc/examples/
-wg-holepunch-guide.md usr/share/doc/wireguardrtc/
+../docs/wg-holepunch-guide.md usr/share/doc/wireguardrtc/
