@@ -33,7 +33,7 @@ import types
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 loader = importlib.machinery.SourceFileLoader(
- "wgrtc", os.path.join(REPO, "wireguardrtc"))
+    "wgrtc", os.path.join(REPO, "wireguardrtc"))
 spec = importlib.util.spec_from_loader("wgrtc", loader)
 wgrtc = importlib.util.module_from_spec(spec)
 loader.exec_module(wgrtc)
@@ -42,47 +42,47 @@ loader.exec_module(wgrtc)
 pass_n = 0
 fail_n = 0
 def expect(desc, actual, want):
- global pass_n, fail_n
- if actual == want:
- print(f" PASS [{desc}] -> {actual}")
- pass_n += 1
- else:
- print(f" FAIL [{desc}] expected {want!r} got {actual!r}")
- fail_n += 1
+    global pass_n, fail_n
+    if actual == want:
+        print(f"  PASS [{desc}] -> {actual}")
+        pass_n += 1
+    else:
+        print(f"  FAIL [{desc}] expected {want!r} got {actual!r}")
+        fail_n += 1
 
 
 def gcfg(public_ip=None, advertise=None, suppress=None,
- stun_servers=("stun-a", "stun-b")):
- return types.SimpleNamespace(
- public_ip=public_ip,
- stun_servers=list(stun_servers),
- stun_strict=False,
- advertise_interfaces=list(advertise or []),
- suppress_interfaces=list(suppress or []),
- )
+         stun_servers=("stun-a", "stun-b")):
+    return types.SimpleNamespace(
+        public_ip=public_ip,
+        stun_servers=list(stun_servers),
+        stun_strict=False,
+        advertise_interfaces=list(advertise or []),
+        suppress_interfaces=list(suppress or []),
+    )
 
 
 def discover(global_config, listen_port, own_wg_ifaces=None,
- iface_addrs=None, default_iface=None, stun_ips=None):
- """Test wrapper: pass synthetic iface/route/STUN data."""
- async def iface_p(): return list(iface_addrs or [])
- async def default_p(): return default_iface
- async def stun_p(servers, state): return list(stun_ips or [])
- return asyncio.run(wgrtc.discover_local_candidates(
- global_config, listen_port,
- own_wg_ifaces=set(own_wg_ifaces or []),
- iface_addrs_provider=iface_p,
- default_iface_provider=default_p,
- stun_provider=stun_p,
- ))
+             iface_addrs=None, default_iface=None, stun_ips=None):
+    """Test wrapper: pass synthetic iface/route/STUN data."""
+    async def iface_p(): return list(iface_addrs or [])
+    async def default_p(): return default_iface
+    async def stun_p(servers, state): return list(stun_ips or [])
+    return asyncio.run(wgrtc.discover_local_candidates(
+        global_config, listen_port,
+        own_wg_ifaces=set(own_wg_ifaces or []),
+        iface_addrs_provider=iface_p,
+        default_iface_provider=default_p,
+        stun_provider=stun_p,
+    ))
 
 
 def ips_of(cands):
- return [c["ip"] for c in cands]
+    return [c["ip"] for c in cands]
 
 
 def kinds_of(cands):
- return [c["kind"] for c in cands]
+    return [c["kind"] for c in cands]
 
 
 # ─── Trivial cases ───────────────────────────────────────────────

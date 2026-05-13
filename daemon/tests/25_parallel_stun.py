@@ -30,7 +30,7 @@ import types
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 loader = importlib.machinery.SourceFileLoader(
- "wgrtc", os.path.join(REPO, "wireguardrtc"))
+    "wgrtc", os.path.join(REPO, "wireguardrtc"))
 spec = importlib.util.spec_from_loader("wgrtc", loader)
 wgrtc = importlib.util.module_from_spec(spec)
 loader.exec_module(wgrtc)
@@ -39,39 +39,39 @@ loader.exec_module(wgrtc)
 pass_n = 0
 fail_n = 0
 def expect(desc, actual, want):
- global pass_n, fail_n
- if actual == want:
- print(f" PASS [{desc}] -> {actual}")
- pass_n += 1
- else:
- print(f" FAIL [{desc}] expected {want!r} got {actual!r}")
- fail_n += 1
+    global pass_n, fail_n
+    if actual == want:
+        print(f"  PASS [{desc}] -> {actual}")
+        pass_n += 1
+    else:
+        print(f"  FAIL [{desc}] expected {want!r} got {actual!r}")
+        fail_n += 1
 
 
 def make_stub(responses, delays=None):
- """Build a stub stun_query that returns `responses[server]` after
- `delays.get(server, 0)` seconds. Lets us simulate slow servers
- and verify parallel firing."""
- delays = delays or {}
- async def stub(server, timeout=2.5):
- if server in delays:
- await asyncio.sleep(delays[server])
- return responses.get(server)
- return stub
+    """Build a stub stun_query that returns `responses[server]` after
+    `delays.get(server, 0)` seconds. Lets us simulate slow servers
+    and verify parallel firing."""
+    delays = delays or {}
+    async def stub(server, timeout=2.5):
+        if server in delays:
+            await asyncio.sleep(delays[server])
+        return responses.get(server)
+    return stub
 
 
 def state(strict=False, public_ip=None):
- return types.SimpleNamespace(public_ip=public_ip, stun_strict=strict)
+    return types.SimpleNamespace(public_ip=public_ip, stun_strict=strict)
 
 
 def run_first(servers, responses, delays=None, strict=False):
- wgrtc.stun_query = make_stub(responses, delays)
- return asyncio.run(wgrtc.get_public_ipv4(list(servers), state(strict)))
+    wgrtc.stun_query = make_stub(responses, delays)
+    return asyncio.run(wgrtc.get_public_ipv4(list(servers), state(strict)))
 
 
 def run_all(servers, responses, delays=None, strict=False):
- wgrtc.stun_query = make_stub(responses, delays)
- return asyncio.run(wgrtc.get_public_ipv4_all(list(servers), state(strict)))
+    wgrtc.stun_query = make_stub(responses, delays)
+    return asyncio.run(wgrtc.get_public_ipv4_all(list(servers), state(strict)))
 
 
 # ─── get_public_ipv4: single-result API ────────────────────────────
@@ -98,9 +98,9 @@ expect(
 # return the fast one without waiting for the slow ones. Assert
 # wall-clock < sum-of-delays.
 def timed_first(servers, responses, delays=None, strict=False):
- t0 = time.monotonic()
- r = run_first(servers, responses, delays, strict)
- return r, time.monotonic() - t0
+    t0 = time.monotonic()
+    r = run_first(servers, responses, delays, strict)
+    return r, time.monotonic() - t0
 
 
 r, dt = timed_first(

@@ -653,7 +653,7 @@ async def get_public_ipv4_all(stun_servers, state) -> list:
     # doesn't abort the whole gather and force an empty candidate list.
     # Surviving servers still produce results.
     raw = await asyncio.gather(*tasks, return_exceptions=True)
-    seen = set
+    seen: set = set()
     out: list = []
     for entry in raw:
         if isinstance(entry, BaseException):

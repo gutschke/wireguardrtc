@@ -24,7 +24,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 loader = importlib.machinery.SourceFileLoader(
- "wgrtc", os.path.join(REPO, "wireguardrtc"))
+    "wgrtc", os.path.join(REPO, "wireguardrtc"))
 spec = importlib.util.spec_from_loader("wgrtc", loader)
 wgrtc = importlib.util.module_from_spec(spec)
 loader.exec_module(wgrtc)
@@ -33,13 +33,13 @@ loader.exec_module(wgrtc)
 pass_n = 0
 fail_n = 0
 def expect(desc, actual, want):
- global pass_n, fail_n
- if actual == want:
- print(f" PASS [{desc}] -> {actual}")
- pass_n += 1
- else:
- print(f" FAIL [{desc}] expected {want!r} got {actual!r}")
- fail_n += 1
+    global pass_n, fail_n
+    if actual == want:
+        print(f"  PASS [{desc}] -> {actual}")
+        pass_n += 1
+    else:
+        print(f"  FAIL [{desc}] expected {want!r} got {actual!r}")
+        fail_n += 1
 
 
 # ─── filter_candidates_for_peer ───────────────────────────────────
@@ -47,11 +47,11 @@ def expect(desc, actual, want):
 print("=== filter_candidates_for_peer (per-peer deadlock trim) ===")
 
 def cands(*ips):
- return [{"ip": ip, "port": 51820, "kind": "stun"} for ip in ips]
+    return [{"ip": ip, "port": 51820, "kind": "stun"} for ip in ips]
 
 
 def ips_only(cs):
- return [c["ip"] for c in cs]
+    return [c["ip"] for c in cs]
 
 
 # Empty AllowedIPs → no filtering, full list returned (order preserved).
@@ -147,16 +147,16 @@ print()
 print("=== GlobalConfig: Advertise/SuppressInterfaces (Step B conf knobs) ===")
 
 def write_conf(body):
- f = tempfile.NamedTemporaryFile(
- mode="w", suffix=".conf", delete=False)
- f.write(body)
- f.flush()
- f.close()
- return f.name
+    f = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".conf", delete=False)
+    f.write(body)
+    f.flush()
+    f.close()
+    return f.name
 
 
 def cfg(extra=""):
- body = f"""\
+    body = f"""\
 [Global]
 Salt = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 PeerJsServer = wss://example.com/peerjs
@@ -166,7 +166,7 @@ PeerJsKey = test
 [Stun]
 Servers = stun.example.com:3478
 """
- return wgrtc.load_global_config(write_conf(body))
+    return wgrtc.load_global_config(write_conf(body))
 
 
 # Default: empty lists when neither knob is set.
