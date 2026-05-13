@@ -341,6 +341,15 @@ symmetric-NAT wall.  Wgrtc is direct-path only; if both ends sit
 behind symmetric NATs you'll need a relay solution outside this
 project's scope.
 
+**Check your network before you set anything up.**  Both surfaces
+expose a no-installation NAT probe:
+
+- Linux daemon: `wireguardrtc --check-nat` prints the verdict and
+  exits.  No root needed; sends a handful of small UDP packets to
+  three public STUN servers.
+- Android app: Settings → *Network check* → *Run NAT test*.  Same
+  three-server probe, same verdict.
+
 ---
 
 ## Install

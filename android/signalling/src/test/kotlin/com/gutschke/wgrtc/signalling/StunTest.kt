@@ -304,6 +304,37 @@ class StunTest {
         assertNull(report.externalIp)
     }
 
+    @Test fun `classify returns UNKNOWN for an empty server list`() {
+        val report = classifyNat(servers = emptyList())
+        assertEquals(NatType.UNKNOWN, report.natType)
+        assertNull(report.externalIp)
+        assertTrue(report.observations.isEmpty())
+    }
+
+    @Test fun `classify returns CONE_REMAPPED when port is consistent but != source`() {
+        // Two stubs that both lie with the SAME fixed port — a single
+        // external port observed across servers, but not equal to the
+        // local source port we allocated.  This is what an upstream
+        // cone NAT that remaps ports looks like.
+        FixedPortStubStunServer(advertisedPort = 17171).use { a ->
+            FixedPortStubStunServer(advertisedPort = 17171).use { b ->
+                val client = StunClient(timeoutMs = 2000)
+                val report = classifyNat(
+                    servers = listOf(
+                        "127.0.0.1:${a.port}",
+                        "127.0.0.1:${b.port}",
+                    ),
+                    client = client,
+                )
+                assertEquals(NatType.CONE_REMAPPED, report.natType)
+                assertEquals("127.0.0.1", report.externalIp)
+                // Both observations should reflect the lied-about port.
+                assertEquals(setOf(17171),
+                    report.observations.map { it.externalPort }.toSet())
+            }
+        }
+    }
+
     // ─── Helpers ────────────────────────────────────────────────────────
 
     private fun pack(a: Int, b: Int, c: Int, d: Int): ByteArray =

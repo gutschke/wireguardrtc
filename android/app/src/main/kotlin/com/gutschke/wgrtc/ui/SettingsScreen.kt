@@ -46,6 +46,12 @@ import com.gutschke.wgrtc.data.SettingsStore
 import com.gutschke.wgrtc.data.WormholeDefaults
 import com.gutschke.wgrtc.data.decideEgress
 import com.gutschke.wgrtc.data.EgressDecision
+import com.gutschke.wgrtc.signalling.NatClassification
+import com.gutschke.wgrtc.signalling.NatType
+import com.gutschke.wgrtc.signalling.classifyNat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Settings screen for app-level preferences. Currently the
@@ -181,6 +187,13 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.outlineVariant,
             )
             Spacer(Modifier.height(16.dp))
+            NetworkCheckSection()
+
+            Spacer(Modifier.height(24.dp))
+            androidx.compose.material3.HorizontalDivider(
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+            Spacer(Modifier.height(16.dp))
             AdvancedNetworkSection(settings)
 
             Spacer(Modifier.height(24.dp))
@@ -297,6 +310,132 @@ private fun NotificationSection(settings: SettingsStore) {
  * most users want, and exposing the picker prominently would
  * suggest a wrong-thing-to-tweak. Tap to expand.
  */
+/**
+ * "Network check" — runs the same STUN-based NAT classifier that the
+ * daemon's `wireguardrtc --check-nat` exposes, and surfaces the verdict
+ * in plain language.  Lives in Settings rather than per-tunnel
+ * Diagnostics because a first-time user wants to test their NAT *before*
+ * they create a tunnel, not after.  See task D2.
+ */
+@Composable
+private fun NetworkCheckSection() {
+    var inFlight by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf<NatClassification?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+
+    Text("Network check", style = MaterialTheme.typography.titleMedium)
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "Probe your current network's NAT so you know whether wgrtc " +
+            "will work here before you set anything up.  Sends a handful " +
+            "of small UDP packets to public STUN servers; takes a few " +
+            "seconds.  No data leaves the device.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Button(
+        enabled = !inFlight,
+        onClick = {
+            inFlight = true
+            result = null
+            error = null
+            scope.launch {
+                try {
+                    val r = withContext(Dispatchers.IO) {
+                        classifyNat(NETWORK_CHECK_STUN_SERVERS)
+                    }
+                    result = r
+                } catch (t: Throwable) {
+                    error = "Network check failed: ${t.message}"
+                } finally {
+                    inFlight = false
+                }
+            }
+        },
+        modifier = Modifier.fillMaxWidth(),
+    ) { Text(if (inFlight) "Checking…" else "Run NAT test") }
+
+    val current = result
+    if (current != null) {
+        Spacer(Modifier.height(12.dp))
+        NetworkCheckVerdict(current)
+    }
+    val currentError = error
+    if (currentError != null) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            currentError,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
+}
+
+@Composable
+private fun NetworkCheckVerdict(r: NatClassification) {
+    val headline: String
+    val detail: String
+    val viable: Boolean
+    when (r.natType) {
+        NatType.CONE_PRESERVING -> {
+            headline = "Port-preserving cone NAT (or no NAT)"
+            detail = "wgrtc's hole-punch should work as designed."
+            viable = true
+        }
+        NatType.CONE_REMAPPED -> {
+            headline = "Cone NAT, not port-preserving"
+            detail = "The router rewrites your source port.  wgrtc will " +
+                "publish the wrong port; enable UPnP / NAT-PMP / PCP on " +
+                "the router, or use a static port forward."
+            viable = false
+        }
+        NatType.SYMMETRIC -> {
+            headline = "Symmetric NAT"
+            detail = "The router picks a different external port for " +
+                "every destination.  Direct hole-punching is " +
+                "infeasible on this network — wgrtc would need a relay " +
+                "(which this project doesn't ship).  Mobile data or a " +
+                "different Wi-Fi network usually works."
+            viable = false
+        }
+        NatType.UNKNOWN -> {
+            headline = "Couldn't classify"
+            detail = if (r.note.isNotBlank()) r.note
+                     else "No STUN responses.  Check outbound UDP is " +
+                          "allowed, then retry."
+            viable = false
+        }
+    }
+    Text(
+        headline,
+        style = MaterialTheme.typography.titleSmall,
+        color = if (viable) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.error,
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(detail, style = MaterialTheme.typography.bodyMedium)
+    val externalIp = r.externalIp
+    if (externalIp != null) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "External IP seen: $externalIp",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** STUN servers used by the Settings → Network check panel.  Kept in
+ *  sync with `ListenerHub.DEFAULT_STUN_SERVERS` and the daemon's
+ *  `DEFAULT_STUN_SERVERS`. */
+private val NETWORK_CHECK_STUN_SERVERS = listOf(
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.nextcloud.com:3478",
+)
+
 @Composable
 private fun AdvancedNetworkSection(settings: SettingsStore) {
     var expanded by remember { mutableStateOf(false) }
