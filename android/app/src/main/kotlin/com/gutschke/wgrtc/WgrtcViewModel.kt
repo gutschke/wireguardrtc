@@ -842,6 +842,17 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  candidates = candidates,
  localInterfaces = ifaces,
  strictHotspot = false,
+ // Cold-start: the runner was JUST opened by
+ // binding.service.start above. Any handshake on
+ // this controller IS the fresh one — pre-race
+ // should not need to beat a prior baseline. Fixes
+ // PS27 where a fast-path handshake (e.g. ARC
+ // loopback v6, 4 ms) completed before runner
+ // .connect started polling, leaving the capture-
+ // at-entry baseline equal to the just-completed
+ // handshake and pre-race sitting out its full
+ // 2.5 s budget for a successor that never comes.
+ baselineHandshakeMs = 0L,
  )
  when (r) {
  is ConnectAttemptResult.Success -> {

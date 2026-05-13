@@ -472,4 +472,83 @@ class ConnectionRunnerTest {
         assertEquals(0, controller.setEndpointCalls.get(),
                      "shortcut must skip the race when no LAN candidate exists")
     }
+
+    // ─── PS27: cold-start baseline override ──────────────────────────
+    //
+    // On fast paths (e.g. ARC loopback v6) the initial handshake
+    // completes BEFORE runner.connect even starts polling. The
+    // default capture-at-entry baseline already reflects the just-
+    // completed handshake, so waitForHandshake sits out its full
+    // window for a successor that never arrives, then falls through
+    // to a redundant race. Cold-start callers (WgrtcViewModel) opt
+    // out by passing baselineHandshakeMs=0L — any positive value
+    // returned by the controller then counts as fresh.
+
+    @Test fun `baselineHandshakeMs=0L short-circuits when controller already has a handshake`() = runBlocking {
+        // Simulates ARC fast-path: the controller's
+        // latestHandshakeMs is already > 0 at the moment connect()
+        // is invoked (binding.service.start triggered the handshake
+        // synchronously). Default behaviour would capture that
+        // value as the baseline and never short-circuit. With
+        // baselineHandshakeMs=0L the runner accepts the standing
+        // handshake immediately and skips the race entirely.
+        val already = System.currentTimeMillis()
+        val controller = object : TunnelEndpointController {
+            val setEndpointCalls = AtomicInteger(0)
+            val bringDownCalls = AtomicInteger(0)
+            override suspend fun setEndpoint(
+                tunnelId: String, candidate: EndpointUpdate, egressInterface: String?,
+            ) { setEndpointCalls.incrementAndGet() }
+            override suspend fun latestHandshakeMs(): Long = already
+            override suspend fun bringDown() { bringDownCalls.incrementAndGet() }
+        }
+        val runner = ConnectionRunner(
+            controller, IpKeyedProbe(emptyMap()),
+            preRaceHandshakeWindowMs = 1_500L,
+        )
+        val r = runner.connect(
+            "t1",
+            listOf(ep("203.0.113.5")),
+            emptyList(),
+            perCandidateTimeoutMs = 500L,
+            probeBudgetMs = 50L,
+            baselineHandshakeMs = 0L,
+        )
+        assertTrue(r is ConnectAttemptResult.Success, "got $r")
+        assertEquals(0, controller.setEndpointCalls.get(),
+                     "cold-start baseline=0 must short-circuit on the standing handshake")
+        assertEquals(0, controller.bringDownCalls.get())
+    }
+
+    @Test fun `default baseline (no override) preserves roam semantics — stale handshake does not short-circuit`() = runBlocking {
+        // Same controller as above (handshake already set), but the
+        // caller does NOT pass baselineHandshakeMs — this is
+        // RoamController's path, where the standing handshake is
+        // from the OLD endpoint and must NOT be accepted as "fresh
+        // for the new endpoint". Capture-at-entry stays. Pre-race
+        // budgets out, race runs.
+        val already = System.currentTimeMillis()
+        val controller = object : TunnelEndpointController {
+            val setEndpointCalls = mutableListOf<EndpointUpdate>()
+            override suspend fun setEndpoint(
+                tunnelId: String, candidate: EndpointUpdate, egressInterface: String?,
+            ) { setEndpointCalls += candidate }
+            override suspend fun latestHandshakeMs(): Long = already
+            override suspend fun bringDown() {}
+        }
+        val runner = ConnectionRunner(
+            controller, IpKeyedProbe(emptyMap()),
+            preRaceHandshakeWindowMs = 100L,
+        )
+        val r = runner.connect(
+            "t1",
+            listOf(ep("203.0.113.5")),
+            emptyList(),
+            perCandidateTimeoutMs = 200L,
+            probeBudgetMs = 30L,
+            // baselineHandshakeMs intentionally omitted.
+        )
+        assertTrue(controller.setEndpointCalls.isNotEmpty(),
+                   "default capture-at-entry baseline must NOT short-circuit on a standing handshake")
+    }
 }

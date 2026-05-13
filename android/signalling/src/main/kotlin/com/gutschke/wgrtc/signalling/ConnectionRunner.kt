@@ -124,6 +124,18 @@ class ConnectionRunner(
         strictHotspot: Boolean = true,
         perCandidateTimeoutMs: Long = 12_000L,
         probeBudgetMs: Long = 1_500L,
+        // Pre-race "what counts as a NEW handshake" threshold. If the
+        // caller knows wireguard-go was JUST started by them and any
+        // handshake on this peer counts as fresh, pass 0L (cold-start
+        // semantics). If null, capture the current latestHandshakeMs
+        // at entry — correct for [RoamController], which reuses the
+        // same controller across network changes and needs to beat
+        // the OLD endpoint's handshake. Pinned by PS27: on fast paths
+        // (e.g. ARC loopback), the initial handshake completes before
+        // connect() even starts polling, so capture-at-entry misses
+        // the fresh handshake and the race fires a redundant
+        // setEndpoint 4 s later.
+        baselineHandshakeMs: Long? = null,
     ): ConnectAttemptResult {
         if (candidates.isEmpty()) {
             return ConnectAttemptResult.Failed(
@@ -160,7 +172,8 @@ class ConnectionRunner(
         val firstPickedIsSameSubnet =
             picked.firstOrNull()?.isSameSubnet == true
         if (!firstPickedIsSameSubnet) {
-            val handshakeMsBeforePreRace = controller.latestHandshakeMs()
+            val handshakeMsBeforePreRace = baselineHandshakeMs
+                ?: controller.latestHandshakeMs()
             val preWaited = waitForHandshake(
                 handshakeMsBeforePreRace, preRaceHandshakeWindowMs)
             if (preWaited != null) {
