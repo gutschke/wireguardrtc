@@ -110,6 +110,144 @@ DEFAULT_STUN_SERVERS = [
     "stun.cloudflare.com:3478",
     "stun.nextcloud.com:3478",
 ]
+
+
+# ─── NAT-type classifier (used by --check-nat + tests/01_stun_nat.py) ────
+
+class NatVerdict:
+    """Structured verdict from classify_nat_result.
+
+    Fields:
+        kind: one of "no_data", "no_nat_or_cone_port_preserving",
+              "cone_not_port_preserving", "symmetric".
+        port_preserving: True if every observed src_port mapped to the
+                         same number externally; False if any didn't;
+                         None when no data observed.
+        cone: True if every src_port mapped to the SAME ext port across
+              servers; False if at least one src_port showed differing
+              ext ports across destinations; None when no data or only
+              one server probed.
+        external_ips: sorted list of unique external IPs reported.
+        summary: short human-readable verdict, suitable for a CLI
+                 one-liner or a UI banner.
+        wgrtc_viable: True if direct wgrtc hole-punching is expected
+                      to work on this NAT.
+    """
+    __slots__ = ("kind", "port_preserving", "cone", "external_ips",
+                 "summary", "wgrtc_viable")
+
+    def __init__(self, kind, port_preserving, cone, external_ips,
+                 summary, wgrtc_viable):
+        self.kind = kind
+        self.port_preserving = port_preserving
+        self.cone = cone
+        self.external_ips = external_ips
+        self.summary = summary
+        self.wgrtc_viable = wgrtc_viable
+
+    def __repr__(self):
+        return (f"NatVerdict(kind={self.kind!r}, "
+                f"port_preserving={self.port_preserving}, "
+                f"cone={self.cone}, external_ips={self.external_ips}, "
+                f"wgrtc_viable={self.wgrtc_viable})")
+
+
+def classify_nat_result(probes):
+    """Classify NAT behaviour from a list of STUN probe results.
+
+    Args:
+        probes: iterable of (server_label, src_port, ext_ip, ext_port)
+                tuples — each tuple is one successful STUN binding
+                response.  Failed probes should be excluded by the
+                caller.
+
+    Returns:
+        a [NatVerdict] describing what was observed and whether the
+        daemon's hole-punch is expected to work.
+    """
+    probes = list(probes)
+    if not probes:
+        return NatVerdict(
+            kind="no_data", port_preserving=None, cone=None,
+            external_ips=[],
+            summary="No successful STUN probes — cannot classify NAT. "
+                    "Check outbound UDP, then retry.",
+            wgrtc_viable=False)
+
+    external_ips = sorted({ext_ip for (_s, _p, ext_ip, _e) in probes})
+
+    # Group ext_ports observed per src_port.
+    by_src = {}
+    for server, src_port, _ext_ip, ext_port in probes:
+        by_src.setdefault(src_port, []).append((server, ext_port))
+
+    # Port-preservation: every observed src_port mapped to the same
+    # external port number.  If ANY src maps to a different number on
+    # ANY server → not preserving.
+    preserving = True
+    for src_port, observations in by_src.items():
+        for _server, ext_port in observations:
+            if ext_port != src_port:
+                preserving = False
+                break
+        if not preserving:
+            break
+
+    # Cone vs symmetric: for each src, count distinct ext ports across
+    # servers.  If any src shows ≥ 2 distinct ext ports → symmetric.
+    # If every src that was probed against ≥ 2 servers shows exactly
+    # one ext port → cone.  If every src was only probed once we don't
+    # have enough data to declare cone-ness.
+    cone_known = False
+    cone = True
+    for src_port, observations in by_src.items():
+        distinct_ports = {p for _s, p in observations}
+        if len(observations) >= 2:
+            cone_known = True
+            if len(distinct_ports) > 1:
+                cone = False
+                break
+    if not cone_known:
+        cone = None
+
+    if cone is False:
+        return NatVerdict(
+            kind="symmetric", port_preserving=preserving, cone=False,
+            external_ips=external_ips,
+            summary="Symmetric NAT detected: external port varies per "
+                    "destination, so wgrtc's hole-punch can't predict the "
+                    "right port.  Needs a relay or different NAT.",
+            wgrtc_viable=False)
+
+    if cone is True and preserving:
+        return NatVerdict(
+            kind="no_nat_or_cone_port_preserving",
+            port_preserving=True, cone=True, external_ips=external_ips,
+            summary="Port-preserving cone NAT (or no NAT at all).  wgrtc's "
+                    "hole-punch is expected to work as designed.",
+            wgrtc_viable=True)
+
+    if cone is True and not preserving:
+        return NatVerdict(
+            kind="cone_not_port_preserving",
+            port_preserving=False, cone=True, external_ips=external_ips,
+            summary="Cone NAT but NOT port-preserving: external port "
+                    "differs from your WireGuard listen port.  wgrtc will "
+                    "publish the wrong port; enable NAT-PMP/PCP, set up a "
+                    "manual port forward, or use the daemon on a host "
+                    "with a public IP.",
+            wgrtc_viable=False)
+
+    # cone is None → only single-server data per src; honest about it.
+    return NatVerdict(
+        kind="cone_not_port_preserving" if not preserving
+             else "no_nat_or_cone_port_preserving",
+        port_preserving=preserving, cone=None, external_ips=external_ips,
+        summary="Only one STUN server responded per source port — "
+                "port-preservation determined but cone-vs-symmetric "
+                "is undetermined.  Re-run with more STUN servers reachable.",
+        wgrtc_viable=preserving)
+
 DEFAULT_PEERJS_SERVER = "wss://0.peerjs.com/peerjs"
 DEFAULT_PEERJS_KEY = "peerjs"
 
@@ -3776,6 +3914,103 @@ def cmd_enroll_token(args):
     )
 
 
+def cmd_check_nat(args):
+    """Run STUN probes from 3 source ports to each configured STUN server,
+    classify the NAT, print a verdict, exit 0 if wgrtc is viable else 1."""
+    import struct as _struct
+    import socket as _socket
+    import time as _time
+
+    servers = args.stun_servers or DEFAULT_STUN_SERVERS
+
+    # Pick three distinct ephemeral source ports — ask the kernel for
+    # one, read it back, close, repeat.  Avoids accidentally landing on
+    # an in-use port.
+    src_ports = []
+    for _ in range(3):
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 0))
+        src_ports.append(s.getsockname()[1])
+        s.close()
+        _time.sleep(0.05)
+
+    print(f"Source ports: {src_ports}")
+    print(f"STUN servers: {', '.join(servers)}")
+    print()
+
+    probes = []
+    failures = []
+    magic = 0x2112A442
+    for server in servers:
+        host, port_str = server.rsplit(":", 1)
+        port = int(port_str)
+        for src_port in src_ports:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            try:
+                sock.bind(("0.0.0.0", src_port))
+                local_port = sock.getsockname()[1]
+                ip = _socket.gethostbyname(host)
+                txid = os.urandom(12)
+                request = _struct.pack("!HHL12s", 0x0001, 0, magic, txid)
+                sock.settimeout(2.0)
+                sock.sendto(request, (ip, port))
+                deadline = _time.time() + 2.0
+                ext_ip = None
+                ext_port = None
+                while _time.time() < deadline:
+                    data, _ = sock.recvfrom(2048)
+                    if len(data) < 20:
+                        continue
+                    msg_type, msg_len, magic_resp, resp_txid = \
+                        _struct.unpack("!HHL12s", data[:20])
+                    if (msg_type != 0x0101 or magic_resp != magic
+                            or resp_txid != txid):
+                        continue
+                    offset = 20
+                    end = 20 + msg_len
+                    while offset + 4 <= end:
+                        attr_type, attr_len = _struct.unpack(
+                            "!HH", data[offset:offset + 4])
+                        offset += 4
+                        if attr_type == 0x0020 and attr_len >= 8:
+                            family = data[offset + 1]
+                            if family == 0x01:
+                                xport = _struct.unpack(
+                                    "!H", data[offset + 2:offset + 4])[0]
+                                xip = _struct.unpack(
+                                    "!L", data[offset + 4:offset + 8])[0]
+                                ext_port = xport ^ (magic >> 16)
+                                ext_ip = _socket.inet_ntoa(
+                                    _struct.pack("!L", xip ^ magic))
+                                break
+                        offset += attr_len + ((4 - (attr_len % 4)) % 4)
+                    break
+                if ext_ip is None:
+                    raise RuntimeError("XOR-MAPPED-ADDRESS not in response")
+                probes.append((server, local_port, ext_ip, ext_port))
+                tag = "preserved" if ext_port == local_port else "remapped"
+                print(f"  {server:32s}  src={local_port:>5d}  "
+                      f"->  {ext_ip}:{ext_port}  ({tag})")
+            except Exception as e:
+                failures.append((server, src_port, str(e)))
+                print(f"  {server:32s}  src={src_port:>5d}  ->  FAILED: {e}")
+            finally:
+                sock.close()
+
+    verdict = classify_nat_result(probes)
+    print()
+    print(f"External IPs: {verdict.external_ips or '(none)'}")
+    print(f"Verdict:      {verdict.kind}")
+    print(f"  cone:             {verdict.cone}")
+    print(f"  port-preserving:  {verdict.port_preserving}")
+    print()
+    print(verdict.summary)
+    if failures:
+        print()
+        print(f"({len(failures)} probe(s) failed; verdict based on the rest)")
+    sys.exit(0 if verdict.wgrtc_viable else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3797,6 +4032,14 @@ def main():
     ap.add_argument("--expires", metavar="SECONDS", type=int, default=None,
                     help=f"with --enroll-token: token validity window "
                          f"(default {int(TOKEN_DEFAULT_EXPIRY)}s, range 60..604800)")
+    ap.add_argument("--check-nat", action="store_true",
+                    help="probe STUN servers and classify this network's NAT; "
+                         "exit 0 if wgrtc is viable, non-zero otherwise")
+    ap.add_argument("--stun-servers", metavar="HOST:PORT", nargs="+",
+                    default=None,
+                    help="with --check-nat: STUN servers to probe "
+                         "(default: stun.l.google.com, stun.cloudflare.com, "
+                         "stun.nextcloud.com)")
     args = ap.parse_args()
 
     if args.show_config:
@@ -3804,6 +4047,9 @@ def main():
         return
     if args.enroll_token:
         cmd_enroll_token(args)
+        return
+    if args.check_nat:
+        cmd_check_nat(args)
         return
 
     logging.basicConfig(
