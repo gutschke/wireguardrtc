@@ -374,7 +374,7 @@ def _merge_peer_dir(into: dict, directory: Path, override: bool) -> dict:
             logging.warning("%s: unknown Mode=%r, defaulting to passive",
                             path, mode_str)
             mode = Mode.PASSIVE
-        dns_host = sec.get("DnsHost", "").strip or None
+        dns_host = sec.get("DnsHost", "").strip() or None
         if mode == Mode.DNS_ROAM and not dns_host:
             logging.warning("%s: dns-roam requires DnsHost, ignoring peer", path)
             continue
@@ -610,8 +610,8 @@ async def get_public_ipv4(stun_servers, state) -> Optional[str]:
             return ext_ip
     finally:
         for t in tasks:
-            if not t.done:
-                t.cancel
+            if not t.done():
+                t.cancel()
         # Drain cancellations — keeps asyncio's "Task was destroyed
         # but it is pending" warnings out of the log.
         await asyncio.gather(*tasks, return_exceptions=True)
