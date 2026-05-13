@@ -152,8 +152,11 @@ fun parseStunBindingResponse(data: ByteArray, expectedTxid: ByteArray): StunMapp
                 0x02 -> {
                     // 16-byte IPv6 address XORed with cookie ‖ txid.
                     if (attrLen < 20) {
-                        // Malformed v6 attr; skip it.
-                        bb.position(bb.position() + (attrLen - 4))
+                        // Malformed v6 attr; skip it. We've already
+                        // read 4 bytes (reserved + family + xport),
+                        // so advance by `alignTo4(attrLen) - 4` to
+                        // land at the next attribute's header.
+                        bb.position(bb.position() + (alignTo4(attrLen) - 4))
                         offset += 4 + alignTo4(attrLen)
                         continue
                     }
@@ -177,15 +180,22 @@ fun parseStunBindingResponse(data: ByteArray, expectedTxid: ByteArray): StunMapp
                     return StunMapping(cleanIp, extPort)
                 }
                 else -> {
-                    // Unknown family; skip this attribute.
-                    bb.position(bb.position() + (attrLen - 4))
+                    // Unknown family; skip this attribute. We've
+                    // already read 4 bytes (reserved + family +
+                    // xport), so advance by `alignTo4(attrLen) - 4`
+                    // to land at the next attribute's header.
+                    bb.position(bb.position() + (alignTo4(attrLen) - 4))
                     offset += 4 + alignTo4(attrLen)
                     continue
                 }
             }
         } else {
             // Skip this attribute (and any padding to a 4-byte boundary).
-            bb.position(bb.position() + attrLen)
+            // Real STUN servers emit SOFTWARE (0x8022) and other
+            // padded attributes before XOR-MAPPED-ADDRESS; using
+            // raw `attrLen` here would misalign bb.position so the
+            // next attrType is read from the padding bytes.
+            bb.position(bb.position() + alignTo4(attrLen))
             offset += 4 + alignTo4(attrLen)
             continue
         }

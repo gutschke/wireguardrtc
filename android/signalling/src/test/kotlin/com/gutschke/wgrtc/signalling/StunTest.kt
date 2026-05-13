@@ -70,6 +70,56 @@ class StunTest {
         assertEquals(StunMapping("203.0.113.42", 54321), parsed)
     }
 
+    @Test fun `parses XOR-MAPPED-ADDRESS after a padded unknown attribute`() {
+        // Regression: real STUN servers (Google's stun.l.google.com,
+        // for one) emit a SOFTWARE attribute before XOR-MAPPED-ADDRESS.
+        // SOFTWARE is a UTF-8 string and its length rarely lands on
+        // a 4-byte boundary, so STUN's per-attribute padding kicks in.
+        // The parser's skip-unknown-attribute path used to advance
+        // ByteBuffer.position by raw attrLen (not alignTo4(attrLen)),
+        // so the next attribute's header was read from the padding
+        // bytes — XOR-MAPPED-ADDRESS got missed and probe() returned
+        // null. Symptom: STUN classification falsely flagged as
+        // UNKNOWN on stacks that hit a server with this layout.
+        val txid = ByteArray(12) { 0x42.toByte() }
+        // Unknown attribute: type=0x8022 (SOFTWARE), payload="hello"
+        // (5 bytes — needs 3 bytes of zero padding).
+        val swPayload = "hello".toByteArray(Charsets.UTF_8)
+        assertEquals(5, swPayload.size)
+        val swAttr = ByteBuffer.allocate(4 + 5 + 3) // header + payload + pad
+            .order(ByteOrder.BIG_ENDIAN)
+            .putShort(0x8022.toShort())
+            .putShort(5.toShort())
+            .put(swPayload)
+            .put(byteArrayOf(0, 0, 0)) // padding to next 4-byte boundary
+            .array()
+        // Then XOR-MAPPED-ADDRESS for 203.0.113.42:54321.
+        val srcPort = 54321
+        val xport = srcPort xor (0x2112A442.ushr(16))
+        val xip = ByteBuffer.wrap(pack(203, 0, 113, 42))
+            .order(ByteOrder.BIG_ENDIAN).getInt() xor 0x2112A442.toInt()
+        val xmAttrPayload = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
+            .put(0).put(0x01).putShort(xport.toShort()).putInt(xip)
+            .array()
+        val xmAttr = ByteBuffer.allocate(4 + xmAttrPayload.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putShort(0x0020).putShort(xmAttrPayload.size.toShort())
+            .put(xmAttrPayload).array()
+        val body = swAttr + xmAttr
+        val response = ByteBuffer.allocate(20 + body.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putShort(0x0101) // binding response
+            .putShort(body.size.toShort())
+            .putInt(0x2112A442.toInt())
+            .put(txid)
+            .put(body)
+            .array()
+        assertEquals(
+            StunMapping("203.0.113.42", 54321),
+            parseStunBindingResponse(response, txid),
+        )
+    }
+
     @Test fun `mismatched txid returns null`() {
         val txid = ByteArray(12) { 0x42.toByte() }
         val wrongTxid = ByteArray(12) { 0x99.toByte() }
