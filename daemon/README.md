@@ -3,6 +3,32 @@
 A lightweight daemon that maintains direct WireGuard tunnels between peers behind
 NAT — without static IPs, relay servers, or kernel modifications.
 
+> **The daemon and the Android app speak the same wire format.** Anything below
+> works for daemon-to-daemon (typical site-to-site), but the remote peer can
+> equally well be the [Android app](../android/) — e.g. your phone joining a
+> tunnel hosted by this daemon, or this daemon joining a tunnel hosted by the
+> Android app on someone else's phone. Mix and match.
+
+## Configuration checklist — every place you have to touch
+
+First-run pitfalls cluster around forgotten settings. Before reporting that
+"the tunnel won't come up", verify every item on this list on **both** sides:
+
+| # | File / setting | What | Where it's documented |
+|---|---|---|---|
+| 1 | `wg0.conf` `ListenPort` | Must be a **fixed** port, not ephemeral | [WireGuard configuration](#wireguard-configuration) |
+| 2 | `wg0.conf` `[Peer] Endpoint` | Must be **absent** — the daemon fills it in | [WireGuard configuration](#wireguard-configuration) |
+| 3 | `/etc/wireguardrtc/wireguardrtc.conf` `[Global] Salt` | **Must be byte-identical on every host in the mesh.** Generate once with `head -c 32 /dev/urandom \| base64`, then copy. This is the most-missed step. | [Quick start §1](#1-generate-a-shared-salt) |
+| 4 | `[Global] PeerJsServer` + `PeerJsKey` | Signaling broker. Self-host recommended; public broker at `0.peerjs.com` works for testing. | [Signaling server](#signaling-server) |
+| 5 | `/etc/wireguardrtc/peers.d/<label>.conf` | One drop-in per remote peer, carrying the **remote** peer's WG `PublicKey` and a `Mode` (active / passive / dns-roam / ignore). No drop-in → daemon ignores. | [Quick start §3](#3-add-a-peer-drop-in-for-each-remote-host) |
+| 6 | `[Enrollment]` section (optional) | Only needed if you want phones / new daemons to enroll via QR code instead of hand-edited `peers.d/`. | [Auto-enrollment](#auto-enrollment-optional) |
+| 7 | `/etc/wireguardrtc/provision-broker.conf` | Companion to §6 — which Provisioner the privileged broker should call. | [Auto-enrollment](#auto-enrollment-optional) |
+
+After editing any of the above, `sudo wireguardrtc --show-config` is the
+canonical sanity check: the `salt-fingerprint` line must match on both peers,
+and each side's `THIS PEER broker-id` must equal the other side's record of
+the same peer.
+
 ## Problem
 
 WireGuard is a stateless UDP protocol. When both peers sit behind NAT, neither
@@ -299,6 +325,20 @@ but the loser receives an authenticated `TOKEN_USED` response so the
 legitimate user notices the failure rather than silently re-enrolling
 onto a stolen identity. Treat QR images like one-time passwords (E2EE
 channels or in person, not plaintext email).
+
+### Roadmap: wormhole pairing
+
+The Android app additionally supports **wormhole-style pairing** — two devices
+exchange a six-letter shared secret, run SPAKE2 over the same broker, and
+display a matching SAS confirmation phrase before completing the connection.
+This is much friendlier than QR for **site-to-site setup** (where neither end
+has a camera handy) and for retrofitting wgrtc onto an existing pair of
+servers without copy-pasting WG keys by hand.
+
+The daemon doesn't speak this protocol yet — it's tracked as task D1. Until
+then, server-to-server provisioning uses either hand-edited `.peers` /
+`peers.d/` files, or the QR-enrollment flow above (with the joiner side using
+a wgrtc client app or the QR's plain-text URI).
 
 Peer names accept Unicode letters and digits plus space, dot, apostrophe,
 underscore, and hyphen — names like `Anna's Pixel 8` or `François's

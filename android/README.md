@@ -37,7 +37,7 @@ This writes `wgbridge_native/build/jni/<abi>/libwgbridge_native.so` for each ABI
 
 ```sh
 ./gradlew :app:assembleDebug        # debug APK
-./gradlew :app:bundleRelease         # Play-Store-ready AAB
+./gradlew :app:bundleRelease         # signed AAB (kept for future use)
 ./gradlew :app:testDebugUnitTest     # JVM unit tests
 ./gradlew :signalling:testDebugUnitTest
 ./gradlew :app:connectedDebugAndroidTest   # instrumented tests against connected device/emulator
@@ -54,7 +54,7 @@ android/
 ├── wgbridge_native/       cgo + //export wrapper around wireguard-go + gvisor
 ├── wgbridge-native-aar/   Gradle wrapper that packages the .so files into an AAR
 ├── docs/                  Android-specific design notes
-├── playstore-assets/      Listing copy, icons, feature graphic, screenshots
+├── playstore-assets/      Icons, feature graphic, listing copy (kept on hand in case it's ever needed)
 └── gradle/                Wrapper + version catalogue
 ```
 
@@ -68,7 +68,7 @@ The `signalling/` module's protocol design is captured in the top-level [`docs/w
 
 ## Distribution
 
-The app is available on Google Play; the package id is `com.gutschke.wgrtc`. While Play Store coverage is still **internal-testing only**, source-built APKs from this repository are the only way to install it outside that closed list. There is no plan to publish a prebuilt APK directly through GitHub Releases at this time — the trade-off is that GitHub-distributed APKs and Play-distributed APKs sign with different keys and cannot upgrade each other without a full uninstall. If this changes, [`RELEASING.md`](../RELEASING.md) will document the workflow.
+The app's package id is `com.gutschke.wgrtc`. It's distributed as a signed `.apk` on this repository's [Releases](../../releases) page; build it yourself with `./gradlew :app:assembleRelease` if you'd rather not trust a binary you didn't compile. [Obtainium](https://obtainium.imranr.dev/) can keep a sideloaded install up-to-date by polling Releases for new tags.
 
 ## License
 
