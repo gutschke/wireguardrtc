@@ -1,4 +1,6 @@
 import java.util.Properties
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
 
 plugins {
     alias(libs.plugins.android.application)
@@ -79,6 +81,22 @@ android {
             signingConfig = signingConfigs.findByName("release")
                 ?: signingConfigs.getByName("debug")
         }
+        // Instrumented test channel — picks up `src/agent/` source
+        // set on top of `src/main/`, which adds a broadcast receiver
+        // + content provider that let an attached adb host drive the
+        // app without going through the UI. NEVER ship: separate
+        // applicationId means Play Store + GitHub release builds can
+        // never collide with this, and `src/agent/` is physically
+        // absent from `assembleDebug` / `assembleRelease`, so a
+        // signature scan of the production AAB has nothing to find.
+        // The companion `verifyAgentNotInRelease` task below double-
+        // checks the release dex.
+        create("agent") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".agent"
+            isDebuggable = true
+            matchingFallbacks += listOf("debug")
+        }
     }
 
     packaging {
@@ -141,4 +159,58 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.junit4)
     androidTestImplementation(libs.kotlinx.coroutines.test)
+}
+
+// Belt-and-suspenders gate for the agent buildType: the source-set
+// split already excludes `src/agent/` from any other build, but if
+// someone ever moves the receiver into `src/main/` by accident this
+// task fails the release build before an AAB can be uploaded.
+tasks.register("verifyAgentNotInRelease") {
+    group = "verification"
+    description =
+        "Asserts no com/gutschke/wgrtc/agent/ classes leak into the release APK."
+    dependsOn("assembleRelease")
+    // Capture once at configuration time so the action closure only
+    // holds configuration-cache-safe types (File, ByteArray). Defining
+    // containsBytes at script scope captures the Project reference into
+    // the doLast closure, which fails the config cache — inline it.
+    val apkDirFile = layout.buildDirectory
+        .dir("outputs/apk/release").get().asFile
+    val needle = "com/gutschke/wgrtc/agent/".toByteArray(Charsets.UTF_8)
+    doLast {
+        fun containsBytes(haystack: ByteArray, n: ByteArray): Boolean {
+            if (n.isEmpty() || haystack.size < n.size) return false
+            outer@ for (i in 0..haystack.size - n.size) {
+                for (j in n.indices) {
+                    if (haystack[i + j] != n[j]) continue@outer
+                }
+                return true
+            }
+            return false
+        }
+        val apks = apkDirFile.listFiles { f -> f.name.endsWith(".apk") }
+            .orEmpty()
+        require(apks.isNotEmpty()) {
+            "expected at least one APK under ${apkDirFile.absolutePath}"
+        }
+        for (apk in apks) {
+            ZipFile(apk).use { zip ->
+                val dexes: List<ZipEntry> = zip.entries().toList()
+                    .filter { entry: ZipEntry ->
+                        entry.name.matches(Regex("classes\\d*\\.dex"))
+                    }
+                require(dexes.isNotEmpty()) {
+                    "no classes*.dex inside ${apk.name}"
+                }
+                for (dex in dexes) {
+                    val bytes = zip.getInputStream(dex).readBytes()
+                    check(!containsBytes(bytes, needle)) {
+                        "agent classes leaked into release: " +
+                            "${apk.name} :: ${dex.name}"
+                    }
+                }
+            }
+        }
+        println("verifyAgentNotInRelease: clean")
+    }
 }

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Agent buildType manifest: layered on top of `src/main/AndroidManifest.xml`
+  by AGP's manifest merger so the release / debug AndroidManifest never
+  sees the receiver. Lives only in `src/agent/` — physically absent
+  from `assembleDebug` / `assembleRelease`.
+
+  The receiver is exported so `adb shell am broadcast` can reach it,
+  but the agent build also runs under a separate applicationId
+  (`.agent` suffix) so a production install of the app can never
+  receive an agent-channel intent even if one were sent.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name="com.gutschke.wgrtc.agent.AgentBroadcastReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.gutschke.wgrtc.agent.ADD_TUNNEL" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
