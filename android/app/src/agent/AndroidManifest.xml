@@ -11,7 +11,10 @@
   receive an agent-channel intent even if one were sent.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application>
+    <application
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:replace="android:networkSecurityConfig"
+        xmlns:tools="http://schemas.android.com/tools">
         <receiver
             android:name="com.gutschke.wgrtc.agent.AgentBroadcastReceiver"
             android:exported="true">
