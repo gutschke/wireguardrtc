@@ -105,19 +105,19 @@ if [[ -z "${FABRIC_TMP:-}" ]]; then
     export FABRIC_TMP
 fi
 
-_fabric_log {
+_fabric_log() {
     [[ "${FABRIC_DEBUG:-0}" == "1" ]] && echo "[fabric] $*" >&2
     return 0
 }
 
-_fabric_die {
+_fabric_die() {
     echo "[fabric] error: $*" >&2
     exit 1
 }
 
 # ─── Cleanup ───────────────────────────────────────────────────────────────
 
-_fabric_cleanup {
+_fabric_cleanup() {
     local rc=$?
     _fabric_log "cleanup (rc=$rc)"
     # Tell each host to exit.  Best-effort.
@@ -145,7 +145,7 @@ fi
 
 # ─── Public functions ──────────────────────────────────────────────────────
 
-fabric_create_host {
+fabric_create_host() {
     local name="$1"
     [[ -z "$name" ]] && _fabric_die "fabric_create_host: name required"
     [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] \
@@ -184,7 +184,7 @@ fabric_create_host {
     _fabric_log "host $name pid=$(<"$FABRIC_TMP/$name.pid")"
 }
 
-fabric_link {
+fabric_link() {
     local h1="$1" h2="$2"
     local if1="${3:-veth-${h1}-${h2}}"
     local if2="${4:-veth-${h2}-${h1}}"
@@ -199,14 +199,14 @@ fabric_link {
     _fabric_log "linked $h1:$if1 <-> $h2:$if2"
 }
 
-fabric_exec {
+fabric_exec() {
     local h="$1"; shift
     [[ -e "$FABRIC_TMP/$h.cmd" ]] || _fabric_die "fabric_exec: unknown host $h"
     # NUL-delimit the message so multi-line commands survive `read -d ''`.
     printf '%s\0' "$*" > "$FABRIC_TMP/$h.cmd"
 }
 
-fabric_exec_capture {
+fabric_exec_capture() {
     local h="$1"; shift
     [[ -e "$FABRIC_TMP/$h.cmd" ]] || _fabric_die "fabric_exec_capture: unknown host $h"
     # Allocate per-call output and signaling files.
@@ -245,13 +245,13 @@ fabric_exec_capture {
     return "$rc"
 }
 
-fabric_pid {
+fabric_pid() {
     local h="$1"
     [[ -e "$FABRIC_TMP/$h.pid" ]] || _fabric_die "fabric_pid: unknown host $h"
     cat "$FABRIC_TMP/$h.pid"
 }
 
-fabric_status {
+fabric_status() {
     echo "fabric tmp dir: $FABRIC_TMP"
     local f h pid
     for f in "$FABRIC_TMP"/*.pid; do

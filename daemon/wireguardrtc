@@ -640,6 +640,9 @@ async def get_public_ipv4_all(stun_servers, state) -> list:
     means "STUN ran, found nothing usable"; never returns None.
     """
     if getattr(state, "public_ip", None):
+        LOG.event("stun", "public_ip", state.public_ip,
+                  f"public IPv4 = {state.public_ip} (configured override; "
+                  f"STUN skipped)")
         return [state.public_ip]
     if not stun_servers:
         return []
