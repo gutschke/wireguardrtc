@@ -1,5 +1,6 @@
 package com.gutschke.wgrtc.data
 
+import com.gutschke.wgrtc.signalling.IfaceAddrProvider
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -80,6 +81,33 @@ class HostTunnelSnapshotBuilderTest {
         val t = hostTunnel("fdaa::1/64")
         val s = buildHostTunnelSnapshot(t, "fdaa::2/128")
         assertNull(s!!.dns)
+    }
+
+    @Test fun `pickHostEndpoint brackets a ULA IPv6 candidate`() {
+        // Regression: an unbracketed v6 endpoint string like
+        // `fd00:a771:c05:0:7093:efff:fec7:1f44:51820` is unparseable
+        // by wireguard-go's IpcSet (the trailing `:51820` is
+        // indistinguishable from the next address group), and the
+        // joiner's nativeConfigureUAPI returned -2 the moment it
+        // tried to bring the tunnel up. The host's pickHostEndpoint
+        // must always route through formatEndpoint, which brackets
+        // v6 literals.
+        val provider = object : IfaceAddrProvider {
+            override fun list(): List<Pair<String, String>> =
+                listOf("wlan0" to "fd00:a771:c05:0:7093:efff:fec7:1f44")
+        }
+        assertEquals(
+            "[fd00:a771:c05:0:7093:efff:fec7:1f44]:51820",
+            pickHostEndpoint(51820, provider),
+        )
+    }
+
+    @Test fun `pickHostEndpoint leaves an IPv4 candidate unbracketed`() {
+        val provider = object : IfaceAddrProvider {
+            override fun list(): List<Pair<String, String>> =
+                listOf("wlan0" to "192.168.1.10")
+        }
+        assertEquals("192.168.1.10:51820", pickHostEndpoint(51820, provider))
     }
 
     @Test fun `joiner gets host's wg endpoint and allowed ips as usual`() {

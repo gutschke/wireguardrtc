@@ -1,7 +1,9 @@
 package com.gutschke.wgrtc.data
 
+import com.gutschke.wgrtc.signalling.IfaceAddrProvider
 import com.gutschke.wgrtc.signalling.JavaIfaceAddrProvider
 import com.gutschke.wgrtc.signalling.enumerateAndRank
+import com.gutschke.wgrtc.signalling.formatEndpoint
 import com.gutschke.wgrtc.signalling.pubKeyFromPrivate
 import java.net.NetworkInterface
 import java.net.Inet4Address
@@ -128,10 +130,13 @@ internal fun parseInterfaceField(configText: String, key: String): String? {
  * the joiner's listener will rewrite it as soon as a fresh
  * OFFER arrives, so the wrong endpoint is recoverable.
  */
-internal fun pickHostEndpoint(listenPort: Int): String {
+internal fun pickHostEndpoint(
+    listenPort: Int,
+    provider: IfaceAddrProvider = JavaIfaceAddrProvider(),
+): String {
     val candidates = try {
         enumerateAndRank(
-            provider = JavaIfaceAddrProvider(),
+            provider = provider,
             defaultIface = null,
         )
     } catch (_: Throwable) { emptyList() }
@@ -139,7 +144,7 @@ internal fun pickHostEndpoint(listenPort: Int): String {
         ?: candidates.firstOrNull()?.ip
         ?: pickFirstLocalIPv4()
         ?: "192.0.2.1"
-    return "$ip:$listenPort"
+    return formatEndpoint(ip, listenPort)
 }
 
 /** Last-resort: walk the JDK's NetworkInterface list ourselves. */
