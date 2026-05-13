@@ -320,7 +320,7 @@ private fun PeerRow(
     var menuOpen by remember(name, ip) { mutableStateOf(false) }
     var confirmRevoke by remember(name, ip) { mutableStateOf(false) }
 
-    // Health dot colour — green when this peer has handshook recently,
+    // Health dot color — green when this peer has handshook recently,
     // amber when the tunnel is up but this specific peer hasn't, grey
     // when the tunnel itself is down. Threshold: WG re-keys every
     // 2 minutes, so a handshake older than 180 s probably means the

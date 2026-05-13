@@ -18,7 +18,7 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Behaviour of the host backend: owns at most one
+ * Behavior of the host backend: owns at most one
  * [HostModeRunner] at a time, exposes start / stop / reconfigure +
  * a per-pubkey stats snapshot. All tests use a fake
  * [WgBridgeBackend] so the Go runtime never loads.
@@ -341,7 +341,7 @@ class HostModeBackendTest {
     }
 
     @Test
-    fun `subnet other than 10_99_0_0_24 is honoured for localAddr`() = runBlocking<Unit> {
+    fun `subnet other than 10_99_0_0_24 is honored for localAddr`() = runBlocking<Unit> {
         val backend = HookedBackend()
         val factory = HookedFactory(backend)
         val be = HostModeBackend(factory, parentScope)
@@ -387,7 +387,7 @@ class HostModeBackendTest {
 
         // HostModeBackend now defaults to installing catchall
         // forwarders on every start. The unit-test fake doesn't
-        // need real catchall behaviour — it just records that the
+        // need real catchall behavior — it just records that the
         // install happened so tests can assert lifecycle if they
         // want to. Returning a no-op AutoCloseable satisfies the
         // ownership contract.

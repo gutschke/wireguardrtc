@@ -102,7 +102,7 @@ Suggested sequence — each beat ~5–8 s:
 
 That is the entire demo. Steps 1–2 establish that the FGS is running;
 steps 3–4 establish the benefit. The reviewer infers from the text
-justification that maintaining this behaviour while the app is
+justification that maintaining this behavior while the app is
 backgrounded for hours requires the FGS.
 
 ### What NOT to film (would mislead the reviewer)

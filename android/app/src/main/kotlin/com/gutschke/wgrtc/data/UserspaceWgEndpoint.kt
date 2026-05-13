@@ -154,7 +154,7 @@ class UserspaceWgEndpoint(
      * demux table.
      *
      * The internal channel is bounded ([flowChannelCapacity]).
-     * Overflow drops the *new* datagram (UDP-typical behaviour) so
+     * Overflow drops the *new* datagram (UDP-typical behavior) so
      * a slow consumer can't back-pressure the listener thread.
      *
      * NOTE: `flow.send` is blocking from a coroutine perspective —
@@ -246,7 +246,7 @@ class UserspaceWgEndpoint(
     ) : WgUdpFlow {
         override val peerAddress: InetSocketAddress = parseHostPort(peerAddrStr)
         // Channel is the inbound mailbox. DROP_OLDEST so a slow
-        // consumer doesn't back-pressure (UDP-typical behaviour).
+        // consumer doesn't back-pressure (UDP-typical behavior).
         private val inbox: Channel<ByteArray> =
             Channel(capacity = capacity, onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST)
         private val closed = AtomicBoolean(false)
@@ -275,7 +275,7 @@ class UserspaceWgEndpoint(
         /** Default mailbox depth per UDP flow. Sized for a typical
          * STUN/QUIC burst; if a single peer is sustained-flooding,
          * excess datagrams get DROP_OLDEST'd, matching kernel UDP
-         * socket-buffer behaviour. */
+         * socket-buffer behavior. */
         const val DEFAULT_UDP_FLOW_CAPACITY: Int = 64
 
         /** Open a real userspace WG endpoint. Loads the JNI .so;

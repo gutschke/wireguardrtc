@@ -17,7 +17,7 @@ import java.util.Base64
  *
  * Two layers of protection:
  *
- * 1. **Behavioural:** every backend-bound `wg-quick` rendering for
+ * 1. **Behavioral:** every backend-bound `wg-quick` rendering for
  * a HOST_MODE tunnel with enrolled peers MUST contain a
  * `PublicKey = ...` line for each enrolled peer.
  * 2. **Lint:** every Kotlin source file under `app/src/main/`

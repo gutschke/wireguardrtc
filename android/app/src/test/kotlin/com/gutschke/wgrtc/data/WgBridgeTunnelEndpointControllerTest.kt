@@ -12,7 +12,7 @@ import java.io.File
 import java.util.Base64
 
 /**
- * Behaviour of [WgBridgeTunnelEndpointController]. Drives the
+ * Behavior of [WgBridgeTunnelEndpointController]. Drives the
  * candidate race for joiner-mode tunnels via [JoinerWgRunner]
  * (wgbridge / TUN-fd) instead of the legacy GoBackend.
  *

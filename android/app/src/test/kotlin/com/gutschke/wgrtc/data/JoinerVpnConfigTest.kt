@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Test
 import java.util.Base64
 
 /**
- * Behaviour of [JoinerVpnConfig.parse] — extracts the bits a
+ * Behavior of [JoinerVpnConfig.parse] — extracts the bits a
  * `VpnService.Builder` needs from a wg-quick `.conf` text:
  *
  * - Local address(es) for `addAddress(...)` (from `[Interface]
@@ -102,7 +102,7 @@ class JoinerVpnConfigTest {
         assertEquals(2, parsed.routes.size)
     }
 
-    @Test fun `MTU line is honoured`() {
+    @Test fun `MTU line is honored`() {
         val cfg = """
             [Interface]
             PrivateKey = $privB64

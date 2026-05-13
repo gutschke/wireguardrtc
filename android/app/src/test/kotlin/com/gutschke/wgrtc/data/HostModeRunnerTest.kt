@@ -311,7 +311,7 @@ class HostModeRunnerTest {
             }
         }
         override fun setFdProtector(protector: WgFdProtector?) {
-            // Match RealWgBridgeBackend's behaviour: silently ignore
+            // Match RealWgBridgeBackend's behavior: silently ignore
             // calls after close so the runner's setProtector-after-stop
             // doesn't surface the post-close state to assertions.
             if (closedFlag) return

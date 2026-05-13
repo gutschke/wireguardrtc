@@ -42,7 +42,7 @@ expect() {
     else echo "  FAIL [$desc]"; fail_n=$((fail_n+1)); fi
 }
 
-# Add a peer to wg0 the daemon will recognise (we register them via
+# Add a peer to wg0 the daemon will recognize (we register them via
 # a peers.d/ drop-in, since the daemon needs a configured peer to
 # accept OFFERs from on the iface side).  Use a fake but valid WG
 # pubkey for the "peer" — the test plays the peer in Python.

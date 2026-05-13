@@ -200,7 +200,7 @@ class DnsProxy(private val resolver: DnsResolver) {
         // Flags (RFC 1035 §4.1.1): QR=1, Opcode=0, AA=0, TC?,
         // RD=mirrored, RA=1, Z=0, RCODE. RD lives in byte 2
         // bit 0 of the query (high byte of flags); we mirror it
-        // so the client sees "RD got honoured." TC is bit 1 of
+        // so the client sees "RD got honored." TC is bit 1 of
         // byte 2; RA is the high bit of byte 3.
         var flags = 0x8000 // QR=1
         if (queryBuf[2].toInt() and 0x01 != 0) flags = flags or 0x0100 // mirror RD

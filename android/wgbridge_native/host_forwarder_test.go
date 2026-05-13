@@ -117,7 +117,7 @@ func bytesNonZero(n int) []byte {
 // router-originated echoes) and even one such packet killed the
 // process.
 //
-// This test pins the two relevant gvisor API behaviours:
+// This test pins the two relevant gvisor API behaviors:
 // - `Range.ToView()` on an empty Range returns nil.
 // - `View.Release()` panics on a nil receiver.
 // If either flips in a future gvisor upgrade, this test goes red

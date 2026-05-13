@@ -353,7 +353,7 @@ principle, target *any* WG implementation that speaks UAPI — see
  Android `VpnService.Builder` (joiner) or at netstack creation
  time by `netstack.CreateNetTUN` (host).
 - DNS — `wg-quick`'s `DNS = ...` is a userspace resolver hint and
- we deliberately don't honour it. Apps inside a joiner tunnel
+ we deliberately don't honor it. Apps inside a joiner tunnel
  use the OS's DNS for whatever network they're on.
 - `PreUp` / `PreDown` / `PostUp` / `PostDown` — wg-quick script
  hooks. Not applicable on Android.

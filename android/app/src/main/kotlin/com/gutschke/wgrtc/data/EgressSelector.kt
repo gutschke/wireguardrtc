@@ -19,7 +19,7 @@ import javax.net.SocketFactory
  * binds to:
  *
  * - [OsDefault] — let Android pick (default route). Same as
- * the pre- behaviour.
+ * the pre- behavior.
  * - [WifiOnly] — bind to the Wi-Fi network. If Wi-Fi is
  * absent, refuse the flow. Used to make sure ChromeOS-via-
  * tether traffic egresses on the home network, not the
@@ -198,7 +198,7 @@ class EgressSelector(
         override fun createSocket(): Socket {
             // Unconnected socket — caller connects later. We bind
             // to the chosen network here so the later connect
-            // honours the policy. If `resolveOrThrow` throws,
+            // honors the policy. If `resolveOrThrow` throws,
             // it's propagated to the caller as IOException, which
             // SocketFactory.createSocket is allowed to throw.
             val net = resolveOrThrow()

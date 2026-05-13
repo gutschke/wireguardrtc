@@ -124,7 +124,7 @@ class RealWgBridgeBackendNative private constructor(
         // we get here, so this entry point only updates the
         // protector for any FUTURE socket open — currently no path
         // re-opens the wire socket without recreating the bridge,
-        // but updating is cheap and keeps the API behaviour
+        // but updating is cheap and keeps the API behavior
         // intuitive ("set the latest protector").
         WgBridgeNative.installProtector(protector)
         WgBridgeNative.nativeSetFdProtector(handle)

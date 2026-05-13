@@ -89,7 +89,7 @@ class FormatHandshakeAgoTest {
             formatHandshakeAgo(now - (7L*86400 + 12*3600) * 1000, nowMs = now))
     }
 
-    @Test fun `future timestamp clamps to zero (clock skew defence)`() {
+    @Test fun `future timestamp clamps to zero (clock skew defense)`() {
         // If the kernel hands us a "handshake in the future" (clock
         // skew, NTP step, ...), don't render a negative value.
         assertEquals("0s ago", formatHandshakeAgo(now + 5_000, nowMs = now))

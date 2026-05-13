@@ -47,7 +47,7 @@ import kotlinx.coroutines.launch
  *
  * Layout:
  *
- * - Name field (matches the rename dialog's behaviour but inline).
+ * - Name field (matches the rename dialog's behavior but inline).
  * - Configuration text — multi-line, monospace. Validated on
  * Save via [WgQuickUapi.render] (same path the paste-tunnel
  * flow uses).

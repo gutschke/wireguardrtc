@@ -110,7 +110,7 @@ fun pickReceiverCandidates(
  * loopback, link-local, and operationally-down interfaces — same
  * gate the sender uses on its own enumeration. Returns an empty
  * list on any reflection / I/O failure (defensive: the caller falls
- * through to no-same-subnet behaviour, which is permissive but
+ * through to no-same-subnet behavior, which is permissive but
  * doesn't deadlock).
  *
  * Pure JVM API — works on Android (ART supports `NetworkInterface`)

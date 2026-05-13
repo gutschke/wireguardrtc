@@ -75,7 +75,7 @@ import com.gutschke.wgrtc.ui.theme.StatusUpLight
  * Tunnel detail screen — completely reorganised in . Layout
  * pattern:
  *
- * 1. **Status hero card** — colour-keyed to the current state
+ * 1. **Status hero card** — color-keyed to the current state
  * (Connected = teal-green, Connecting = amber, Idle =
  * neutral). Shows the headline status, a one-line summary of
  * the connection (last handshake age / endpoint hint), and
@@ -317,7 +317,7 @@ private fun StatusHeroCard(
             )
             Spacer(Modifier.height(16.dp))
             // All three states use a filled Button so the action is
-            // clearly tappable. We pull the button colours from the
+            // clearly tappable. We pull the button colors from the
             // hero's status palette so the button reads as an
             // intentional inverse of the card (dark fill, light
             // label) rather than a translucent overlay that fights

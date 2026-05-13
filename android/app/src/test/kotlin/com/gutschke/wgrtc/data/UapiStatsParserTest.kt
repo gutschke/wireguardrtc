@@ -6,13 +6,13 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
- * Behaviour of [UapiStatsParser]: turn wireguard-go's IpcGet UAPI
+ * Behavior of [UapiStatsParser]: turn wireguard-go's IpcGet UAPI
  * dump into a [UapiStats] object the host-mode UI can consume.
  *
  * The format is line-oriented `key=value`, terminated by an empty
  * line. Peer sections start with `public_key=<hex>`; all subsequent
  * fields up to the next `public_key=` (or the document end) belong
- * to that peer. Unrecognised keys are ignored.
+ * to that peer. Unrecognized keys are ignored.
  *
  * Pubkey hex → base64 conversion is the parser's responsibility so
  * the status line (which keys [PeerStats] by base64) lines up

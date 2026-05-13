@@ -248,7 +248,7 @@ class EnrollUriTest {
         assertTrue(withCustom.contains("brokerkey=custom"))
         // When brokerKey is the default, it can be omitted to keep
         // URI short — but emitting it is also legal. We emit always
-        // for predictability; both behaviours round-trip via parse().
+        // for predictability; both behaviors round-trip via parse().
         val withDefault = EnrollUri.build(
             serverPub = ByteArray(32), salt = ByteArray(32),
             brokerWss = "wss://x/y", brokerKey = "peerjs",

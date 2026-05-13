@@ -151,7 +151,7 @@ class UdpFlowForwarderTest {
     // ─── helpers ────────────────────────────────────────────────────────
 
     /** UDP echo server that records which source ports it sees so
-     * tests can assert socket-reuse behaviour. */
+     * tests can assert socket-reuse behavior. */
     private class UdpEchoServer {
         private val sock = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
         val address: InetSocketAddress get() = InetSocketAddress("127.0.0.1", sock.localPort)

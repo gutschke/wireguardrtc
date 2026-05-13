@@ -13,7 +13,7 @@ import java.util.Base64
  * Wormhole-code (SPAKE2 + SAS) wire format.
  *
  * This is the *plaintext* signalling format that travels over the
- * broker WSS during wormhole-code enrolment. Unlike the
+ * broker WSS during wormhole-code enrollment. Unlike the
  * existing [buildEnrollEnvelope] flow (which encrypts via a
  * pre-shared sigbox key), the SAS flow has no shared secret yet —
  * the SPAKE2 messages themselves are the key-establishment. SPAKE2
@@ -91,7 +91,7 @@ private val B64_URL = Base64.getUrlEncoder().withoutPadding()
  * existing [routingId] format that broker IDs use over WSS.
  *
  * @param code the shared wormhole-code bytes (UTF-8 of the typed
- * string after normalisation, or whatever the UI chose).
+ * string after normalization, or whatever the UI chose).
  */
 fun sasRoutingIdInitiator(code: ByteArray): String =
     B64_URL.encodeToString(blake2b32(code, LABEL_SAS_ROUTING_INIT))
@@ -125,9 +125,9 @@ fun buildSasStep2Envelope(dstRoutingId: String, pakeMsg: ByteArray): JsonElement
 
 /** Wrap [confirmMac] in an OFFER envelope tagged [SAS_CONFIRM].
  * Optional [encryptedInfo]: a secretbox-with-K ciphertext carrying
- * [JoinerEnrolInfo] (joiner→host) or [HostEnrolInfo] (host→joiner);
+ * [JoinerEnrollInfo] (joiner→host) or [HostEnrollInfo] (host→joiner);
  * see those classes' kdocs. Backward-compat: omit [encryptedInfo]
- * for the legacy mac-only behaviour. */
+ * for the legacy mac-only behavior. */
 fun buildSasConfirmEnvelope(
     dstRoutingId: String,
     confirmMac: ByteArray,

@@ -44,7 +44,7 @@ class UdpProbeTest {
         }
     }
 
-    // ─── single-candidate retry behaviour ─────────────────────────────
+    // ─── single-candidate retry behavior ─────────────────────────────
 
     @Test fun `Reachable on first attempt returns immediately`() = runBlocking {
         val probe = ScriptedProbe(listOf(ProbeResult.Reachable))

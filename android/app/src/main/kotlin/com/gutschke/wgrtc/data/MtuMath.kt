@@ -12,7 +12,7 @@ package com.gutschke.wgrtc.data
  * "packet too big". Many production networks block one or both
  * — operators colloquially call this a "PMTU black hole." When
  * it happens, large packets with `DF=1` are dropped silently and
- * connections appear to hang. Our defence is two-layered:
+ * connections appear to hang. Our defense is two-layered:
  *
  * 1. **Conservative default WG MTU.** [DEFAULT_WG_MTU] = 1420
  * leaves room for a 60-byte WG-over-IPv4 envelope on a

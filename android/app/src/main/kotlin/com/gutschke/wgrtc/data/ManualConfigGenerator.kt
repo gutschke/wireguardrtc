@@ -54,7 +54,7 @@ object ManualConfigGenerator {
             append("Endpoint = ").append(snapshot.wgEndpoint).append('\n')
             // ChromeOS's WG client rejects whitespace inside AllowedIPs.
             // Canonicalize even though the snapshot field is supposed
-            // to be clean already — defence in depth, since the field
+            // to be clean already — defense in depth, since the field
             // ultimately originates from a user textbox.
             append("AllowedIPs = ")
                 .append(WgAllowedIps.canonicalize(snapshot.allowedIps))

@@ -7,7 +7,7 @@
 # get_public_ipv4(servers, state)
 # Returns the FIRST valid response (under strict-mode filtering)
 # across all servers fired in parallel. Caller-visible API matches
-# the pre-Step-H behaviour for back-compat.
+# the pre-Step-H behavior for back-compat.
 #
 # get_public_ipv4_all(servers, state)
 # Returns the deduped list of all valid responses, in completion

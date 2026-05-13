@@ -43,7 +43,7 @@ class DiagnosticsTargetsTest {
         // AllowedIPs = 0.0.0.0/0 isn't actually useful as a host
         // target ("first host of 0.0.0.0/0" = 0.0.0.1, garbage),
         // but the parser still returns it. This is documented
-        // behaviour — the user's expected to edit the textfield
+        // behavior — the user's expected to edit the textfield
         // away from a clearly-wrong default.
         val cfg = """
             [Interface]

@@ -4,7 +4,7 @@
 // AAR consumable from the app module.
 //
 // Why a library module rather than a flat-file dependency:
-// Android Gradle Plugin only honours an AAR's `jni/` payload when
+// Android Gradle Plugin only honors an AAR's `jni/` payload when
 // the AAR arrives via a Maven or project dependency.
 // `implementation(files(libwgbridge_native.so))` would put the .so
 // on the classpath but NOT into the final APK's `lib/<abi>/`

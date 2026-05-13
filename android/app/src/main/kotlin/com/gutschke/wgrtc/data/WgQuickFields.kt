@@ -11,7 +11,7 @@ package com.gutschke.wgrtc.data
  * etc.
  *
  * Tolerant of extra whitespace, Windows / Unix line endings, blank
- * lines, comments starting with `#`. Anything we don't recognise
+ * lines, comments starting with `#`. Anything we don't recognize
  * gets dropped from the per-field view (a multi-peer config would
  * therefore lose its second peer — but our manual-config generator
  * only ever emits single-peer). Pure — no I/O — so unit-testable.

@@ -20,7 +20,7 @@ import java.util.Base64
  * joiner persists the resulting tunnel and starts its listener,
  * the host's OFFER traffic carries the authoritative roamed
  * address and the listener-driven Endpoint rewriter takes over
- * (existing behaviour from the QR-enrolment path).
+ * (existing behavior from the QR-enrollment path).
  *
  * Returns null when the tunnel isn't HOST_MODE, doesn't carry
  * required fields, or has no parseable PrivateKey / ListenPort.
@@ -59,9 +59,9 @@ fun buildHostTunnelSnapshot(
         privKeyB64 = privB64,
         pubKeyB64 = pubB64,
         wgEndpoint = endpoint,
-        // Honour the host's choice from [HostModeConfig.advertisedAllowedIps];
+        // Honor the host's choice from [HostModeConfig.advertisedAllowedIps];
         // fall back to the subnet (local-only access) so legacy
-        // tunnels that pre-date the field keep their behaviour.
+        // tunnels that pre-date the field keep their behavior.
         // Canonicalize so downstream wg-quick / SAS-payload renderers
         // never emit whitespace that ChromeOS's WG client rejects.
         allowedIps = WgAllowedIps.canonicalize(
@@ -99,7 +99,7 @@ internal fun extractInterfaceIpv4(configText: String): String? {
  * Extract `<key> = <value>` from the `[Interface]` section.
  * Tolerant of indentation, extra spaces around `=`, and Unix /
  * Windows line endings. Returns the first match; subsequent
- * lines with the same key are ignored (wg-quick's own behaviour).
+ * lines with the same key are ignored (wg-quick's own behavior).
  */
 internal fun parseInterfaceField(configText: String, key: String): String? {
     var inInterface = false

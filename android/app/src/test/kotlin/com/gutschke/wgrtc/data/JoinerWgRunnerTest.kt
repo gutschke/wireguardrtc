@@ -11,7 +11,7 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Behaviour of [JoinerWgRunner]: parallel to [HostModeBackend]
+ * Behavior of [JoinerWgRunner]: parallel to [HostModeBackend]
  * but for joiner-mode tunnels. Drives `wgbridge` in TUN-fd mode
  * — the kernel TUN (from `VpnService.Builder.establish()`) is the
  * cleartext side, wireguard-go drives encryption end-to-end. No

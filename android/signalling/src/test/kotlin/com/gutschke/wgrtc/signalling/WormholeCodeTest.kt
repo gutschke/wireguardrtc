@@ -42,26 +42,26 @@ class WormholeCodeTest {
         assertThrows(IllegalArgumentException::class.java) { WormholeCode.generate(length = 33) }
     }
 
-    @Test fun `normalise uppercases and strips spaces and dashes`() {
-        assertEquals("ABCDEF", WormholeCode.normalise("ab-cd ef"))
-        assertEquals("ABCDEF", WormholeCode.normalise("ABC-DEF"))
-        assertEquals("ABCDEF", WormholeCode.normalise(" a b c d e f "))
+    @Test fun `normalize uppercases and strips spaces and dashes`() {
+        assertEquals("ABCDEF", WormholeCode.normalize("ab-cd ef"))
+        assertEquals("ABCDEF", WormholeCode.normalize("ABC-DEF"))
+        assertEquals("ABCDEF", WormholeCode.normalize(" a b c d e f "))
     }
 
-    @Test fun `normalise drops disallowed characters (digits, I, O, etc)`() {
+    @Test fun `normalize drops disallowed characters (digits, I, O, etc)`() {
         // Digit zero, the letter I, the letter O — all stripped.
-        assertEquals("ABCDEF", WormholeCode.normalise("AB0CDIEF"))
-        assertEquals("ABCDEF", WormholeCode.normalise("AB.CD-EF"))
+        assertEquals("ABCDEF", WormholeCode.normalize("AB0CDIEF"))
+        assertEquals("ABCDEF", WormholeCode.normalize("AB.CD-EF"))
         // Lowercase 'l' uppercases to 'L' which IS in the alphabet,
-        // so it survives normalisation. Lowercase 'i' uppercases to
+        // so it survives normalization. Lowercase 'i' uppercases to
         // 'I' which is NOT in the alphabet, so it gets dropped.
-        assertEquals("ABCDEFL", WormholeCode.normalise("aBcDeFiOl"))
-        assertEquals("ABCDEFL", WormholeCode.normalise("aBcDeFil"))
+        assertEquals("ABCDEFL", WormholeCode.normalize("aBcDeFiOl"))
+        assertEquals("ABCDEFL", WormholeCode.normalize("aBcDeFil"))
     }
 
-    @Test fun `isValid accepts a 6-character normalised code`() {
+    @Test fun `isValid accepts a 6-character normalized code`() {
         assertTrue(WormholeCode.isValid("ABCDEF"))
-        assertTrue(WormholeCode.isValid("ab-cdef")) // normalised before check
+        assertTrue(WormholeCode.isValid("ab-cdef")) // normalized before check
         assertTrue(WormholeCode.isValid("ABC DEF"))
     }
 
@@ -86,10 +86,10 @@ class WormholeCodeTest {
         )
     }
 
-    @Test fun `toBytes is idempotent across normalised vs raw input`() {
+    @Test fun `toBytes is idempotent across normalized vs raw input`() {
         val raw = " AB-CDEF "
         val once = WormholeCode.toBytes(raw)
-        val twice = WormholeCode.toBytes(WormholeCode.normalise(raw))
+        val twice = WormholeCode.toBytes(WormholeCode.normalize(raw))
         assertArrayEquals(once, twice)
     }
 

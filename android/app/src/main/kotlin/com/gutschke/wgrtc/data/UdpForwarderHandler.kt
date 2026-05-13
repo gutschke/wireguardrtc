@@ -39,7 +39,7 @@ import java.util.concurrent.ConcurrentHashMap
  * **Idle timeout.** Each flow has an idle timer; if no traffic
  * passes through it for [idleTimeoutMs], the flow is closed
  * (both the netstack-side endpoint via [WgBridgeNative.nativeUdpFlowClose]
- * and the OS-side socket). Standard NAT box behaviour.
+ * and the OS-side socket). Standard NAT box behavior.
  */
 class UdpForwarderHandler(
     private val egressFactory: UdpEgressFactory =

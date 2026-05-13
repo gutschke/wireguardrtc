@@ -61,7 +61,7 @@ data class ProbeOutcome(
 )
 
 /** Single-attempt probe — abstracted so unit tests can fake it
- * (real-network ICMP behaviour varies wildly by OS / iface mix). */
+ * (real-network ICMP behavior varies wildly by OS / iface mix). */
 interface UdpProbe {
     /** Attempt one probe to `<ip>:<port>` with the given timeout.
      * Implementations MUST NOT throw; all errors fold into one of

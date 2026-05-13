@@ -41,7 +41,7 @@ import kotlinx.coroutines.launch
  * OutlinedTextField(...)
  * ```
  *
- * Tooltip behaviour: tap the "?" to open; tap outside or the
+ * Tooltip behavior: tap the "?" to open; tap outside or the
  * tooltip itself to dismiss. Works under TalkBack — the icon
  * button announces "Help" by default; the tooltip body is read
  * when shown.

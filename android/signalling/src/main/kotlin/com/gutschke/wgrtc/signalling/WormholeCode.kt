@@ -3,8 +3,8 @@ package com.gutschke.wgrtc.signalling
 import java.security.SecureRandom
 
 /**
- * Wormhole-code generator + normaliser for SAS-based
- * enrolment. The "code" is the SPAKE2 password — short enough for
+ * Wormhole-code generator + normalizer for SAS-based
+ * enrollment. The "code" is the SPAKE2 password — short enough for
  * a human to read aloud or type, long enough that a brute-force
  * attacker can't enumerate it within the broker's rate-limit
  * window before the user notices and aborts.
@@ -17,7 +17,7 @@ import java.security.SecureRandom
  * one-shot: an attacker has to guess correctly on the first try,
  * which the human SAS-confirmation catches if they don't.
  *
- * **Normalisation**: the user's typed input goes through [normalise]
+ * **Normalization**: the user's typed input goes through [normalize]
  * before any comparison or [toBytes]. Both sides MUST use the same
  * canonical form, otherwise SPAKE2 produces different keys (which
  * the SAS catches, but only after both sides go through the
@@ -54,22 +54,22 @@ object WormholeCode {
      * the digit zero get stripped — better than letting them slip
      * into the SPAKE2 password and yielding a guaranteed mismatch).
      */
-    fun normalise(raw: String): String =
+    fun normalize(raw: String): String =
         raw.uppercase()
             .filter { it in ALPHABET }
 
-    /** True iff [code] (normalised) is exactly [length] letters
+    /** True iff [code] (normalized) is exactly [length] letters
      * long. Use this to decide whether to enable a "Continue"
      * button. */
     fun isValid(code: String, length: Int = DEFAULT_LENGTH): Boolean {
-        val n = normalise(code)
+        val n = normalize(code)
         return n.length == length
     }
 
-    /** Convert a normalised code to the bytes SPAKE2 will hash.
-     * Caller's responsibility to pass [normalise]'d input — but
-     * this method normalises again as defence-in-depth so a UI
+    /** Convert a normalized code to the bytes SPAKE2 will hash.
+     * Caller's responsibility to pass [normalize]'d input — but
+     * this method normalizes again as defense-in-depth so a UI
      * bug can't silently produce a non-canonical byte string. */
     fun toBytes(code: String): ByteArray =
-        normalise(code).toByteArray(Charsets.UTF_8)
+        normalize(code).toByteArray(Charsets.UTF_8)
 }

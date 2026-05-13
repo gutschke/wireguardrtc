@@ -19,7 +19,7 @@ func TestNewJoinerBindFallbackReturnsAStdBind(t *testing.T) {
 	if b == nil {
 		t.Fatal("newJoinerBind returned nil")
 	}
-	// Behavioural assertion: ParseEndpoint must accept a literal
+	// Behavioral assertion: ParseEndpoint must accept a literal
 	// IPv4:port — same contract the production protect-aware bind
 	// promises.
 	ep, err := b.ParseEndpoint("203.0.113.5:51820")

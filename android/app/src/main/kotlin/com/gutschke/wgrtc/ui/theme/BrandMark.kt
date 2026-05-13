@@ -23,7 +23,7 @@ import kotlin.math.sin
  * itself, suggesting a connection that finds its way home through
  * the otherwise-closed ring. Drawn as a Compose [Canvas] so it
  * scales crisply at any size and respects the active theme's
- * primary colour without baking a tint into a raster asset.
+ * primary color without baking a tint into a raster asset.
  *
  * Originality: not a derivative of WireGuard's "shield" mark, of
  * Tailscale's "T" badge, or of any cloud-VPN logo I'm aware of.

@@ -3,7 +3,7 @@ package com.gutschke.wgrtc.ui.theme
 import androidx.compose.ui.graphics.Color
 
 /**
- * Brand colour palette for wireguardrtc.
+ * Brand color palette for wireguardrtc.
  *
  * Two-tone identity:
  *
@@ -18,7 +18,7 @@ import androidx.compose.ui.graphics.Color
  * the dark-mode variant maintains sufficient contrast on Pixel-class
  * OLED panels (verified against WCAG AA at 4.5:1 for body text).
  *
- * **Why not Material You / dynamic colour**: brand consistency. A
+ * **Why not Material You / dynamic color**: brand consistency. A
  * user's wallpaper-tinted UI varies wildly across devices, which
  * makes the "is this the same app I had on my old phone" recognition
  * test fail. We sacrifice the small Pixel-12+ Material-You bonus
@@ -64,7 +64,7 @@ val ErrorDark = Color(0xFFFFB4AB)
 val ErrorContainerDark = Color(0xFF93000A)
 val OnErrorContainerDark = Color(0xFFFFDAD6)
 
-// ─── Status colours (custom, used for tunnel state pills) ──────────
+// ─── Status colors (custom, used for tunnel state pills) ──────────
 val StatusUpLight = Color(0xFF136D54)
 val StatusUpContainerLight = Color(0xFFA0F2D1)
 val StatusUpDark = Color(0xFF85D6B4)

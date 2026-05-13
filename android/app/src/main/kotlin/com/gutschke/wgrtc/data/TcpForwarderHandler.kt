@@ -87,7 +87,7 @@ class TcpForwarderHandler(
         // `createSocket(host, port)` on the JDK default factory
         // connects synchronously with no timeout; use the unconnected
         // form + explicit `connect(target, CONNECT_TIMEOUT_MS)` so we
-        // honour our own deadline regardless of factory choice.
+        // honor our own deadline regardless of factory choice.
         val socket: Socket = try {
             withContext(ioDispatcher) {
                 val s = socketFactory.createSocket()

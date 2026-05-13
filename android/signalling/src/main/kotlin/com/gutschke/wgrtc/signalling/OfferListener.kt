@@ -34,7 +34,7 @@ import java.util.concurrent.TimeUnit
  * OFFERs from the daemon and emits each decoded [EndpointUpdate] on
  * [updates].
  *
- * Mirrors the daemon's `PeerJSClient` behaviour:
+ * Mirrors the daemon's `PeerJSClient` behavior:
  * - registers under our routing-id (`SHA256(myPubB64 ‖ salt)`)
  * - waits for the broker's `{"type":"OPEN"}` before treating the
  * session as live

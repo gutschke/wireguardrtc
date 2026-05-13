@@ -7,7 +7,7 @@ import org.junit.jupiter.api.Test
 import java.util.Base64
 
 /**
- * Behaviour of [WgQuickUapi]: parses joiner-side wg-quick text and
+ * Behavior of [WgQuickUapi]: parses joiner-side wg-quick text and
  * emits the UAPI string wireguard-go's IpcSet expects. Mirrors the
  * format wireguard-android's `Config.parse(...)` + `getStatistics`
  * dance produced — once drops that dependency, this is the
@@ -81,7 +81,7 @@ class WgQuickUapiTest {
         assertTrue(uapi.contains("allowed_ip=192.168.42.0/24"))
     }
 
-    @Test fun `ListenPort in Interface section is honoured`() {
+    @Test fun `ListenPort in Interface section is honored`() {
         // Joiner ListenPort is uncommon (joiners pick ephemeral) but
         // some users pin it; preserve the value.
         val cfg = """

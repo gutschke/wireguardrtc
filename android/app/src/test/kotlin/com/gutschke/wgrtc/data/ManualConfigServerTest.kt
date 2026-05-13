@@ -68,7 +68,7 @@ class ManualConfigServerTest {
     @Test fun `multiple fetches work within the TTL window`() {
         // The new contract: multi-fetch during TTL. Tests that an
         // initial fetch followed by a second one both succeed —
-        // a regression from the previous v1 single-shot behaviour
+        // a regression from the previous v1 single-shot behavior
         // would have the second request return 410.
         val srv = ManualConfigServer(sampleConfig, ttlMs = 60_000)
         srv.start()
