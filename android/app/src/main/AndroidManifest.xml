@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Network access; VPN consent is requested at runtime via
-         GoBackend.VpnService.prepare(context). -->
+         VpnService.prepare(context) on the host-mode / joiner services. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -54,9 +54,8 @@
             </intent-filter>
             <!-- URL handler: any QR scanner / browser / messaging app
                  that follows a `wgrtc-enroll://` URI dispatches it
-                 here.  The activity reads `intent.data` and feeds
-                 the URI through the same auto-enroll path that the
-                 `am start` extra-config invocation uses for testing. -->
+                 here.  The activity reads `intent.data` and runs
+                 the auto-enrollment flow. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -64,9 +63,6 @@
                 <data android:scheme="wgrtc-enroll" />
             </intent-filter>
         </activity>
-        <!-- com.wireguard.android.backend.GoBackend$VpnService is registered
-             by the tunnel AAR's AndroidManifest; the manifest merger pulls
-             it in automatically. -->
 
         <!-- Long-lived signalling listener — keeps the OFFER
              websocket alive so the daemon's roaming public IP
@@ -90,11 +86,10 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
-        <!-- C1 joiner-mode VpnService.  Owns the kernel TUN fd and
-             hands it to wgbridge in TUN-fd mode.  Replaces the path
-             that goes through wireguard-android's
-             GoBackend$VpnService once C1g flips the joiner-backend
-             default. -->
+        <!-- Joiner-mode VpnService.  Owns the kernel TUN fd and
+             hands it to wgbridge_native in TUN-fd mode.  The only
+             joiner runtime — the wireguard-android tunnel AAR and
+             its GoBackend$VpnService were removed in C1h. -->
         <service
             android:name=".service.JoinerVpnService"
             android:exported="false"
