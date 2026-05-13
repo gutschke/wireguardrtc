@@ -41,6 +41,7 @@ class AgentBroadcastReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             ACTION_ADD_TUNNEL -> handleAddTunnel(context, intent)
+            ACTION_LIST_TUNNELS -> handleListTunnels(context)
             else -> {
                 Log.w(TAG, "unknown action: ${intent.action}")
                 resultCode = RESULT_BAD_REQUEST
@@ -48,6 +49,27 @@ class AgentBroadcastReceiver : BroadcastReceiver() {
             }
         }
     }
+
+    private fun handleListTunnels(context: Context) {
+        val rows = TunnelStore(context.applicationContext).load().map { t ->
+            // Compact JSON object per tunnel. Drops configText so the
+            // result fits comfortably in a broadcast resultData even
+            // with many tunnels; private keys never appear on adb.
+            buildString {
+                append('{')
+                append("\"id\":\"").append(t.id).append("\",")
+                append("\"name\":\"").append(t.name.escape()).append("\",")
+                append("\"source\":\"").append(t.source.name).append("\"")
+                append('}')
+            }
+        }
+        resultCode = RESULT_OK
+        resultData = rows.joinToString(prefix = "[", postfix = "]", separator = ",")
+        Log.i(TAG, "LIST_TUNNELS returned ${rows.size} tunnels")
+    }
+
+    private fun String.escape(): String =
+        replace("\\", "\\\\").replace("\"", "\\\"")
 
     private fun handleAddTunnel(context: Context, intent: Intent) {
         // Two ways to pass the wg-quick text: literal (single-line
@@ -110,6 +132,7 @@ class AgentBroadcastReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION_ADD_TUNNEL = "com.gutschke.wgrtc.agent.ADD_TUNNEL"
+        const val ACTION_LIST_TUNNELS = "com.gutschke.wgrtc.agent.LIST_TUNNELS"
 
         const val EXTRA_NAME = "name"
         const val EXTRA_CONFIG = "config"

@@ -17,6 +17,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.gutschke.wgrtc.agent.ADD_TUNNEL" />
+                <action android:name="com.gutschke.wgrtc.agent.LIST_TUNNELS" />
             </intent-filter>
         </receiver>
     </application>
