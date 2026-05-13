@@ -2,14 +2,14 @@ package com.gutschke.wgrtc.signalling
 
 /**
  * Short Authentication String (SAS) derivation for the
- * wormhole-code enrolment.
+ * wormhole-code enrollment.
  *
  * After [Spake2.finish] both sides hold a 32-byte shared key —
  * matching iff the password matched. We hash that key with a
  * domain-separator and slice it into N bytes; each byte indexes a
  * word from [PLACEHOLDER_SAS_WORDLIST]. The result is shown to the
  * user on both devices; manual visual confirmation that the two
- * SAS phrases match is the *only* line of defence against a relay-
+ * SAS phrases match is the *only* line of defense against a relay-
  * MITM that completed PAKE on each side independently.
  *
  * **Wordlist note**: this is a PLACEHOLDER 256-word list (8 bits per

@@ -13,10 +13,10 @@ package com.gutschke.wgrtc.data
  *
  * Allocation policy: linear scan from the lowest usable host address
  * upward; first hole wins. This makes the IP a peer gets stable on
- * re-enrolment as long as no peer in front of it has been removed —
+ * re-enrollment as long as no peer in front of it has been removed —
  * good enough for casual sharing scenarios; if we ever need true
  * stability across removals, that's the caller's responsibility (key
- * the in-use map by peer pubkey, reuse the previous IP on re-enrol).
+ * the in-use map by peer pubkey, reuse the previous IP on re-enroll).
  */
 object HostSubnetAllocator {
 

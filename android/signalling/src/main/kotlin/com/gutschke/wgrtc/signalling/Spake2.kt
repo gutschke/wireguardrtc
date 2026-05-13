@@ -3,7 +3,7 @@ package com.gutschke.wgrtc.signalling
 /**
  * SPAKE2 (RFC 9382) over Ristretto255, pure Kotlin.
  *
- * wormhole-code enrolment uses this PAKE: both sides know a
+ * wormhole-code enrollment uses this PAKE: both sides know a
  * low-entropy code (e.g. 6 letters); the protocol upgrades that into
  * a 256-bit shared key without leaking the code on the wire. An
  * attacker who relays one half but not the other can complete the

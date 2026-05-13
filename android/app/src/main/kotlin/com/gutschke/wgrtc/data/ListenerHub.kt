@@ -5,6 +5,7 @@ import android.util.Log
 import com.gutschke.wgrtc.signalling.EndpointCandidate
 import com.gutschke.wgrtc.signalling.EndpointUpdate
 import com.gutschke.wgrtc.signalling.EnrollUri
+import com.gutschke.wgrtc.signalling.formatEndpoint
 import com.gutschke.wgrtc.signalling.JavaIfaceAddrProvider
 import com.gutschke.wgrtc.signalling.NatType
 import com.gutschke.wgrtc.signalling.OfferListener
@@ -344,7 +345,7 @@ class ListenerHub internal constructor(
                     wireCandidates.add(
                         EndpointCandidate(ip = ip, port = listenPort, kind = "stun"))
                 }
-                natHint.externalIp?.let { "$it:$listenPort" }
+                natHint.externalIp?.let { formatEndpoint(it, listenPort) }
             }
             else -> null // symmetric / unknown / null (still classifying)
         }
@@ -526,7 +527,7 @@ class ListenerHub internal constructor(
             Log.w(TAG, "mintHostEnrollToken: mint failed", t)
             return null
         }
-        return EnrollUri.build(
+        val uri = EnrollUri.build(
             serverPub = pubBytes,
             salt = crypto.saltBytes,
             brokerWss = crypto.brokerWss,
@@ -539,6 +540,15 @@ class ListenerHub internal constructor(
             expiresAt = minted.expiresAtMs / 1000,
             serverName = tunnel.name,
         )
+        // Debug-only URI dump so agentic test rigs can grab the
+        // enrollment string straight from logcat instead of OCRing the
+        // QR. BuildConfig.DEBUG is true only for the .debug variant —
+        // the Play-signed release build elides this entire branch.
+        if (com.gutschke.wgrtc.BuildConfig.DEBUG) {
+            Log.i(TAG, "mintHostEnrollToken: minted URI for tunnel " +
+                "$tunnelId (expires in ${ttlMs}ms): $uri")
+        }
+        return uri
     }
 
     /** Per-host-mode-tunnel pending-tokens store path. Lives in the
@@ -622,7 +632,7 @@ class ListenerHub internal constructor(
      * listener and the race never lose each other's writes. */
     private suspend fun applyEndpointUpdate(tunnelId: String, ip: String, port: Int) =
         storeMutex.withLock {
-            val newEndpoint = "$ip:$port"
+            val newEndpoint = formatEndpoint(ip, port)
             val tunnels = store.load()
             val current = tunnels.firstOrNull { it.id == tunnelId }
                 ?: return@withLock
@@ -665,7 +675,7 @@ class ListenerHub internal constructor(
 
     /**
      * Persist the joiner produced by a wormhole-host session as a
-     * new peer of [result.tunnelId]. Mirrors the enrolment-via-QR
+     * new peer of [result.tunnelId]. Mirrors the enrollment-via-QR
      * flow ([applyEnrollmentToTunnel]) so the post-add reconfigure
      * (DOWN+UP cycle) runs identically.
      *
@@ -790,7 +800,7 @@ interface HostModeReconfigurer {
  * sends ENROLL_OK, the wg-go peer table already accepts the
  * client's first handshake. If the reconfig step throws, the
  * persistence stays — the operator can recover (manual toggle), and
- * the (rare) race-loss client will re-enrol.
+ * the (rare) race-loss client will re-enroll.
  *
  * Hidden contract: callers must have already verified peer
  * uniqueness via [HostSubnetAllocator.nextFreeIp]; passing a

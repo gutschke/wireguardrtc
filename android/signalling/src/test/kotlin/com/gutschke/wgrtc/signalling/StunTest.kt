@@ -104,10 +104,36 @@ class StunTest {
         assertNull(parseStunBindingResponse(resp, txid))
     }
 
-    @Test fun `ipv6 family is currently rejected (we ship v4 only)`() {
+    @Test fun `parses a hand-crafted ipv6 XOR-MAPPED-ADDRESS response`() {
+        // The case wgrtc was failing on: ChromeOS ARC resolves
+        // stun.l.google.com's AAAA first, so the response carries
+        // family=0x02 with a 16-byte XOR'd v6 mapped-address.
+        // RFC 5389 §15.2: bytes 0..3 XOR magic cookie; bytes 4..15
+        // XOR the 12-byte transaction id.
         val txid = ByteArray(12) { 0x42.toByte() }
-        val attrPayload = ByteArray(20) // family=0x02 (IPv6) at byte 1, no rest matters
-        attrPayload[1] = 0x02
+        val srcPort = 51820
+        val xport = srcPort xor (0x2112A442.ushr(16))
+        // The address we want the parser to recover: 2001:db8::1
+        val plainAddr = byteArrayOf(
+            0x20, 0x01, 0x0d.toByte(), 0xb8.toByte(),
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0x01,
+        )
+        val mask = ByteArray(16).also {
+            // magic cookie BE
+            it[0] = 0x21; it[1] = 0x12; it[2] = 0xa4.toByte(); it[3] = 0x42
+            // txid (all 0x42 by construction)
+            for (i in 4 until 16) it[i] = 0x42
+        }
+        val xoredAddr = ByteArray(16) { i -> (plainAddr[i].toInt() xor mask[i].toInt()).toByte() }
+
+        val attrPayload = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
+            .put(0)            // reserved
+            .put(0x02)         // family = IPv6
+            .putShort(xport.toShort())
+            .put(xoredAddr)
+            .array()
         val attr = ByteBuffer.allocate(4 + attrPayload.size).order(ByteOrder.BIG_ENDIAN)
             .putShort(0x0020)
             .putShort(attrPayload.size.toShort())
@@ -120,7 +146,48 @@ class StunTest {
             .put(txid)
             .put(attr)
             .array()
-        assertNull(parseStunBindingResponse(resp, txid))
+        val parsed = parseStunBindingResponse(resp, txid)
+        assertNotNull(parsed)
+        assertEquals(51820, parsed!!.externalPort)
+        // Compare via InetAddress so we don't have to commit to a
+        // specific textual form (Java's compression has varied
+        // between JDK versions).
+        assertEquals(
+            InetAddress.getByName("2001:db8::1"),
+            InetAddress.getByName(parsed.externalIp),
+        )
+    }
+
+    @Test fun `parses ipv6 ULA XOR-MAPPED-ADDRESS`() {
+        // Same test shape as above but for ULA (fd00::/8) — the
+        // Chromebook's eth5 carries an fd-prefixed ULA alongside the
+        // global v6, and we want STUN to return either if that's
+        // what the server sees.
+        val txid = ByteArray(12) { (it + 1).toByte() }
+        val plain = InetAddress.getByName(
+            "fd00:a771:c05:0:9854:9eff:fe81:b49b").address
+        val mask = ByteArray(16).also {
+            it[0] = 0x21; it[1] = 0x12; it[2] = 0xa4.toByte(); it[3] = 0x42
+            System.arraycopy(txid, 0, it, 4, 12)
+        }
+        val xored = ByteArray(16) { i -> (plain[i].toInt() xor mask[i].toInt()).toByte() }
+        val srcPort = 22111
+        val xport = srcPort xor (0x2112A442.ushr(16))
+
+        val attrPayload = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
+            .put(0).put(0x02).putShort(xport.toShort()).put(xored).array()
+        val attr = ByteBuffer.allocate(4 + 20).order(ByteOrder.BIG_ENDIAN)
+            .putShort(0x0020).putShort(20.toShort()).put(attrPayload).array()
+        val resp = ByteBuffer.allocate(20 + attr.size).order(ByteOrder.BIG_ENDIAN)
+            .putShort(0x0101).putShort(attr.size.toShort())
+            .putInt(0x2112A442.toInt()).put(txid).put(attr).array()
+        val parsed = parseStunBindingResponse(resp, txid)
+        assertNotNull(parsed)
+        assertEquals(srcPort, parsed!!.externalPort)
+        assertEquals(
+            InetAddress.getByName("fd00:a771:c05:0:9854:9eff:fe81:b49b"),
+            InetAddress.getByName(parsed.externalIp),
+        )
     }
 
     // ─── Integration — talk to a tiny in-process responder ───────────────

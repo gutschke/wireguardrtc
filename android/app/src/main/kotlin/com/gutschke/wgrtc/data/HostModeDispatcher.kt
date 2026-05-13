@@ -14,7 +14,7 @@ import kotlinx.serialization.json.JsonElement
  * enrolled peer (if any) and sends the response envelope back over
  * the same WSS.
  *
- * Sequencing on a successful enrolment is **persist-then-send**:
+ * Sequencing on a successful enrollment is **persist-then-send**:
  *
  * 1. [applyEnrollment] writes the new peer to tunnels.json AND
  * reconfigures wg-go (DOWN+UP) so by the time the client
@@ -30,7 +30,7 @@ import kotlinx.serialization.json.JsonElement
  *
  * On `Ignore` (mismatched src, no matching token, stale ts, etc.)
  * we drop silently — the threat model in the internal design doc wants no
- * step-distinguishing observable behaviour.
+ * step-distinguishing observable behavior.
  *
  * On authenticated `enroll_err` (TOKEN_USED, PROVISION_FAILED) we
  * send the response without persisting any peer.

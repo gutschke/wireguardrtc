@@ -225,7 +225,7 @@ private object Acknowledgements {
             "OkHttp",
             "Apache 2.0",
             "HTTP / WebSocket client. Used for the long-lived broker " +
-                "session and one-shot enrolment requests.",
+                "session and one-shot enrollment requests.",
         ),
         AcknowledgementEntry(
             "kotlinx.coroutines + kotlinx.serialization",

@@ -1,6 +1,6 @@
 package com.gutschke.wgrtc.data
 
-import com.gutschke.wgrtc.signalling.HostEnrolInfo
+import com.gutschke.wgrtc.signalling.HostEnrollInfo
 import com.gutschke.wgrtc.signalling.OfferListenerWormholeTransport
 import com.gutschke.wgrtc.signalling.SasConfirmRole
 import com.gutschke.wgrtc.signalling.SasInbound
@@ -45,7 +45,7 @@ class WormholeHostController(
      * via [WormholeCode.generate]. */
     code: String = WormholeCode.generate(),
     /** Snapshot of the host tunnel the joiner is being enrolled into.
-     * When present, the controller sends a [HostEnrolInfo] payload
+     * When present, the controller sends a [HostEnrollInfo] payload
      * in its SAS_CONFIRM and exposes a [HostWormholeResult] on
      * Succeeded. When null, the legacy mac-only flow runs (kept
      * so the dev preview / era code paths still work). */
@@ -101,13 +101,13 @@ class WormholeHostController(
         val key = sharedKey ?: return failNow("internal: no shared key")
         _state.value = WormholeHostUiState.AwaitingPeerConfirm(s.code)
         val mac = buildSasConfirmMac(SasConfirmRole.RESPONDER, key)
-        // If we have a tunnel snapshot, send our HostEnrolInfo
+        // If we have a tunnel snapshot, send our HostEnrollInfo
         // alongside the mac. Without it we fall back to the legacy
         // mac-only confirm — joiner will fail to construct a tunnel
-        // and surface "peer didn't send enrolment info" — the
+        // and surface "peer didn't send enrollment info" — the
         // failure shape is intentional, not silent.
         val sendOk = if (tunnelSnapshot != null) {
-            val info = HostEnrolInfo(
+            val info = HostEnrollInfo(
                 timestamp = System.currentTimeMillis() / 1000,
                 wgPubkeyB64 = tunnelSnapshot.pubKeyB64,
                 wgEndpoint = tunnelSnapshot.wgEndpoint,
@@ -194,7 +194,7 @@ class WormholeHostController(
         if (!macOk) {
             return failNow("peer MAC verification failed — possible MITM")
         }
-        // If a tunnel snapshot AND the joiner sent enrolment info,
+        // If a tunnel snapshot AND the joiner sent enrollment info,
         // produce a [HostWormholeResult] for the UI to persist.
         // Both missing → legacy mac-only flow (Succeeded with no
         // result). Snapshot present but info missing IS a hard
@@ -202,7 +202,7 @@ class WormholeHostController(
         // it without crediting the joiner.
         if (tunnelSnapshot != null) {
             if (peerInfoBlob == null) {
-                return failNow("joiner didn't send enrolment info")
+                return failNow("joiner didn't send enrollment info")
             }
             val joinerInfo = decodeJoinerInfo(peerInfoBlob, key)
                 ?: return failNow("joiner info decode failed — wrong key or stale ts")

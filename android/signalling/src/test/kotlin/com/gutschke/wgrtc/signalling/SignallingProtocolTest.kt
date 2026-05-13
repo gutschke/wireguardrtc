@@ -49,7 +49,7 @@ class SignallingProtocolTest {
         assertEquals("abc", r)
     }
 
-    @Test fun `extractSignallingOffer rejects enrolment OFFERs`() {
+    @Test fun `extractSignallingOffer rejects enrollment OFFERs`() {
         // The daemon discriminates kinds; we mirror that.
         assertNull(extractSignallingOffer(envelope(kind = "enroll")))
         assertNull(extractSignallingOffer(envelope(kind = "enroll_ok")))
@@ -221,7 +221,7 @@ class SignallingProtocolTest {
     }
 
     @Test fun `legacy ip+port-only payload rejected (post-cutover wire format)`() {
-        // Per the user's directive 2026-05-07, we DO NOT honour the v0
+        // Per the user's directive 2026-05-07, we DO NOT honor the v0
         // single-endpoint form — every plaintext now carries
         // candidates. This test pins the cutover.
         val now = 1_700_000_000L
@@ -286,8 +286,8 @@ class SignallingProtocolTest {
         assertEquals("203.0.113.5", r?.ip)
     }
 
-    @Test fun `deadlock guard with empty allowedIps preserves default behaviour`() {
-        // When the caller has nothing to reject against, behaviour is
+    @Test fun `deadlock guard with empty allowedIps preserves default behavior`() {
+        // When the caller has nothing to reject against, behavior is
         // identical to the no-arg form — no candidate is dropped on
         // these grounds.
         val now = 1_700_000_000L

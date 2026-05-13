@@ -12,7 +12,7 @@ import org.junit.jupiter.api.TestInstance
 import java.util.Base64
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class SasEnrolInfoTest {
+class SasEnrollInfoTest {
 
     @BeforeAll fun installJvmSodium() {
         Sodium.setForTest(LazySodiumJava(SodiumJava()))
@@ -27,7 +27,7 @@ class SasEnrolInfoTest {
     // ─── Joiner round-trip ────────────────────────────────────────
 
     @Test fun `joiner info round-trips through encode then decode`() {
-        val info = JoinerEnrolInfo(
+        val info = JoinerEnrollInfo(
             timestamp = now,
             wgPubkeyB64 = pubkeyB64,
             deviceName = "Android phone",
@@ -38,28 +38,28 @@ class SasEnrolInfoTest {
     }
 
     @Test fun `joiner info with no device name still round-trips`() {
-        val info = JoinerEnrolInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
+        val info = JoinerEnrollInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
         val dec = decodeJoinerInfo(encodeJoinerInfo(info, key), key, now)!!
         assertEquals(info, dec)
         assertNull(dec.deviceName)
     }
 
     @Test fun `joiner info decode rejects wrong key`() {
-        val info = JoinerEnrolInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
+        val info = JoinerEnrollInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
         val enc = encodeJoinerInfo(info, key)
         val wrongKey = ByteArray(32) { 9 }
         assertNull(decodeJoinerInfo(enc, wrongKey, now))
     }
 
     @Test fun `joiner info decode rejects stale timestamp`() {
-        val info = JoinerEnrolInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
+        val info = JoinerEnrollInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
         val enc = encodeJoinerInfo(info, key)
         // Freshness window default is 90 s; 200 s out-of-window.
         assertNull(decodeJoinerInfo(enc, key, nowEpochSeconds = now + 200))
     }
 
     @Test fun `joiner info decode rejects malformed pubkey`() {
-        val info = JoinerEnrolInfo(timestamp = now, wgPubkeyB64 = "not!base64!")
+        val info = JoinerEnrollInfo(timestamp = now, wgPubkeyB64 = "not!base64!")
         val enc = encodeJoinerInfo(info, key)
         assertNull(decodeJoinerInfo(enc, key, now))
     }
@@ -70,7 +70,7 @@ class SasEnrolInfoTest {
     }
 
     @Test fun `joiner info encode rejects too-short shared key`() {
-        val info = JoinerEnrolInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
+        val info = JoinerEnrollInfo(timestamp = now, wgPubkeyB64 = pubkeyB64)
         assertThrows(IllegalArgumentException::class.java) {
             encodeJoinerInfo(info, ByteArray(16))
         }
@@ -79,7 +79,7 @@ class SasEnrolInfoTest {
     // ─── Host round-trip ─────────────────────────────────────────
 
     @Test fun `host info round-trips with all fields`() {
-        val info = HostEnrolInfo(
+        val info = HostEnrollInfo(
             timestamp = now,
             wgPubkeyB64 = pubkeyB64,
             wgEndpoint = "203.0.113.5:51820",
@@ -98,7 +98,7 @@ class SasEnrolInfoTest {
     }
 
     @Test fun `host info round-trips with minimal fields`() {
-        val info = HostEnrolInfo(
+        val info = HostEnrollInfo(
             timestamp = now,
             wgPubkeyB64 = pubkeyB64,
             wgEndpoint = "1.2.3.4:51820",
@@ -112,7 +112,7 @@ class SasEnrolInfoTest {
     }
 
     @Test fun `host info decode rejects wrong key`() {
-        val info = HostEnrolInfo(
+        val info = HostEnrollInfo(
             timestamp = now,
             wgPubkeyB64 = pubkeyB64,
             wgEndpoint = "1.2.3.4:51820",
@@ -124,7 +124,7 @@ class SasEnrolInfoTest {
     }
 
     @Test fun `host info decode rejects stale timestamp`() {
-        val info = HostEnrolInfo(
+        val info = HostEnrollInfo(
             timestamp = now,
             wgPubkeyB64 = pubkeyB64,
             wgEndpoint = "1.2.3.4:51820",

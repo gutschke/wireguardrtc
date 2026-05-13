@@ -194,7 +194,7 @@ class WormholeControllerTest {
         }
     }
 
-    @Test fun ` happy path - both sides exchange enrolment info and persist results`() = runBlocking<Unit> {
+    @Test fun ` happy path - both sides exchange enrollment info and persist results`() = runBlocking<Unit> {
         val broker = InMemoryBroker()
         val code = "ABCDEF"
         val snapshot = HostTunnelSnapshot(

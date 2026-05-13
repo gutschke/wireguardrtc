@@ -134,7 +134,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
 
  fun dismissTokenUsedAlert() { _tokenUsedAlert.value = null }
 
- /** A snapshot of the rejected enrolment for the prominent banner.
+ /** A snapshot of the rejected enrollment for the prominent banner.
  * [serverNote] is the daemon-supplied note (often the human-
  * readable reason ENROLL_ERR carried). */
  data class TokenUsedAlert(val serverNote: String?)
@@ -243,6 +243,24 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // The async-launch pattern here previously raced with the
  // intent-driven rename hook used by the E2E test.
  _tunnels.value = hub.loadTunnels()
+ // HostModeBackend is an Application-scoped singleton kept
+ // alive by the OFFER-listener foreground service; it can
+ // outlive the Activity (and therefore this ViewModel). If
+ // the user leaves and re-enters the app while a host tunnel
+ // is up, the previous ViewModel is gone but the runner is
+ // still serving traffic — reconcile so the UI reflects the
+ // real state instead of showing the tunnel as Idle (which
+ // then prompts the user to tap Connect and earns them an
+ // "another tunnel is already running" error from
+ // HostModeBackend.start). Mirrors the host-mode connect
+ // branch at the top of `connect()`. Joiner-side recovery is
+ // a separate problem — the bound JoinerVpnService is per-
+ // Context, so a new Activity always starts unbound.
+ WgrtcApp.instance.hostModeBackend.activeTunnelId?.let { liveId ->
+  _activeTunnelId.value = liveId
+  _liveState.value = "UP"
+  startThroughputSampler()
+ }
  // Subscribe to the hub's endpoint-applied events so the
  // viewmodel's _tunnels stays in sync with the disk state
  // when listeners (which run in the hub's scope) rewrite
@@ -435,7 +453,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * OFFER listener. Same persist-then-start contract as
  * [addEnrollTunnel] — the broker coordinates carried in [t] let
  * the listener subscribe under the host's routing-id so the
- * joiner picks up endpoint roams without having to re-enrol.
+ * joiner picks up endpoint roams without having to re-enroll.
  */
  fun addWormholeJoinedTunnel(t: Tunnel): Tunnel {
  persistAndStart(t)
@@ -446,7 +464,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * Add the joiner returned by a wormhole host session
  * ([WormholeHostController.wormholeResult]) as an enrolled peer
  * of an existing host-mode tunnel. Goes through the same
- * persist-then-reconfig path the QR-enrolment flow uses, so the
+ * persist-then-reconfig path the QR-enrollment flow uses, so the
  * host's wg-go starts accepting the new peer's handshake the
  * moment this returns.
  */
@@ -455,7 +473,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * tearing the tunnel down for the other peers. Triggers a
  * single DOWN+UP cycle on the host's wg-go (~125 ms blip);
  * other peers reconnect automatically via WG's normal
- * handshake-retry behaviour.
+ * handshake-retry behavior.
  */
  fun revokeEnrolledPeer(tunnelId: String, pubkeyB64: String) {
  viewModelScope.launch {

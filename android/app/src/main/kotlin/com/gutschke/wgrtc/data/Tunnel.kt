@@ -18,7 +18,7 @@ import java.util.UUID
  * For host-mode tunnels [hostMode] is non-null and carries
  * the host's subnet plus the canonical list of enrolled peers (each
  * with its assigned /32, the name hint from the token mint, and the
- * timestamp of enrolment). In that case [configText] is just the
+ * timestamp of enrollment). In that case [configText] is just the
  * `[Interface]` block — the per-peer `[Peer]` blocks are *rendered*
  * from [HostModeConfig.enrolledPeers] at the moment we hand the
  * config to wg-go (see [renderWgConfig]). This split keeps the
@@ -95,7 +95,7 @@ data class EnrolledPeer(
     /** Free-form label the user supplied at token-mint time;
      * surfaces in the host UI's "active peers" list. */
     val nameHint: String,
-    /** Epoch ms; ordering preserves enrolment order. */
+    /** Epoch ms; ordering preserves enrollment order. */
     val enrolledAtMs: Long,
     /**
      * Optional snapshot of the wg-quick text the host minted for
@@ -116,7 +116,7 @@ data class EnrolledPeer(
      * [Context.filesDir] which is per-app-uid private; the
      * field is dropped immediately when the peer is revoked.
      *
-     * Wormhole / QR-token enrolments DON'T store this — the
+     * Wormhole / QR-token enrollments DON'T store this — the
      * joiner generates its own keypair locally, the host only
      * ever sees the joiner's pubkey. Only the Manual flow
      * (where the host mints both halves) populates this field.

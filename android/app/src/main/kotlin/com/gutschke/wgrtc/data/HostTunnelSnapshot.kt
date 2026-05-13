@@ -3,7 +3,7 @@ package com.gutschke.wgrtc.data
 /**
  * Read-only view of a HOST_MODE tunnel snapshotted at the moment a
  * wormhole-code session is initiated. Contains everything the
- * [WormholeHostController] needs to assemble a [com.gutschke.wgrtc.signalling.HostEnrolInfo]
+ * [WormholeHostController] needs to assemble a [com.gutschke.wgrtc.signalling.HostEnrollInfo]
  * payload — without the controller having to depend on
  * [TunnelStore], [HostSubnetAllocator], or anything else from the
  * persistence layer. That keeps the controller pure-protocol and
@@ -43,7 +43,7 @@ data class HostTunnelSnapshot(
      * `10.99.0.2/32`). See class kdoc. */
     val assignedAddress: String,
     /** Per-tunnel broker the joiner should subscribe to after
-     * enrolment for OFFER traffic. Default broker (from
+     * enrollment for OFFER traffic. Default broker (from
      * [SettingsStore]) is fine; per-tunnel override goes here. */
     val brokerWss: String,
     val brokerKey: String,
@@ -63,7 +63,7 @@ data class HostTunnelSnapshot(
  * existing [applyEnrollmentToTunnel] path.
  */
 data class HostWormholeResult(
-    /** The host tunnel this enrolment belongs to. */
+    /** The host tunnel this enrollment belongs to. */
     val tunnelId: String,
     /** Joiner's WG public key. Goes into the new `[Peer] PublicKey`. */
     val joinerPubkeyB64: String,
@@ -77,7 +77,7 @@ data class HostWormholeResult(
     /** Manual-flow only: the wg-quick text the host minted for this
      * joiner. Persisted on the resulting [EnrolledPeer] so the
      * host UI's "Show invitation" action survives a restart.
-     * Null for QR / wormhole enrolments where the host never sees
+     * Null for QR / wormhole enrollments where the host never sees
      * the joiner's privkey. */
     val manualInvitationText: String? = null,
 )

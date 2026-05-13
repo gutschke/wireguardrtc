@@ -1,5 +1,6 @@
 package com.gutschke.wgrtc.data
 
+import com.gutschke.wgrtc.signalling.EndpointCandidate
 import com.gutschke.wgrtc.signalling.EnrollOkPlain
 import com.gutschke.wgrtc.signalling.EnrollResult
 import com.gutschke.wgrtc.signalling.EnrollUri
@@ -63,16 +64,56 @@ class EnrollConfigRendererTest {
         assertTrue(pubB64.endsWith("="), "expected padding; got '$pubB64'")
     }
 
-    @Test fun `missing server_endpoint_hint throws with actionable message`() {
+    @Test fun `missing server_endpoint_hint AND no candidates throws with actionable message`() {
         val ex = assertThrows<IllegalStateException> {
-            renderEnrollConfig(sampleUri, ok(basePlain.copy(serverEndpointHint = null)))
+            renderEnrollConfig(sampleUri, ok(basePlain.copy(
+                serverEndpointHint = null, candidates = null)))
         }
         // The message is what the user sees in the app's error banner —
-        // it must name the daemon-side fix (PublicIp/STUN), not just
+        // it must name the host-side fix (PublicIp/STUN), not just
         // shrug.
         assertTrue(ex.message?.contains("PublicIp") == true ||
                    ex.message?.contains("STUN") == true,
-            "message should mention the daemon-side fix; got: ${ex.message}")
+            "message should mention the host-side fix; got: ${ex.message}")
+    }
+
+    @Test fun `falls back to first candidate when server_endpoint_hint is null`() {
+        // Phone-host on a symmetric / unknown-NAT (typical Chromebook
+        // host on a captive network) omits server_endpoint_hint but
+        // still advertises LAN candidates. The renderer must build a
+        // working wg-quick from the first candidate; the listener-driven
+        // OFFER mechanism takes over once the tunnel is live and rewrites
+        // the persisted Endpoint as fresh candidates arrive.
+        val cfg = renderEnrollConfig(sampleUri, ok(basePlain.copy(
+            serverEndpointHint = null,
+            candidates = listOf(
+                EndpointCandidate(ip = "10.99.0.1", port = 51820, kind = "lan"),
+                EndpointCandidate(ip = "192.168.1.50", port = 51820, kind = "lan"),
+            ),
+        )))
+        assertTrue(cfg.contains("Endpoint = 10.99.0.1:51820"),
+            "expected first candidate as Endpoint; got:\n$cfg")
+    }
+
+    @Test fun `prefers server_endpoint_hint over candidates when both present`() {
+        val cfg = renderEnrollConfig(sampleUri, ok(basePlain.copy(
+            serverEndpointHint = "203.0.113.5:51820",
+            candidates = listOf(
+                EndpointCandidate(ip = "10.99.0.1", port = 51820, kind = "lan"),
+            ),
+        )))
+        assertTrue(cfg.contains("Endpoint = 203.0.113.5:51820"))
+        assertFalse(cfg.contains("10.99.0.1"))
+    }
+
+    @Test fun `falls back through empty candidate list`() {
+        // An explicit empty list is treated the same as null — throw.
+        val ex = assertThrows<IllegalStateException> {
+            renderEnrollConfig(sampleUri, ok(basePlain.copy(
+                serverEndpointHint = null, candidates = emptyList())))
+        }
+        assertTrue(ex.message?.contains("PublicIp") == true ||
+                   ex.message?.contains("STUN") == true)
     }
 
     @Test fun `daemon-supplied dns and mtu pass through`() {

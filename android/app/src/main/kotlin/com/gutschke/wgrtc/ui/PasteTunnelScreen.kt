@@ -135,8 +135,8 @@ fun PasteTunnelScreen(
                         title = "What's a device label?",
                         body = "A short name the host sees in their peer " +
                             "list — usually your phone model. Helps " +
-                            "the host recognise who's joining. Only " +
-                            "used during enrolment.",
+                            "the host recognize who's joining. Only " +
+                            "used during enrollment.",
                     )
                 },
                 modifier = Modifier.fillMaxWidth(),

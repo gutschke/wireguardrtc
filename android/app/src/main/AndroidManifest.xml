@@ -55,7 +55,7 @@
             <!-- URL handler: any QR scanner / browser / messaging app
                  that follows a `wgrtc-enroll://` URI dispatches it
                  here.  The activity reads `intent.data` and feeds
-                 the URI through the same auto-enrol path that the
+                 the URI through the same auto-enroll path that the
                  `am start` extra-config invocation uses for testing. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />

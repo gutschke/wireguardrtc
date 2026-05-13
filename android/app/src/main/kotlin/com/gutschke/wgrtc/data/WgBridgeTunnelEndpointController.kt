@@ -2,6 +2,7 @@ package com.gutschke.wgrtc.data
 
 import android.util.Log
 import com.gutschke.wgrtc.signalling.EndpointUpdate
+import com.gutschke.wgrtc.signalling.formatEndpoint
 import com.gutschke.wgrtc.signalling.TunnelEndpointController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -65,7 +66,7 @@ class WgBridgeTunnelEndpointController(
         val tunnels = hub.loadTunnels()
         val tunnel = tunnels.firstOrNull { it.id == tunnelId }
             ?: error("setEndpoint: no tunnel with id $tunnelId")
-        val newEndpoint = "${candidate.ip}:${candidate.port}"
+        val newEndpoint = formatEndpoint(candidate.ip, candidate.port)
         val newConfigText = replaceEndpointLine(tunnel.configText, newEndpoint)
         // In-place reconfigure. wireguard-go's IpcSet replaces the
         // peer's endpoint without disturbing the active session

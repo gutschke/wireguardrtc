@@ -1,7 +1,7 @@
 #!/bin/bash
 # 22_auto_active_dropin.sh — verify the daemon auto-writes a Mode=active
 # peers.d-style drop-in to <StateDir>/auto-enrolled.d/ on each
-# successful enrolment (Phase-2 enabler — see wg-holepunch-guide.md
+# successful enrollment (Phase-2 enabler — see wg-holepunch-guide.md
 # §"Auto-active drop-ins for enrolled peers").
 #
 # What we assert:
@@ -52,7 +52,7 @@ fabric_exec_capture client "
     '$PY' '$CLIENT' --json '$URI' --timeout 30 2>&1
 " >/dev/null
 
-# Give the daemon a moment to write the drop-in (enrolment is async).
+# Give the daemon a moment to write the drop-in (enrollment is async).
 sleep 1
 
 AA_DIR="$FABRIC_TMP/state/auto-enrolled.d"
@@ -65,9 +65,9 @@ expect "filename-mentions-label" "echo '$DROPIN' | grep -q 'testclient22'"
 expect "contains-mode-active" "grep -q 'Mode = active' '$DROPIN'"
 expect "contains-pubkey" "grep -q '^PublicKey = ' '$DROPIN'"
 
-# Second enrolment of the same name uses a fresh client keypair
-# (each enrol is a distinct WG identity) — so we get a SECOND
-# drop-in, not an overwrite.  Assert exactly that: each enrol
+# Second enrollment of the same name uses a fresh client keypair
+# (each enroll is a distinct WG identity) — so we get a SECOND
+# drop-in, not an overwrite.  Assert exactly that: each enroll
 # produces its own auto-active entry, both with Mode=active.
 URI2=$(_mint testclient22 "--expires 600")
 [[ -n "$URI2" ]] || { echo "[22] FAIL — second mint failed"; exit 1; }
@@ -76,7 +76,7 @@ fabric_exec_capture client "
 " >/dev/null
 sleep 1
 NUM_FILES_2=$(ls "$AA_DIR"/*.conf 2>/dev/null | wc -l)
-expect "two-confs-after-second-enrol" "[ '$NUM_FILES_2' = '2' ]"
+expect "two-confs-after-second-enroll" "[ '$NUM_FILES_2' = '2' ]"
 
 # Pubkey-collision idempotency: write the SAME pubkey twice via
 # the writer directly and confirm only one file results

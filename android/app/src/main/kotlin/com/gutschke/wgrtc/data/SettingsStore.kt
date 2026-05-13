@@ -16,8 +16,8 @@ import kotlinx.coroutines.flow.asStateFlow
  *
  * 1. **Default-broker only** — no setup; both sides use
  * [WormholeDefaults.BROKER_WSS] for first contact. Per-tunnel
- * broker (from 's enrolment payload) takes over afterwards
- * so the public broker never sees post-enrolment OFFER frames.
+ * broker (from 's enrollment payload) takes over afterwards
+ * so the public broker never sees post-enrollment OFFER frames.
  * 2. **Private broker only** — user overrides the default below.
  * Both sides MUST configure the same private broker for the
  * initial rendezvous; that's the cost of opting out.

@@ -137,7 +137,7 @@ class WormholeBrokerSession(
         transport.send(buildSasConfirmEnvelope(peerRoutingId, mac))
 
     /** Same as [sendConfirm] but includes the encrypted [info] blob
-     * the enrolment-payload extension requires. Falls back
+     * the enrollment-payload extension requires. Falls back
      * cleanly: an older receiver that only checks `mac` ignores
      * the extra field. */
     fun sendConfirmWithInfo(mac: ByteArray, info: ByteArray): Boolean =

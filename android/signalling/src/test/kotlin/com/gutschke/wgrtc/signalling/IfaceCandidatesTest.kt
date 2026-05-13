@@ -60,7 +60,7 @@ class IfaceCandidatesTest {
         assertFalse(isPrivateV4("203.0.113.5"))
     }
 
-    @Test fun `tunnel iface names recognised`() {
+    @Test fun `tunnel iface names recognized`() {
         assertTrue(isTunnelIfaceName("wg0"))
         assertTrue(isTunnelIfaceName("wg0p1"))
         assertTrue(isTunnelIfaceName("tun0"))
@@ -70,7 +70,7 @@ class IfaceCandidatesTest {
         assertFalse(isTunnelIfaceName("ap0"))
     }
 
-    @Test fun `bridge iface names recognised`() {
+    @Test fun `bridge iface names recognized`() {
         assertTrue(isBridgeIfaceName("br0"))
         assertTrue(isBridgeIfaceName("br-ec1234"))
         assertTrue(isBridgeIfaceName("docker0"))
@@ -250,6 +250,94 @@ class IfaceCandidatesTest {
         assertTrue(out.all { it.rank == 50 && it.kind == "lan" })
         assertEquals("wlan2" to "192.168.43.1", out[0].iface to out[0].ip)
         assertEquals("rmnet_data0" to "100.64.7.42", out[1].iface to out[1].ip)
+    }
+
+    // ─── IPv6 classification ──────────────────────────────────────
+
+    @Test fun `v6 link-local is ineligible`() {
+        assertEquals(V6Range.NONE, classifyV6Range("fe80::1"))
+        assertEquals(V6Range.NONE, classifyV6Range("fe80::9854:9eff:fe81:b49b"))
+        assertFalse(isCandidateEligibleV6("fe80::1"))
+    }
+
+    @Test fun `v6 loopback and unspecified are ineligible`() {
+        assertEquals(V6Range.NONE, classifyV6Range("::1"))
+        assertEquals(V6Range.NONE, classifyV6Range("::"))
+    }
+
+    @Test fun `v6 multicast is ineligible`() {
+        assertEquals(V6Range.NONE, classifyV6Range("ff02::1"))
+        assertEquals(V6Range.NONE, classifyV6Range("ff05::2"))
+    }
+
+    @Test fun `v6 IPv4-mapped is ineligible`() {
+        assertEquals(V6Range.NONE, classifyV6Range("::ffff:192.0.2.1"))
+        assertEquals(V6Range.NONE, classifyV6Range("::ffff:0:0"))
+    }
+
+    @Test fun `v6 ULA is reachable on the home LAN`() {
+        // fc00::/8 and fd00::/8 — site-local routable.
+        assertEquals(V6Range.ULA, classifyV6Range("fc00::1"))
+        assertEquals(V6Range.ULA, classifyV6Range("fd00:a771:c05:0:9854:9eff:fe81:b49b"))
+        assertTrue(isCandidateEligibleV6("fd12:3456:789a::42"))
+    }
+
+    @Test fun `v6 global is publicly reachable`() {
+        assertEquals(V6Range.GLOBAL, classifyV6Range("2001:db8::1"))
+        assertEquals(V6Range.GLOBAL, classifyV6Range("2001:5a8:4cea:cc00:9854:9eff:fe81:b49b"))
+        assertEquals(V6Range.GLOBAL, classifyV6Range("3fff::1"))
+        // 2000::/3 lower bound.
+        assertEquals(V6Range.GLOBAL, classifyV6Range("2000::1"))
+        // First address outside 2000::/3 is 4000:: — outside global range.
+        assertEquals(V6Range.NONE, classifyV6Range("4000::1"))
+    }
+
+    @Test fun `enumerateAndRank surfaces v6 global as stun-kind`() {
+        // ChromeOS ARC scenario: ARC sees only its internal v4 bridge
+        // (100.115.92.x — useless for joiners) plus a globally-
+        // routable v6 on eth5. The v6 must come out as an
+        // advertise-able candidate.
+        val provider = FakeIfaceProvider(listOf(
+            "eth0" to "100.115.92.2",
+            "eth5" to "100.115.92.22",
+            "eth5" to "2001:5a8:4cea:cc00:9854:9eff:fe81:b49b",
+            "eth5" to "fd00:a771:c05:0:9854:9eff:fe81:b49b",
+            "eth5" to "fe80::9854:9eff:fe81:b49b",
+        ))
+        val out = enumerateAndRank(
+            provider = provider,
+            defaultIface = null,
+            advertise = emptySet(),
+            suppress = emptySet(),
+            ownWg = emptySet(),
+        )
+        // 4 advertise-able: two v4 CGNAT + global v6 + ULA v6. Link-local v6 dropped.
+        assertEquals(4, out.size)
+        // v6 global ranks 25 — sorts BEFORE v4 CGNAT (rank 50) and v6 ULA (rank 45).
+        assertEquals("2001:5a8:4cea:cc00:9854:9eff:fe81:b49b", out[0].ip)
+        assertEquals("stun", out[0].kind)
+        assertEquals(25, out[0].rank)
+        // v6 ULA ranks 45 — between v6 global and v4 lan/CGNAT.
+        assertEquals("fd00:a771:c05:0:9854:9eff:fe81:b49b", out[1].ip)
+        assertEquals("lan", out[1].kind)
+        assertEquals(45, out[1].rank)
+        // Then v4 CGNAT at rank 50, insertion order preserved.
+        assertEquals("100.115.92.2", out[2].ip)
+        assertEquals("100.115.92.22", out[3].ip)
+    }
+
+    @Test fun `enumerateAndRank drops scoped v6 silently`() {
+        // Link-local with %scope id is dropped before ranking.
+        val provider = FakeIfaceProvider(listOf(
+            "wlan0" to "fe80::1",
+            "wlan0" to "2001:db8::1",
+        ))
+        val out = enumerateAndRank(
+            provider = provider,
+            defaultIface = null,
+        )
+        assertEquals(1, out.size)
+        assertEquals("2001:db8::1", out[0].ip)
     }
 }
 

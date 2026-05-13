@@ -23,7 +23,7 @@ const val PROTOCOL_VERSION = 1
 
 // `encodeDefaults = true` is critical: the daemon rejects ENROLL blobs
 // that don't carry an explicit `v` (PROTOCOL_VERSION) field. Default
-// kotlinx.serialization behaviour drops fields whose value equals
+// kotlinx.serialization behavior drops fields whose value equals
 // their default, which would silently break interop.
 internal val JSON = Json {
     ignoreUnknownKeys = true
@@ -210,9 +210,9 @@ fun extractEnrollResponse(message: JsonElement): Pair<String, String>? {
 /**
  * Pull the encrypted blob out of an inbound *signalling* OFFER, or
  * null if the message is something else. Mirrors the daemon's
- * [extract_envelope] behaviour: signalling OFFERs are discriminated
- * from enrolment OFFERs by the absence of `metadata.kind` (or by
- * `metadata.kind` being something other than the enrolment kinds).
+ * [extract_envelope] behavior: signalling OFFERs are discriminated
+ * from enrollment OFFERs by the absence of `metadata.kind` (or by
+ * `metadata.kind` being something other than the enrollment kinds).
  *
  * Returns the base64-encoded ciphertext blob; the caller decrypts it
  * with the sigbox key.
@@ -227,7 +227,7 @@ fun extractSignallingOffer(message: JsonElement): String? {
     if (v != PROTOCOL_VERSION.toString()) return null
     val kind = (md["kind"] as? JsonPrimitive)?.contentOrNull
     // Signalling OFFER iff `kind` is absent. The daemon also ignores
-    // unknown kinds — match that behaviour rather than bail.
+    // unknown kinds — match that behavior rather than bail.
     if (kind != null && kind != "") return null
     return (md["blob"] as? JsonPrimitive)?.contentOrNull
 }
@@ -326,7 +326,7 @@ private fun isValidPublicEndpoint(ip: String, port: Int): Boolean {
     return true
 }
 
-// Conservative literal-IP recogniser. IPv4: four dotted decimals.
+// Conservative literal-IP recognizer. IPv4: four dotted decimals.
 // IPv6: anything containing ":" with no DNS-shaped characters. False
 // positives are filtered by the InetAddress.getByName check below;
 // the regex only short-circuits the obvious "this is a hostname" case

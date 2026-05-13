@@ -49,7 +49,7 @@ WHAT MAKES IT DIFFERENT
 — Peer-to-peer by design. No relay server in the middle of your traffic.
 — Self-hosted signaling. Point the app at your own signaling broker (or
   any compatible one); only short-lived metadata transits, encrypted.
-— Two enrolment paths to your liking: scan a QR code, or read out a
+— Two enrollment paths to your liking: scan a QR code, or read out a
   short SAS-protected wormhole phrase from one device to the other.
 — No accounts, no cloud, no telemetry.
 
@@ -154,7 +154,7 @@ of the app):
    landing screen.
 2. **Tunnel detail** for an active host tunnel — status hero showing
    "connected", the enrolled-peers section visible.
-3. **Invite a peer** modal — three enrolment options (QR / wormhole
+3. **Invite a peer** modal — three enrollment options (QR / wormhole
    code / manual config). Shows the differentiator.
 4. **Settings** — broker URL field is the one to highlight.
 

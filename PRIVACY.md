@@ -22,7 +22,7 @@ intended to be one you run yourself.
   records, and application preferences live in the app's private
   storage and never leave the device except as part of an explicit
   user-initiated action (for example, backing up the device, or sharing a
-  generated enrolment payload with another peer).
+  generated enrollment payload with another peer).
 - **No third-party data sharing.** The application does not send data to
   advertisers, analytics services, cloud back-ends, or any other party.
 
@@ -53,13 +53,13 @@ The application requests only the Android permissions it needs to operate as
 a WireGuard client: `INTERNET`, foreground-service notification permissions,
 `BIND_VPN_SERVICE` (via Android's `VpnService`, only invoked when you
 activate a tunnel), and `CAMERA` (only when you tap "Scan QR code" during
-enrolment; the camera is active only while that screen is open and no images
+enrollment; the camera is active only while that screen is open and no images
 are stored).
 
 ## Open-source verification
 
 Both the Android client and the `wireguardrtc` daemon are open-source under
-the Apache License 2.0. The behaviours described above can be verified
+the Apache License 2.0. The behaviors described above can be verified
 against the source in this repository — `android/` for the app, `daemon/`
 for the server-side daemon.
 

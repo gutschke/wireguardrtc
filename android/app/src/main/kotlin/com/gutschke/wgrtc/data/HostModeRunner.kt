@@ -159,7 +159,7 @@ class HostModeRunner(
     /**
      * Push a fresh UAPI string into the running endpoint without
      * re-opening it. uses this to apply revocations / new
-     * peer enrolments in-place — wireguard-go's `IpcSet` accepts a
+     * peer enrollments in-place — wireguard-go's `IpcSet` accepts a
      * full UAPI document and applies it as a "set state" operation.
      *
      * Throws `IllegalStateException` if called before [start] or
@@ -295,7 +295,7 @@ data class HostModeRunnerConfig(
      * intercepts traffic destined elsewhere.
      *
      * Null = no host forwarder; non-local destinations get
-     * dropped at the netstack's IP layer (legacy behaviour).
+     * dropped at the netstack's IP layer (legacy behavior).
      * Tests that don't need through-host forwarding leave this
      * null.
      */

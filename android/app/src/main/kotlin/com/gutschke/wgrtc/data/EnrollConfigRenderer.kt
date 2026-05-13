@@ -3,6 +3,7 @@ package com.gutschke.wgrtc.data
 import com.gutschke.wgrtc.signalling.EnrollOkPlain
 import com.gutschke.wgrtc.signalling.EnrollResult
 import com.gutschke.wgrtc.signalling.EnrollUri
+import com.gutschke.wgrtc.signalling.formatEndpoint
 import java.util.Base64
 
 /**
@@ -14,18 +15,32 @@ import java.util.Base64
  * private method on `WgrtcViewModel` was a thin wrapper that pulled
  * `android.util.Base64` in for two `encodeToString` calls — both
  * adequately served by `java.util.Base64.getEncoder()` (the
- * NO_WRAP / NO_PAD-equivalent default behaviour matches what we
+ * NO_WRAP / NO_PAD-equivalent default behavior matches what we
  * actually need: 44-char padded base64 of 32 raw bytes).
  *
- * Throws [IllegalStateException] when the daemon's reply omits the
- * `server_endpoint_hint`. for what the daemon must
- * include for the client to write a usable wg-quick block.
+ * Endpoint resolution order:
+ *   1. `server_endpoint_hint` (the host's preferred contact address) —
+ *      typically the STUN-discovered public IP, set when the host is
+ *      behind a cone NAT.
+ *   2. First entry of `candidates` — the host's full ranked list (LAN,
+ *      STUN, PublicIp, mesh). Used when the host has no usable public
+ *      endpoint (symmetric NAT, classification still in progress, or
+ *      a phone-host on a network whose external IP it can't discover).
+ *   3. Throw — neither a hint nor any candidate to write into the
+ *      persisted `Endpoint =` line.
+ *
+ * The listener-driven OFFER mechanism rewrites the persisted endpoint
+ * once the tunnel is live and a fresh candidate list arrives, so the
+ * value written here only needs to be one usable address. A LAN-only
+ * candidate is fine as the bootstrap entry.
  */
 fun renderEnrollConfig(uri: EnrollUri, ok: EnrollResult.Ok): String {
  val plain: EnrollOkPlain = ok.plaintext
  val endpoint = plain.serverEndpointHint
+ ?: plain.candidates?.firstOrNull()?.let { formatEndpoint(it.ip, it.port) }
  ?: throw IllegalStateException(
- "ENROLL_OK has no server endpoint; daemon needs PublicIp or STUN")
+ "ENROLL_OK has no server endpoint; host needs PublicIp or STUN " +
+ "discovery to advertise a usable address")
  val serverPub = plain.serverPubkey
  ?: Base64.getEncoder().encodeToString(uri.serverPub)
  val clientPriv = Base64.getEncoder().encodeToString(ok.clientPrivKey)

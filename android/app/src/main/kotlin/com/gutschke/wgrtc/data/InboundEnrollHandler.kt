@@ -84,7 +84,7 @@ class InboundEnrollHandler(
  /** Manual-flow only: the wg-quick text the host minted for
  * this peer. Stored on the persisted [EnrolledPeer] so
  * the host UI's "Show invitation" action survives an app
- * restart. Null for QR / wormhole enrolments where the
+ * restart. Null for QR / wormhole enrollments where the
  * joiner generated its own keypair (see
  * [EnrolledPeer.manualInvitationText] for the security
  * trade-off). */

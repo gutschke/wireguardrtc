@@ -1,7 +1,7 @@
 package com.gutschke.wgrtc.data
 
-import com.gutschke.wgrtc.signalling.HostEnrolInfo
-import com.gutschke.wgrtc.signalling.JoinerEnrolInfo
+import com.gutschke.wgrtc.signalling.HostEnrollInfo
+import com.gutschke.wgrtc.signalling.JoinerEnrollInfo
 import com.gutschke.wgrtc.signalling.OfferListenerWormholeTransport
 import com.gutschke.wgrtc.signalling.SasConfirmRole
 import com.gutschke.wgrtc.signalling.SasInbound
@@ -54,7 +54,7 @@ class WormholeJoinController(
     private val brokerKey: String,
     private val parentScope: CoroutineScope,
     /** Optional human-readable device name (e.g. `Build.MODEL`).
-     * Carried in [JoinerEnrolInfo.deviceName] so the host's UI can
+     * Carried in [JoinerEnrollInfo.deviceName] so the host's UI can
      * show "Android phone" rather than just a base64 pubkey. */
     private val deviceName: String? = null,
     /** Test seam: skip real keypair generation by injecting a
@@ -104,7 +104,7 @@ class WormholeJoinController(
     fun submit() {
         val s = _state.value as? WormholeJoinUiState.EnteringCode ?: return
         if (!WormholeCode.isValid(s.typed)) return
-        val canonical = WormholeCode.normalise(s.typed)
+        val canonical = WormholeCode.normalize(s.typed)
         _state.value = WormholeJoinUiState.WaitingForResponder(canonical)
         startProtocol(canonical)
     }
@@ -116,8 +116,8 @@ class WormholeJoinController(
         val key = sharedKey ?: return failNow("internal: no shared key")
         _state.value = WormholeJoinUiState.AwaitingPeerConfirm(s.code)
         val mac = buildSasConfirmMac(SasConfirmRole.INITIATOR, key)
-        // Encrypted enrolment info: our pubkey + device name.
-        val joinerInfo = JoinerEnrolInfo(
+        // Encrypted enrollment info: our pubkey + device name.
+        val joinerInfo = JoinerEnrollInfo(
             timestamp = System.currentTimeMillis() / 1000,
             wgPubkeyB64 = joinerPub ?: return failNow("internal: keypair missing"),
             deviceName = deviceName,
@@ -225,7 +225,7 @@ class WormholeJoinController(
         if (!macOk) {
             return failNow("peer MAC verification failed — possible MITM")
         }
-        // If the host sent enrolment info, decode it + build
+        // If the host sent enrollment info, decode it + build
         // a usable tunnel for the UI to persist. Missing info is
         // tolerated (legacy mac-only confirm path) — Succeeded
         // fires without a [resultingTunnel]. Decoding failure when
@@ -241,7 +241,7 @@ class WormholeJoinController(
         teardown()
     }
 
-    private fun buildJoinerTunnel(privB64: String, host: HostEnrolInfo): Tunnel {
+    private fun buildJoinerTunnel(privB64: String, host: HostEnrollInfo): Tunnel {
         val configText = buildString {
             append("[Interface]\n")
             append("PrivateKey = ").append(privB64).append('\n')

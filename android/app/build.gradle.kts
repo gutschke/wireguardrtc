@@ -27,13 +27,11 @@ android {
         applicationId = "com.gutschke.wgrtc"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "0.2.0"
+        versionCode = 23
+        versionName = "0.2.2"
         // Instrumented (androidTest) tests use AndroidX Test's JUnit 4
         // runner. The connectedDebugAndroidTest task drives them via
-        // ADB against whichever device/emulator is currently attached
-        // (in this project: the the dev environment-remote emulator at
-        // 198.51.100.118 — see the dev-env README).
+        // ADB against whichever device/emulator is currently attached.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -50,6 +48,11 @@ android {
 
     buildFeatures {
         compose = true
+        // Generates com.gutschke.wgrtc.BuildConfig with DEBUG/etc; the
+        // mintHostEnrollToken path uses BuildConfig.DEBUG to gate a
+        // debug-only URI dump so agentic test rigs can grab the
+        // enrollment string straight from logcat (release elides it).
+        buildConfig = true
     }
 
     compileOptions {

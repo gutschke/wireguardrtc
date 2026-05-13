@@ -245,7 +245,7 @@ private fun FailedStep(reason: String, onBack: () -> Unit) {
         tint = MaterialTheme.colorScheme.error,
     )
     Spacer(Modifier.height(8.dp))
-    Text("Couldn't enrol",
+    Text("Couldn't enroll",
         style = MaterialTheme.typography.headlineSmall,
         color = MaterialTheme.colorScheme.error)
     Text(

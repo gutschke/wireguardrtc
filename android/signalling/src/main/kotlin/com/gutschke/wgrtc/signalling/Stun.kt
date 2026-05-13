@@ -24,9 +24,15 @@ import java.security.SecureRandom
  * pure (testable with hand-crafted vectors); the I/O happens in
  * [StunClient] which can be replaced in tests by a stub server.
  *
- * IPv4 only. IPv6 STUN is not in our path today (the daemon
- * doesn't classify v6 either; raw-inject hole-punching is v4-only
- * and the phone follows the daemon's lead).
+ * Handles both XOR-MAPPED-ADDRESS families: IPv4 (family=0x01) and
+ * IPv6 (family=0x02). The v6 path is critical on Android-on-ChromeOS
+ * (ARC), where Java's [java.net.InetAddress.getByName] resolves a
+ * dual-stack STUN server's AAAA before its A record; a v4-only parser
+ * silently drops every reply and the host appears to have no NAT
+ * classification at all. See PS19. Daemon-side STUN is still v4-only
+ * (raw-inject hole-punching is v4-only); the v6 path here exists
+ * because v6 doesn't need raw injection — it's end-to-end with no
+ * NAT.
  */
 
 private const val STUN_MAGIC_COOKIE: Int = 0x2112A442.toInt()
@@ -88,9 +94,21 @@ fun randomTxid(rng: SecureRandom = SecureRandom()): ByteArray =
 
 /**
  * Parse a STUN BINDING RESPONSE and extract the XOR-MAPPED-ADDRESS.
- * Returns null if the message isn't a successful response, the
- * transaction id doesn't match, the magic cookie is wrong, or the
- * mapped-address attribute is missing / IPv6.
+ * Handles family=0x01 (IPv4, 8-byte attribute) and family=0x02 (IPv6,
+ * 20-byte attribute). Returns null if the message isn't a successful
+ * response, the transaction id doesn't match, the magic cookie is
+ * wrong, or no XOR-MAPPED-ADDRESS attribute is present in a known
+ * family.
+ *
+ * Per RFC 5389 §15.2 the address is XORed with the 4-byte magic
+ * cookie (v4) or the cookie concatenated with the 12-byte transaction
+ * id (v6). The port is XORed with the high 16 bits of the cookie in
+ * both families.
+ *
+ * Returned [StunMapping.externalIp] is a bare textual literal — IPv4
+ * dotted-quad or canonical IPv6 (compressed form via
+ * [java.net.InetAddress]). Callers that need wire-form `host:port`
+ * (with brackets around v6) should pass it through [formatEndpoint].
  */
 fun parseStunBindingResponse(data: ByteArray, expectedTxid: ByteArray): StunMapping? {
     if (data.size < 20) return null
@@ -112,29 +130,59 @@ fun parseStunBindingResponse(data: ByteArray, expectedTxid: ByteArray): StunMapp
         if (offset + 4 + attrLen > end) return null
         if (attrType == XOR_MAPPED_ADDRESS && attrLen >= 8) {
             // attribute payload starts at current bb position.
-            val reserved = bb.get() // ignored
+            bb.get() // reserved, ignored
             val family = bb.get().toInt() and 0xFF
-            if (family != 0x01) {
-                // IPv6 (family=0x02) not supported here; skip the rest
-                // of this attr including padding to next 4-byte boundary.
-                val toSkip = attrLen - 2
-                bb.position(bb.position() + toSkip)
-                offset += 4 + alignTo4(attrLen)
-                continue
-            }
             val xport = bb.getShort().toInt() and 0xFFFF
-            val xip = bb.getInt()
             val extPort = xport xor STUN_MAGIC_COOKIE_HIGH16
-            val extIpInt = xip xor STUN_MAGIC_COOKIE
-            val ipBytes = ByteBuffer.allocate(4)
-                .order(ByteOrder.BIG_ENDIAN)
-                .putInt(extIpInt)
-                .array()
-            val extIp = "${ipBytes[0].toInt() and 0xFF}." +
-                        "${ipBytes[1].toInt() and 0xFF}." +
-                        "${ipBytes[2].toInt() and 0xFF}." +
-                        "${ipBytes[3].toInt() and 0xFF}"
-            return StunMapping(extIp, extPort)
+            when (family) {
+                0x01 -> {
+                    // 4-byte IPv4 address XORed with the cookie.
+                    val xip = bb.getInt()
+                    val extIpInt = xip xor STUN_MAGIC_COOKIE
+                    val ipBytes = ByteBuffer.allocate(4)
+                        .order(ByteOrder.BIG_ENDIAN)
+                        .putInt(extIpInt)
+                        .array()
+                    val extIp = "${ipBytes[0].toInt() and 0xFF}." +
+                                "${ipBytes[1].toInt() and 0xFF}." +
+                                "${ipBytes[2].toInt() and 0xFF}." +
+                                "${ipBytes[3].toInt() and 0xFF}"
+                    return StunMapping(extIp, extPort)
+                }
+                0x02 -> {
+                    // 16-byte IPv6 address XORed with cookie ‖ txid.
+                    if (attrLen < 20) {
+                        // Malformed v6 attr; skip it.
+                        bb.position(bb.position() + (attrLen - 4))
+                        offset += 4 + alignTo4(attrLen)
+                        continue
+                    }
+                    val raw = ByteArray(16).also { bb.get(it) }
+                    val mask = ByteArray(16)
+                    // First 4 bytes XOR with the magic cookie (big-endian).
+                    mask[0] = ((STUN_MAGIC_COOKIE ushr 24) and 0xFF).toByte()
+                    mask[1] = ((STUN_MAGIC_COOKIE ushr 16) and 0xFF).toByte()
+                    mask[2] = ((STUN_MAGIC_COOKIE ushr 8) and 0xFF).toByte()
+                    mask[3] = (STUN_MAGIC_COOKIE and 0xFF).toByte()
+                    // Next 12 bytes XOR with the transaction id.
+                    System.arraycopy(txid, 0, mask, 4, 12)
+                    val ipBytes = ByteArray(16) { i -> (raw[i].toInt() xor mask[i].toInt()).toByte() }
+                    val extIp = try {
+                        java.net.InetAddress.getByAddress(ipBytes).hostAddress
+                            ?: return null
+                    } catch (_: Exception) { return null }
+                    // Strip the Java %scopeId suffix if any — STUN never
+                    // returns a scoped address, but defensive.
+                    val cleanIp = extIp.substringBefore('%')
+                    return StunMapping(cleanIp, extPort)
+                }
+                else -> {
+                    // Unknown family; skip this attribute.
+                    bb.position(bb.position() + (attrLen - 4))
+                    offset += 4 + alignTo4(attrLen)
+                    continue
+                }
+            }
         } else {
             // Skip this attribute (and any padding to a 4-byte boundary).
             bb.position(bb.position() + attrLen)
@@ -213,7 +261,7 @@ class StunClient(
  * - No server responded → UNKNOWN.
  *
  * Reuses one source port across all probes to keep the comparison
- * apples-to-apples (matches test 01's behaviour).
+ * apples-to-apples (matches test 01's behavior).
  */
 fun classifyNat(
     servers: List<String>,

@@ -31,7 +31,7 @@ URI=$(_mint testclient)
 [[ -n "$URI" ]] || { echo "[12] FAIL — no URI minted"; exit 1; }
 _run_daemon
 
-# Run both enrolment attempts inside one Python process on `client` —
+# Run both enrollment attempts inside one Python process on `client` —
 # this way we keep the keypair in memory across the two attempts.
 RESULT=$(fabric_exec_capture client "
     '$PY' -c \"

@@ -147,7 +147,7 @@ class MainActivity : ComponentActivity() {
     /** Pull a URI out of [intent]. Three sources, all routed through
      * [handleIncomingUri] so the dispatch is identical:
      *
-     * - `--es config "<text>"` (ADB / test driver: paste-screen prefill OR auto-enrol)
+     * - `--es config "<text>"` (ADB / test driver: paste-screen prefill OR auto-enroll)
      * - `intent.data` on `ACTION_VIEW` (URL handler — third-party QR scanner / browser)
      * - `--es scanned_qr "<text>"` on
      * `ACTION_SCAN_RESULT` (debug test hook simulating a successful camera scan)
@@ -161,7 +161,7 @@ class MainActivity : ComponentActivity() {
      * with a 30-second timeout (the daemon silently drops requests
      * whose token doesn't resolve, by security design). Skipping the
      * replay avoids the wasted broker WSS connection and the
-     * misleading "auto-enrol from intent failed: timeout" ERROR. */
+     * misleading "auto-enroll from intent failed: timeout" ERROR. */
     private fun consumeIncomingUri(intent: Intent?): String? {
         if (intent == null) return null
         intent.getStringExtra("config")?.let {
@@ -340,16 +340,27 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Dispatch a URI received via intent: if it's a wgrtc-enroll URI
-     * fire enrolment silently; if it's a wg-quick paste, stash for
+     * fire enrollment silently; if it's a wg-quick paste, stash for
      * the paste screen; anything else is logged and ignored. */
-    private fun handleIncomingUri(raw: String) {
+    private fun handleIncomingUri(raw: String, autoConnect: Boolean = false) {
         if (raw.startsWith("wgrtc-enroll://")) {
             lifecycleScope.launch {
                 try {
                     val uri = com.gutschke.wgrtc.signalling.EnrollUri.parse(raw)
-                    vm.enrollAndAdd(uri, deviceLabel = "android-wgrtc", name = null)
+                    val tunnel = vm.enrollAndAdd(uri, deviceLabel = "android-wgrtc", name = null)
+                    // Debug-only auto-connect: a `--ez autoconnect true`
+                    // adb extra on the VIEW intent immediately brings the
+                    // freshly-enrolled tunnel up. Lets the agentic test
+                    // rig exercise the joiner race without requiring an
+                    // unlocked screen + manual Connect tap. Release
+                    // builds ignore this (gated on BuildConfig.DEBUG).
+                    if (autoConnect && BuildConfig.DEBUG) {
+                        Log.i("wgrtc-main",
+                            "auto-connect after enroll: ${tunnel.id}")
+                        vm.connect(tunnel.id)
+                    }
                 } catch (t: Throwable) {
-                    Log.e("wgrtc-main", "auto-enrol from intent failed", t)
+                    Log.e("wgrtc-main", "auto-enroll from intent failed", t)
                 }
             }
         } else {
@@ -365,7 +376,10 @@ class MainActivity : ComponentActivity() {
         Log.i("wgrtc-main", "onNewIntent fired: action=${intent.action}")
         super.onNewIntent(intent)
         setIntent(intent)
-        consumeIncomingUri(intent)?.let(::handleIncomingUri)
+        consumeIncomingUri(intent)?.let { uri ->
+            handleIncomingUri(uri,
+                autoConnect = intent?.getBooleanExtra("autoconnect", false) == true)
+        }
         consumeRenameAction(intent)
         consumeAddLegacyAction(intent)
         consumeAddHostAction(intent)
@@ -376,7 +390,10 @@ class MainActivity : ComponentActivity() {
     @androidx.compose.runtime.Composable
     private fun AppNavHost() {
         val nav = rememberNavController()
-        consumeIncomingUri(intent)?.let(::handleIncomingUri)
+        consumeIncomingUri(intent)?.let { uri ->
+            handleIncomingUri(uri,
+                autoConnect = intent?.getBooleanExtra("autoconnect", false) == true)
+        }
         consumeRenameAction(intent)
         consumeAddLegacyAction(intent)
         consumeAddHostAction(intent)
@@ -525,7 +542,7 @@ class MainActivity : ComponentActivity() {
                 }
                 val code = remember { WormholeCode.generate() }
                 // Use the host tunnel's broker if present (so the
-                // post-enrolment OFFER traffic stays on the same
+                // post-enrollment OFFER traffic stays on the same
                 // private broker), otherwise fall back to the
                 // app-level default for first contact.
                 val brokerWss = tunnel?.brokerWss ?: app.settings.defaultBrokerWss
@@ -593,7 +610,7 @@ class MainActivity : ComponentActivity() {
                             // URI carries an authenticated single-use
                             // token, no further confirmation needed.
                             // Drop straight to the tunnel list while
-                            // enrolment runs in the background.
+                            // enrollment runs in the background.
                             handleIncomingUri(scanned)
                             nav.popBackStack(Routes.LIST, false)
                         } else {

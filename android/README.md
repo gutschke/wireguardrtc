@@ -1,6 +1,6 @@
 # wgrtc — Android app
 
-The Android client for the wgrtc system — also installs on Chromebooks that support Android apps. Manages WireGuard tunnels, enrols joiners through QR or 6-letter wormhole codes, and acts as a host for other peers when there is no Linux daemon available.
+The Android client for the wgrtc system — also installs on Chromebooks that support Android apps. Manages WireGuard tunnels, enrolls joiners through QR or 6-letter wormhole codes, and acts as a host for other peers when there is no Linux daemon available.
 
 For an overview of how this fits into the larger system, see the [top-level README](../README.md).
 
@@ -8,7 +8,7 @@ For an overview of how this fits into the larger system, see the [top-level READ
 
 - **Joiner mode.** Connect to any peer running the wgrtc daemon (or another wgrtc host). The app speaks the daemon's PeerJS-over-WSS signaling protocol, supports STUN-based endpoint roaming, and races multiple candidates in parallel to pick the lowest-latency path.
 - **Host mode.** The phone itself can host a WireGuard tunnel that other peers join — useful when there is no fixed-IP server available. A built-in userspace network stack (`gvisor`) NATs traffic from joiners onto whatever upstream the phone happens to be using (Wi-Fi, cellular, or a tethered network).
-- **Wormhole enrolment.** A 6-letter pronounceable code (PAKE-derived SAS) pairs two devices in seconds without QR codes or copy-paste of keys — handy when both devices are interactive but not co-located.
+- **Wormhole enrollment.** A 6-letter pronounceable code (PAKE-derived SAS) pairs two devices in seconds without QR codes or copy-paste of keys — handy when both devices are interactive but not co-located.
 - **Foreground service.** Backgrounded long enough for the OS to start killing tasks, the OFFER listener stays alive via a `specialUse` foreground service so endpoint updates keep flowing.
 - **Privacy.** No analytics, no cloud, no third-party sharing. Everything lives in the app's private storage; the only network traffic is the WireGuard tunnel itself plus end-to-end-encrypted signaling messages through whatever broker is configured (intended to be one you run yourself).
 

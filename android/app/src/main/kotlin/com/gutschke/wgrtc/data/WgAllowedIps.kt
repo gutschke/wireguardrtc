@@ -13,7 +13,7 @@ package com.gutschke.wgrtc.data
  *
  * To stay portable, every wg-quick config blob we produce for an
  * *external* WG client (i.e. all SAS payloads, all manual-config
- * blobs, all enrolment renderings) must emit AllowedIPs without
+ * blobs, all enrollment renderings) must emit AllowedIPs without
  * any whitespace. Internal in-memory edits + persistence are
  * fine — the canonicalize happens at the producer side of every
  * wire output.

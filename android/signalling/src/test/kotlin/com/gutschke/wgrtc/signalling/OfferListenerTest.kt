@@ -120,8 +120,8 @@ class OfferListenerTest {
         assertEquals(51820, update.port)
     }
 
-    @Test fun `ignores enrolment OFFERs`() = runBlocking {
-        // The listener is only for signalling; enrolment OFFERs ride
+    @Test fun `ignores enrollment OFFERs`() = runBlocking {
+        // The listener is only for signalling; enrollment OFFERs ride
         // in the same envelope but are discriminated by metadata.kind.
         queueBrokerScript { ws ->
             val blob = encryptEndpoint("198.51.100.10", 51820)
@@ -129,7 +129,7 @@ class OfferListenerTest {
         }
         listener.start(this, brokerWss(), "test", myPubB64, saltBytes, sigboxKey)
         val update = withTimeoutOrNull(2_000) { listener.updates.first() }
-        assertNull(update, "enrolment OFFER should not produce an EndpointUpdate")
+        assertNull(update, "enrollment OFFER should not produce an EndpointUpdate")
     }
 
     @Test fun `ignores OFFER with wrong key (silent)`() = runBlocking {

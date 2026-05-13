@@ -63,7 +63,7 @@ The `metadata.kind` field discriminates between three message families:
 |-------------------|-----------------------------------------------------------------------------------------------|
 | absent / `"offer"` | Ordinary signalling OFFER carrying a candidate-endpoint list.                                |
 | `"signal_wake"`   | Client-initiated wake — sender claims no endpoint, asks the receiver to refresh its view.    |
-| `"enroll"`        | Auto-enrolment request from a fresh client (see §5.4).                                       |
+| `"enroll"`        | Auto-enrollment request from a fresh client (see §5.4).                                       |
 | `"enroll_ok"` / `"enroll_err"` | Server's response to an `enroll`.                                                |
 
 The decrypted blob plaintext (after secretbox-decrypt) is JSON of this shape:
@@ -139,7 +139,7 @@ field accepts only one `(ip, port)` tuple, and the v1 PeerJS wire format
 carries one `ip` field — adding more would require a v2 protocol break.
 
 ### 4.3 Per-Peer Drop-Ins `/etc/wireguardrtc/peers.d/<label>.conf`
-The daemon does NOT enumerate WireGuard peers automatically. Each peer that should be managed needs a drop-in file. Filename is a human-friendly label (use the peer's hostname, role, or anything you'll recognise); the actual public key is given inside.
+The daemon does NOT enumerate WireGuard peers automatically. Each peer that should be managed needs a drop-in file. Filename is a human-friendly label (use the peer's hostname, role, or anything you'll recognize); the actual public key is given inside.
 
 ```ini
 # /etc/wireguardrtc/peers.d/laptop-anna.conf
@@ -166,7 +166,7 @@ When `[Enrollment] AutoActive = yes` (default), every successful ENROLL writes a
 Two reasons you might disable this:
 
 - You manually curate `peers.d/` for every peer (e.g. you want explicit `Mode = passive` per client). Set `[Enrollment] AutoActive = no` and write the drop-ins yourself.
-- You enrol a transient device and don't want the daemon to keep heartbeating to its routing-id forever. Either set `AutoActive = no`, or delete the auto-active drop-in once the device is decommissioned: `rm /var/lib/wireguardrtc/auto-enrolled.d/<label>-*.conf` (and reload the daemon, or wait for its next poll which re-reads peer configs after each enrol).
+- You enroll a transient device and don't want the daemon to keep heartbeating to its routing-id forever. Either set `AutoActive = no`, or delete the auto-active drop-in once the device is decommissioned: `rm /var/lib/wireguardrtc/auto-enrolled.d/<label>-*.conf` (and reload the daemon, or wait for its next poll which re-reads peer configs after each enroll).
 
 ### 4.4 WireGuard Interface Configuration
 
@@ -237,7 +237,7 @@ The command prints a `wgrtc-enroll://v1?...` URI (and a terminal QR code if `qre
 
 The user's client (e.g., a companion `wireguardrtc-android` app, or any third-party client that speaks the protocol) scans the QR, generates its own X25519 keypair, and sends an encrypted `ENROLL` request to the server via PeerJS. The server tries each pending token, decrypts on the matching one, atomically marks it consumed, runs `ProvisionScript` to add the new peer to WireGuard, reads back the allocated address via `wg show`, and responds with an authenticated `ENROLL_OK` carrying the client's WireGuard config.
 
-The protocol is single-use: only one device can complete enrollment per token. If a QR is leaked and an attacker enrols first, the legitimate user receives an authenticated `TOKEN_USED` response and the failure surfaces clearly — see the man page's AUTO-ENROLLMENT section for the full threat model. The man page also documents the `wgrtc-enroll://v1?...` URI format and the on-the-wire ENROLL/ENROLL_OK envelope; these are the spec for client implementations.
+The protocol is single-use: only one device can complete enrollment per token. If a QR is leaked and an attacker enrolls first, the legitimate user receives an authenticated `TOKEN_USED` response and the failure surfaces clearly — see the man page's AUTO-ENROLLMENT section for the full threat model. The man page also documents the `wgrtc-enroll://v1?...` URI format and the on-the-wire ENROLL/ENROLL_OK envelope; these are the spec for client implementations.
 
 ## 6. Compatibility Matrix (NAT)
 

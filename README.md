@@ -7,7 +7,7 @@ This repository hosts the two pieces of the wgrtc system:
 | Component | Where | What it is |
 |---|---|---|
 | **Daemon** | [`daemon/`](daemon/) | A Linux daemon that exchanges encrypted endpoint addresses with remote peers through a signaling broker, then punches both NATs open so the kernel WireGuard module can complete its handshake. Single-file Python 3 asyncio. Ships as a Debian package. |
-| **Android app** | [`android/`](android/) | A WireGuard tunnel manager for Android, including Chromebooks that support Android apps. Implements the same signaling protocol as the daemon, plus extensions for phone-to-phone use: SAS-based wormhole enrolment, host-mode tunnels, NAT-traversal helpers in a userspace `gvisor` netstack. |
+| **Android app** | [`android/`](android/) | A WireGuard tunnel manager for Android, including Chromebooks that support Android apps. Implements the same signaling protocol as the daemon, plus extensions for phone-to-phone use: SAS-based wormhole enrollment, host-mode tunnels, NAT-traversal helpers in a userspace `gvisor` netstack. |
 
 Both components speak the same wire format. A phone can join a tunnel hosted by a server running the daemon, or two phones can host each other — no central infrastructure required beyond a signaling broker, which you can run yourself.
 

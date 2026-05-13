@@ -1,7 +1,7 @@
 package com.gutschke.wgrtc.data
 
 /**
- * UI state machines for the wormhole-code enrolment screens
+ * UI state machines for the wormhole-code enrollment screens
  *. Two parallel state machines — one for the joining client
  * (initiator) and one for the host (responder) — sharing the same
  * shape but driven by different events.
@@ -55,7 +55,7 @@ sealed class WormholeJoinUiState {
 
 /** Events the initiator screen + controller can fire. */
 sealed class WormholeJoinUiEvent {
-    /** User typed; UI normalises before storing in state. */
+    /** User typed; UI normalizes before storing in state. */
     data class CodeChanged(val typed: String) : WormholeJoinUiEvent()
 
     /** User pressed "Connect" — the typed code was well-formed. */
@@ -109,7 +109,7 @@ fun reduceJoin(
                 // UI's enable-button rule, but defend against
                 // out-of-band invocation.
                 if (com.gutschke.wgrtc.signalling.WormholeCode.isValid(state.typed)) {
-                    val canon = com.gutschke.wgrtc.signalling.WormholeCode.normalise(state.typed)
+                    val canon = com.gutschke.wgrtc.signalling.WormholeCode.normalize(state.typed)
                     WormholeJoinUiState.WaitingForResponder(canon)
                 } else state
             }

@@ -8,11 +8,11 @@
 # (a) the round-trip completes in under 5 s wall-clock — the
 # "fast" in fast_wake;
 # (b) the responsive OFFER's first candidate matches the daemon's
-# configured PublicIp (192.168.99.20) so a client honouring the
+# configured PublicIp (192.168.99.20) so a client honoring the
 # candidates array would actually pick a valid endpoint.
 #
-# We don't run a real enrolment here — test 10 already covers that.
-# Adding it would gate this test on enrol latency that's irrelevant to
+# We don't run a real enrollment here — test 10 already covers that.
+# Adding it would gate this test on enroll latency that's irrelevant to
 # the wake path under measurement. We pre-stage the peer via the
 # same peers.d drop-in pattern test 23 uses.
 

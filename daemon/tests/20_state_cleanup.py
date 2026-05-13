@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory() as scratch:
     body = files[0].read_text()
     expect("contains-pubkey", pubkey in body, True)
     expect("contains-mode-active", "Mode = active" in body, True)
-    # Re-enrolment of the same pubkey (same label) overwrites
+    # Re-enrollment of the same pubkey (same label) overwrites
     # idempotently — same filename (sha256 fingerprint), no
     # accumulating files.
     wgrtc.write_auto_active_peer(

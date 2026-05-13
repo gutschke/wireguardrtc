@@ -16,18 +16,18 @@ import java.util.Base64
  * label and the secretbox's nonce-prefix mode keep them
  * cryptographically separate.
  *
- * **Joiner→Host** ([JoinerEnrolInfo]):
+ * **Joiner→Host** ([JoinerEnrollInfo]):
  * - the joiner's WG public key (so the host can add them as a peer).
  * - an optional human-readable device label.
  *
- * **Host→Joiner** ([HostEnrolInfo]):
+ * **Host→Joiner** ([HostEnrollInfo]):
  * - host's WG public key (for the joiner's `[Peer] PublicKey`).
  * - host's WG endpoint address (`ip:port` for `[Peer] Endpoint`).
  * - the joiner's pre-allocated address (e.g. `10.99.0.2/32`,
  * for the joiner's `[Interface] Address`).
  * - allowed-IPs (subnet the joiner can reach via the tunnel).
  * - optional broker WSS + key + salt: where the joiner should
- * subscribe for OFFER updates after enrolment. Falls back to
+ * subscribe for OFFER updates after enrollment. Falls back to
  * the app's default broker (settings) if absent.
  * - assorted wg-quick conveniences (DNS, MTU, keepalive).
  *
@@ -36,7 +36,7 @@ import java.util.Base64
  * pattern.
  */
 @Serializable
-data class JoinerEnrolInfo(
+data class JoinerEnrollInfo(
     @SerialName("v") val version: Int = PROTOCOL_VERSION,
     @SerialName("ts") val timestamp: Long,
     @SerialName("wg_pubkey") val wgPubkeyB64: String,
@@ -44,7 +44,7 @@ data class JoinerEnrolInfo(
 )
 
 @Serializable
-data class HostEnrolInfo(
+data class HostEnrollInfo(
     @SerialName("v") val version: Int = PROTOCOL_VERSION,
     @SerialName("ts") val timestamp: Long,
     @SerialName("wg_pubkey") val wgPubkeyB64: String,
@@ -63,15 +63,15 @@ data class HostEnrolInfo(
 /** Round-trip codec: serialise to JSON, encrypt with [sharedKey] via
  * NaCl secretbox. The result is suitable for the `encryptedInfo`
  * field of [buildSasConfirmEnvelope]. */
-fun encodeJoinerInfo(info: JoinerEnrolInfo, sharedKey: ByteArray): ByteArray {
+fun encodeJoinerInfo(info: JoinerEnrollInfo, sharedKey: ByteArray): ByteArray {
     require(sharedKey.size >= 32) { "sharedKey too short" }
-    val plain = SAS_INFO_JSON.encodeToString(JoinerEnrolInfo.serializer(), info)
+    val plain = SAS_INFO_JSON.encodeToString(JoinerEnrollInfo.serializer(), info)
     return secretboxEncrypt(plain.toByteArray(Charsets.UTF_8), sharedKey.copyOfRange(0, 32))
 }
 
-fun encodeHostInfo(info: HostEnrolInfo, sharedKey: ByteArray): ByteArray {
+fun encodeHostInfo(info: HostEnrollInfo, sharedKey: ByteArray): ByteArray {
     require(sharedKey.size >= 32) { "sharedKey too short" }
-    val plain = SAS_INFO_JSON.encodeToString(HostEnrolInfo.serializer(), info)
+    val plain = SAS_INFO_JSON.encodeToString(HostEnrollInfo.serializer(), info)
     return secretboxEncrypt(plain.toByteArray(Charsets.UTF_8), sharedKey.copyOfRange(0, 32))
 }
 
@@ -84,11 +84,11 @@ fun decodeJoinerInfo(
     sharedKey: ByteArray,
     nowEpochSeconds: Long = System.currentTimeMillis() / 1000,
     freshnessWindowSeconds: Long = PROTOCOL_FRESHNESS_WINDOW_SECONDS,
-): JoinerEnrolInfo? {
+): JoinerEnrollInfo? {
     if (sharedKey.size < 32) return null
     val plain = secretboxDecrypt(blob, sharedKey.copyOfRange(0, 32)) ?: return null
     val info = try {
-        SAS_INFO_JSON.decodeFromString(JoinerEnrolInfo.serializer(),
+        SAS_INFO_JSON.decodeFromString(JoinerEnrollInfo.serializer(),
             plain.toString(Charsets.UTF_8))
     } catch (_: Exception) { return null }
     if (info.version != PROTOCOL_VERSION) return null
@@ -102,11 +102,11 @@ fun decodeHostInfo(
     sharedKey: ByteArray,
     nowEpochSeconds: Long = System.currentTimeMillis() / 1000,
     freshnessWindowSeconds: Long = PROTOCOL_FRESHNESS_WINDOW_SECONDS,
-): HostEnrolInfo? {
+): HostEnrollInfo? {
     if (sharedKey.size < 32) return null
     val plain = secretboxDecrypt(blob, sharedKey.copyOfRange(0, 32)) ?: return null
     val info = try {
-        SAS_INFO_JSON.decodeFromString(HostEnrolInfo.serializer(),
+        SAS_INFO_JSON.decodeFromString(HostEnrollInfo.serializer(),
             plain.toString(Charsets.UTF_8))
     } catch (_: Exception) { return null }
     if (info.version != PROTOCOL_VERSION) return null
