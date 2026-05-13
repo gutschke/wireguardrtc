@@ -168,13 +168,13 @@ class GlobalConfig:
 
 
 def load_global_config(path: Path) -> GlobalConfig:
-    cp = configparser.ConfigParser
+    cp = configparser.ConfigParser()
     cp.optionxform = str  # preserve case for base64 values
     if not cp.read(path):
         sys.stderr.write(f"[FATAL] config file not found: {path}\n")
         sys.exit(2)
 
-    salt_str = cp.get("Global", "Salt", fallback="").strip
+    salt_str = cp.get("Global", "Salt", fallback="").strip()
     if not salt_str or salt_str == "CHANGE_ME_TO_A_SECURE_RANDOM_STRING":
         sys.stderr.write(
             f"[FATAL] {path}: [Global] Salt must be set to a unique random value.\n"
@@ -183,10 +183,10 @@ def load_global_config(path: Path) -> GlobalConfig:
         sys.exit(2)
     salt = salt_str.encode("utf-8")
 
-    peerjs_server = cp.get("Global", "PeerJsServer", fallback=DEFAULT_PEERJS_SERVER).strip
-    peerjs_key = cp.get("Global", "PeerJsKey", fallback=DEFAULT_PEERJS_KEY).strip
+    peerjs_server = cp.get("Global", "PeerJsServer", fallback=DEFAULT_PEERJS_SERVER).strip()
+    peerjs_key = cp.get("Global", "PeerJsKey", fallback=DEFAULT_PEERJS_KEY).strip()
 
-    public_ip_str = cp.get("Global", "PublicIp", fallback="").strip
+    public_ip_str = cp.get("Global", "PublicIp", fallback="").strip()
     public_ip = None
     if public_ip_str:
         try:
@@ -214,9 +214,9 @@ def load_global_config(path: Path) -> GlobalConfig:
         public_ip = str(addr)
 
     stun_raw = cp.get("Stun", "Servers", fallback=", ".join(DEFAULT_STUN_SERVERS))
-    stun = [s.strip for s in stun_raw.split(",") if s.strip]
+    stun = [s.strip() for s in stun_raw.split(",") if s.strip()]
 
-    # When `Strict = yes`, get_public_ipv4 rejects STUN responses
+    # When `Strict = yes`, get_public_ipv4() rejects STUN responses
     # that report a non-globally-routable address (private RFC 1918,
     # CGN, loopback, link-local, multicast, unspecified, reserved).
     # Catches a hijacked or misconfigured STUN server feeding us an
@@ -228,9 +228,9 @@ def load_global_config(path: Path) -> GlobalConfig:
     enrollment_enabled = cp.getboolean(
         "Enrollment", "Enabled", fallback=False)
     provision_script = cp.get(
-        "Enrollment", "ProvisionScript", fallback="").strip or None
+        "Enrollment", "ProvisionScript", fallback="").strip() or None
     state_dir_str = cp.get(
-        "Enrollment", "StateDir", fallback="/var/lib/wireguardrtc").strip
+        "Enrollment", "StateDir", fallback="/var/lib/wireguardrtc").strip()
     try:
         max_pending = cp.getint("Enrollment", "MaxPendingTokens", fallback=32)
     except ValueError:
@@ -252,11 +252,11 @@ def load_global_config(path: Path) -> GlobalConfig:
 
     advertise_raw = cp.get("Global", "AdvertiseInterfaces", fallback="")
     advertise_interfaces = [
-        s.strip for s in advertise_raw.split(",") if s.strip
+        s.strip() for s in advertise_raw.split(",") if s.strip()
     ]
     suppress_raw = cp.get("Global", "SuppressInterfaces", fallback="")
     suppress_interfaces = [
-        s.strip for s in suppress_raw.split(",") if s.strip
+        s.strip() for s in suppress_raw.split(",") if s.strip()
     ]
 
     return GlobalConfig(
@@ -354,7 +354,7 @@ def load_peer_configs(directory: Path,
 
 def _merge_peer_dir(into: dict, directory: Path, override: bool) -> dict:
     for path in sorted(directory.glob("*.conf")):
-        cp = configparser.ConfigParser
+        cp = configparser.ConfigParser()
         cp.optionxform = str
         if not cp.read(path):
             logging.warning("could not read %s", path)
@@ -363,11 +363,11 @@ def _merge_peer_dir(into: dict, directory: Path, override: bool) -> dict:
             logging.warning("%s: no [Peer] section, skipping", path)
             continue
         sec = cp["Peer"]
-        pubkey = sec.get("PublicKey", "").strip
+        pubkey = sec.get("PublicKey", "").strip()
         if not pubkey:
             logging.warning("%s: no PublicKey in [Peer], skipping", path)
             continue
-        mode_str = sec.get("Mode", "passive").striplower
+        mode_str = sec.get("Mode", "passive").strip().lower()
         try:
             mode = Mode(mode_str)
         except ValueError:
@@ -441,7 +441,7 @@ def wg_set(*args) -> bool:
     )
     if res.returncode != 0:
         logging.warning("wg set %s failed: %s",
-                        " ".join(args), res.stderr.strip)
+                        " ".join(args), res.stderr.strip())
         return False
     return True
 
@@ -481,7 +481,7 @@ async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
         port = int(port_s)
     except ValueError:
         return None
-    loop = asyncio.get_running_loop
+    loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(host, None, family=socket.AF_INET,
                                        type=socket.SOCK_DGRAM)
@@ -499,9 +499,9 @@ async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
     sock.bind(("0.0.0.0", 0))
     try:
         sock.sendto(request, (server_ip, port))
-        deadline = loop.time + timeout
-        while loop.time < deadline:
-            remaining = deadline - loop.time
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            remaining = deadline - loop.time()
             try:
                 data = await asyncio.wait_for(loop.sock_recv(sock, 2048),
                                               timeout=remaining)
@@ -533,7 +533,7 @@ async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
                 offset += alen + ((4 - (alen % 4)) % 4)
         return None
     finally:
-        sock.close
+        sock.close()
 
 
 def _stun_response_passes_strict(server, ext_ip) -> bool:
@@ -796,7 +796,7 @@ def _enumerate_iface_addrs_v4_ioctl() -> list:
     SIOCGIFADDR = 0x8915
     addrs: list = []
     try:
-        ifaces = socket.if_nameindex
+        ifaces = socket.if_nameindex()
     except OSError:
         return []
     sock = None
@@ -820,7 +820,7 @@ def _enumerate_iface_addrs_v4_ioctl() -> list:
     finally:
         if sock is not None:
             try:
-                sock.close
+                sock.close()
             except OSError:
                 pass
     return addrs
@@ -847,16 +847,16 @@ async def _enumerate_iface_addrs_v4() -> list:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        out_b, err_b = await proc.communicate
+        out_b, err_b = await proc.communicate()
         rc = proc.returncode
         out_str = out_b.decode("utf-8", errors="replace")
-        err_str = err_b.decode("utf-8", errors="replace").strip
+        err_str = err_b.decode("utf-8", errors="replace").strip()
     except (FileNotFoundError, OSError):
-        _warn_iproute2_missing_once
+        _warn_iproute2_missing_once()
     addrs: list = []
-    for line in out_str.splitlines:
+    for line in out_str.splitlines():
         # Format: "<idx>: <iface> inet <ip>/<prefix> ... scope <scope> ..."
-        toks = line.split
+        toks = line.split()
         try:
             i_inet = toks.index("inet")
             iface = toks[1]
@@ -889,7 +889,7 @@ def _default_route_iface_v4_proc() -> Optional[str]:
     try:
         with open("/proc/net/route", "r") as f:
             for line in f:
-                cols = line.split
+                cols = line.split()
                 if len(cols) < 8:
                     continue
                 if cols[0] == "Iface":
@@ -913,14 +913,14 @@ async def _default_route_iface_v4() -> Optional[str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        out, _ = await proc.communicate
+        out, _ = await proc.communicate()
     except (FileNotFoundError, OSError):
         # Fall back to /proc/net/route — works in any Linux container,
         # iproute2 not required.
-        _warn_iproute2_missing_once
-        return _default_route_iface_v4_proc
-    for line in out.decode("utf-8", errors="replace").splitlines:
-        toks = line.split
+        _warn_iproute2_missing_once()
+        return _default_route_iface_v4_proc()
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        toks = line.split()
         try:
             return toks[toks.index("dev") + 1]
         except (ValueError, IndexError):
@@ -1155,7 +1155,7 @@ def decrypt_envelope(key: bytes, blob_b64: str) -> Optional[dict]:
     ts = msg.get("ts")
     if not isinstance(ts, int):
         return None
-    if abs(time.time - ts) > PROTOCOL_FRESHNESS_WINDOW:
+    if abs(time.time() - ts) > PROTOCOL_FRESHNESS_WINDOW:
         return None
     # Normalise: every plaintext now carries `candidates` (list).
     # Reject anything else.
@@ -1274,7 +1274,7 @@ def build_enroll_envelope(dst_routing_id: str, kind: str,
         "type": "OFFER",
         "dst": dst_routing_id,
         "payload": {
-            "sdp": {"sdp": build_peerjs_sdp, "type": "offer"},
+            "sdp": {"sdp": build_peerjs_sdp(), "type": "offer"},
             "type": "data",
             "connectionId": conn_id,
             "label": conn_id,
@@ -1343,7 +1343,7 @@ def write_provision_permit(token: bytes, name_hint: str,
     permit = {
         "name_hint": name_hint,
         "expires_at": int(expires_at),
-        "created_at": int(time.time),
+        "created_at": int(time.time()),
     }
     try:
         fd = os.open(permit_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1407,7 +1407,7 @@ def run_provision_script(script_path: str, iface: str, name: str,
     if not script_path:
         return False, "ProvisionScript not configured"
     script = Path(script_path)
-    if not script.is_file or not os.access(script_path, os.X_OK):
+    if not script.is_file() or not os.access(script_path, os.X_OK):
         return False, f"ProvisionScript {script_path} is not an executable file"
     if not iface or any(c in iface for c in "\x00/"):
         return False, f"refusing bad iface name: {iface!r}"
@@ -1445,7 +1445,7 @@ def run_provision_script(script_path: str, iface: str, name: str,
         return False, f"failed to invoke ProvisionScript: {e}"
     if res.returncode != 0:
         # Truncate stderr defensively for log output.
-        err = (res.stderr or res.stdout or "").strip
+        err = (res.stderr or res.stdout or "").strip()
         if len(err) > 200:
             err = err[:200] + "..."
         return False, (f"ProvisionScript exited {res.returncode}"
@@ -1459,10 +1459,10 @@ def run_provision_script(script_path: str, iface: str, name: str,
 
 
 def routing_id(pubkey_b64: str, salt: bytes) -> str:
-    h = hashlib.sha256
+    h = hashlib.sha256()
     h.update(pubkey_b64.encode("utf-8"))
     h.update(salt)
-    return h.hexdigest
+    return h.hexdigest()
 
 
 def build_peerjs_sdp() -> str:
@@ -1499,7 +1499,7 @@ def build_offer_envelope(dst_routing_id: str, blob_b64: str) -> dict:
         "type": "OFFER",
         "dst": dst_routing_id,
         "payload": {
-            "sdp": {"sdp": build_peerjs_sdp, "type": "offer"},
+            "sdp": {"sdp": build_peerjs_sdp(), "type": "offer"},
             "type": "data",
             "connectionId": conn_id,
             "label": conn_id,
@@ -1547,9 +1547,9 @@ class PeerJSClient:
         self.on_incoming = on_incoming
         self.on_open = on_open  # called with no args each time session opens
         self.ws = None
-        self._send_lock = asyncio.Lock
-        self._stopped = asyncio.Event
-        self._connected = asyncio.Event
+        self._send_lock = asyncio.Lock()
+        self._stopped = asyncio.Event()
+        self._connected = asyncio.Event()
 
     def _uri(self) -> str:
         sep = "&" if "?" in self.server else "?"
@@ -1558,15 +1558,15 @@ class PeerJSClient:
                 f"&token={token}&version=1.5.2")
 
     async def stop(self):
-        self._stopped.set
+        self._stopped.set()
         if self.ws is not None:
             try:
-                await self.ws.close
+                await self.ws.close()
             except Exception:
                 pass
 
     async def send(self, envelope: dict) -> bool:
-        if self.ws is None or not self._connected.is_set:
+        if self.ws is None or not self._connected.is_set():
             return False
         async with self._send_lock:
             try:
@@ -1579,15 +1579,15 @@ class PeerJSClient:
 
     async def run(self):
         backoff = 5.0
-        while not self._stopped.is_set:
+        while not self._stopped.is_set():
             session_start = None
             try:
-                async with websockets.connect(self._uri) as ws:
+                async with websockets.connect(self._uri()) as ws:
                     self.ws = ws
                     LOG.event("peerjs", "conn", "connecting",
                               f"connected to {self.server}")
                     # First server message should be OPEN.
-                    raw = await asyncio.wait_for(ws.recv, timeout=10.0)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
                     msg = json.loads(raw)
                     if msg.get("type") != "OPEN":
                         LOG.event("peerjs", "conn", "no-open",
@@ -1603,16 +1603,16 @@ class PeerJSClient:
                     # this, a broker that quick-closes after sending
                     # OPEN keeps backoff pinned at 5s indefinitely,
                     # producing a tight reconnect storm.
-                    session_start = time.monotonic
-                    self._connected.set
+                    session_start = time.monotonic()
+                    self._connected.set()
                     LOG.event("peerjs", "conn", "open", "PeerJS session OPEN")
                     if self.on_open is not None:
-                        asyncio.create_task(self.on_open)
+                        asyncio.create_task(self.on_open())
 
-                    hb_task = asyncio.create_task(self._heartbeat_loop)
+                    hb_task = asyncio.create_task(self._heartbeat_loop())
                     try:
-                        while not self._stopped.is_set:
-                            raw = await ws.recv
+                        while not self._stopped.is_set():
+                            raw = await ws.recv()
                             try:
                                 msg = json.loads(raw)
                             except json.JSONDecodeError:
@@ -1626,7 +1626,7 @@ class PeerJSClient:
                                     logging.exception(
                                         "on_incoming raised: %r", e)
                     finally:
-                        hb_task.cancel
+                        hb_task.cancel()
                         try:
                             await hb_task
                         except (asyncio.CancelledError, Exception):
@@ -1639,8 +1639,8 @@ class PeerJSClient:
                           f"PeerJS error: {e!r}", level=logging.WARNING)
             finally:
                 self.ws = None
-                self._connected.clear
-            if self._stopped.is_set:
+                self._connected.clear()
+            if self._stopped.is_set():
                 return
             # CR-D9: reset backoff iff the session was alive long
             # enough to count as "stable".  A broker quick-close
@@ -1656,7 +1656,7 @@ class PeerJSClient:
             backoff = min(backoff * 2, SIGNALING_BACKOFF)
 
     async def _heartbeat_loop(self):
-        while not self._stopped.is_set:
+        while not self._stopped.is_set():
             await asyncio.sleep(PEERJS_HEARTBEAT)
             if self.ws is None:
                 return
@@ -1716,7 +1716,7 @@ def raw_inject(src_port, dst_ip, dst_port):
         logging.warning("raw-inject failed: %r", e)
         return False
     finally:
-        s.close
+        s.close()
     return True
 
 
@@ -1745,11 +1745,11 @@ def filter_candidates_for_peer(candidates: list, allowed_ips_str: str) -> list:
     """
     if not candidates:
         return []
-    if not allowed_ips_str or allowed_ips_str.strip == "(none)":
+    if not allowed_ips_str or allowed_ips_str.strip() == "(none)":
         return list(candidates)
     nets: list = []
-    for token in allowed_ips_str.replace(",", " ").split:
-        token = token.strip
+    for token in allowed_ips_str.replace(",", " ").split():
+        token = token.strip()
         if not token:
             continue
         try:
@@ -1784,12 +1784,12 @@ def pick_wake_target(allowed_ips_str: str) -> Optional[str]:
                      and 192.0.2.1 won't be confused with real local hosts.
     For IPv6-only allowed-ips with no v4 entry: None (no v4 wake possible).
     """
-    if not allowed_ips_str or allowed_ips_str.strip == "(none)":
+    if not allowed_ips_str or allowed_ips_str.strip() == "(none)":
         return None
     has_catchall_v4 = False
     v4_host = None
     v4_net = None
-    for token in allowed_ips_str.replace(",", " ").split:
+    for token in allowed_ips_str.replace(",", " ").split():
         try:
             net = ipaddress.ip_network(token, strict=False)
         except ValueError:
@@ -1807,7 +1807,7 @@ def pick_wake_target(allowed_ips_str: str) -> Optional[str]:
     if v4_host is not None:
         return str(v4_host)
     if v4_net is not None:
-        hosts = list(v4_net.hosts)
+        hosts = list(v4_net.hosts())
         if hosts:
             return str(hosts[0])
         return str(v4_net.network_address)
@@ -1841,7 +1841,7 @@ def wake_via_iface(iface: str, target_ip: str):
             # outbound, which is enough to trigger WG handshake initiation.
             pass
     finally:
-        s.close
+        s.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1850,7 +1850,7 @@ def wake_via_iface(iface: str, target_ip: str):
 
 
 async def resolve_v4(host: str) -> Optional[str]:
-    loop = asyncio.get_running_loop
+    loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(
             host, None, family=socket.AF_INET, type=socket.SOCK_DGRAM)
@@ -1883,12 +1883,12 @@ class PeerRuntime:
 def parse_handshake_age(handshakes_table: dict, pubkey: str) -> float:
     raw = handshakes_table.get(pubkey, "0")
     try:
-        ts = int(raw.strip)
+        ts = int(raw.strip())
     except ValueError:
         return float("inf")
     if ts == 0:
         return float("inf")
-    return time.time - ts
+    return time.time() - ts
 
 
 # ---------------------------------------------------------------------------
@@ -1928,7 +1928,7 @@ class PendingTokensStore:
         """Read the state file.  Returns the default schema if missing."""
         try:
             with open(self.path, "rb") as f:
-                return json.loads(f.readdecode("utf-8") or "{}")
+                return json.loads(f.read().decode("utf-8") or "{}")
         except FileNotFoundError:
             return {"version": 1, "tokens": [], "recent_enrollments": []}
         except json.JSONDecodeError as e:
@@ -1987,7 +1987,7 @@ class PendingTokensStore:
         os.chmod(self.state_dir, 0o700)
         # Lock file is the state file itself.  If it doesn't exist yet,
         # create it empty so flock has something to grab.
-        if not self.path.exists:
+        if not self.path.exists():
             fd = os.open(str(self.path),
                          os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             self._chown_to_match_dir(fd)
@@ -2009,8 +2009,8 @@ class PendingTokensStore:
             self.state: Optional[dict] = None
 
         def __enter__(self):
-            self._fd = self._store._open_locked
-            self.state = self._store._load_locked
+            self._fd = self._store._open_locked()
+            self.state = self._store._load_locked()
             return self
 
         def commit(self):
@@ -2047,8 +2047,8 @@ class PendingTokensStore:
         after purging expired entries and any same-name supersede.
         """
         token = secrets.token_bytes(TOKEN_BYTES)
-        now = time.time
-        with self._txn as txn:
+        now = time.time()
+        with self._txn() as txn:
             # Purge expired tokens and consumed-then-cached entries.
             txn.state.setdefault("tokens", [])
             txn.state.setdefault("recent_enrollments", [])
@@ -2076,7 +2076,7 @@ class PendingTokensStore:
                     f"pending (max {max_pending}).  Wait for them to be "
                     f"used or expire, or raise [Enrollment] MaxPendingTokens.")
             txn.state["tokens"].append({
-                "token_b64":   base64.b64encode(token).decode,
+                "token_b64":   base64.b64encode(token).decode(),
                 "name_hint":   name_hint,
                 "iface":       iface,
                 "created_at":  int(now),
@@ -2085,7 +2085,7 @@ class PendingTokensStore:
                 "used_at":     None,
                 "used_by":     None,
             })
-            txn.commit
+            txn.commit()
         return token, superseded_meta
 
     def unmint(self, token: bytes) -> bool:
@@ -2095,8 +2095,8 @@ class PendingTokensStore:
         active-tokens list iff it's there and not yet consumed.
         Returns True if removed, False if not found / already used.
         CR-D1 of the candidate-negotiation v2 review."""
-        token_b64 = base64.b64encode(token).decode
-        with self._txn as txn:
+        token_b64 = base64.b64encode(token).decode()
+        with self._txn() as txn:
             tokens = txn.state.setdefault("tokens", [])
             removed = False
             kept = []
@@ -2107,7 +2107,7 @@ class PendingTokensStore:
                 kept.append(t)
             if removed:
                 txn.state["tokens"] = kept
-                txn.commit
+                txn.commit()
             return removed
 
     def try_claim(self, token: bytes,
@@ -2116,12 +2116,12 @@ class PendingTokensStore:
         dict on success or None if not found / expired / already used.
 
         The caller then runs ProvisionScript and, on success, calls
-        cache_response to persist the encrypted ENROLL_OK for retry
+        cache_response() to persist the encrypted ENROLL_OK for retry
         safety.
         """
-        token_b64 = base64.b64encode(token).decode
-        now = time.time
-        with self._txn as txn:
+        token_b64 = base64.b64encode(token).decode()
+        now = time.time()
+        with self._txn() as txn:
             for entry in txn.state.get("tokens", []):
                 if entry.get("token_b64") != token_b64:
                     continue
@@ -2132,7 +2132,7 @@ class PendingTokensStore:
                 entry["used"] = True
                 entry["used_at"] = int(now)
                 entry["used_by"] = client_pub_b64
-                txn.commit
+                txn.commit()
                 return dict(entry)  # defensive copy
             return None
 
@@ -2140,9 +2140,9 @@ class PendingTokensStore:
         """Look up a token without claiming it.  Returns metadata dict
         for unused/unexpired tokens, dict with used=True for already-
         consumed ones, or None if unknown / expired-and-purged."""
-        token_b64 = base64.b64encode(token).decode
-        now = time.time
-        with self._txn as txn:
+        token_b64 = base64.b64encode(token).decode()
+        now = time.time()
+        with self._txn() as txn:
             for entry in txn.state.get("tokens", []):
                 if entry.get("token_b64") != token_b64:
                     continue
@@ -2158,8 +2158,8 @@ class PendingTokensStore:
         Only the holder of the corresponding private key can decrypt it,
         so caching is safe.  Used to make legitimate retries (lost
         response over a flaky network) idempotent."""
-        now = time.time
-        with self._txn as txn:
+        now = time.time()
+        with self._txn() as txn:
             cache = txn.state.setdefault("recent_enrollments", [])
             # Remove any earlier entry for this client.
             cache[:] = [e for e in cache
@@ -2170,12 +2170,12 @@ class PendingTokensStore:
                 "envelope":       envelope,
                 "expires_at":     int(now + ttl),
             })
-            txn.commit
+            txn.commit()
 
     def find_recent(self, client_pub_b64: str) -> Optional[dict]:
         """Return a previously cached envelope for this client_pub, or None."""
-        now = time.time
-        with self._txn as txn:
+        now = time.time()
+        with self._txn() as txn:
             for e in txn.state.get("recent_enrollments", []):
                 if (e.get("client_pub_b64") == client_pub_b64
                         and e.get("expires_at", 0) > now):
@@ -2184,15 +2184,15 @@ class PendingTokensStore:
 
     def list_tokens(self) -> list:
         """Return a copy of all tokens for diagnostics (--show-config etc.)."""
-        with self._txn as txn:
+        with self._txn() as txn:
             return [dict(t) for t in txn.state.get("tokens", [])]
 
     def purge_expired(self) -> int:
         """Drop expired tokens and stale cached responses.  Returns
         the number of removed entries (for logging)."""
-        now = time.time
+        now = time.time()
         removed = 0
-        with self._txn as txn:
+        with self._txn() as txn:
             tokens_before = len(txn.state.get("tokens", []))
             txn.state["tokens"] = [
                 t for t in txn.state.get("tokens", [])
@@ -2207,7 +2207,7 @@ class PendingTokensStore:
             removed = ((tokens_before - len(txn.state["tokens"]))
                        + (cache_before - len(txn.state["recent_enrollments"])))
             if removed > 0:
-                txn.commit
+                txn.commit()
         return removed
 
 
@@ -2237,7 +2237,7 @@ class KeyOracleClient:
         self.sock_path = sock_path
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
-        self._lock = asyncio.Lock
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> bool:
         try:
@@ -2255,8 +2255,8 @@ class KeyOracleClient:
             raise IOError("oracle not connected")
         async with self._lock:
             self.writer.write((json.dumps(req) + "\n").encode("utf-8"))
-            await self.writer.drain
-            line = await self.reader.readline
+            await self.writer.drain()
+            line = await self.reader.readline()
         if not line:
             raise IOError("oracle closed connection")
         try:
@@ -2344,7 +2344,7 @@ class RawHelperClient:
         self.sock_path = sock_path
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
-        self._lock = asyncio.Lock
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> bool:
         try:
@@ -2362,8 +2362,8 @@ class RawHelperClient:
             raise IOError("raw-helper not connected")
         async with self._lock:
             self.writer.write((json.dumps(req) + "\n").encode("utf-8"))
-            await self.writer.drain
-            line = await self.reader.readline
+            await self.writer.drain()
+            line = await self.reader.readline()
         if not line:
             raise IOError("raw-helper closed connection")
         try:
@@ -2419,7 +2419,7 @@ class Daemon:
             if self.global_config.auto_active_enrollment else None,
         )
         self.peerjs: Optional[PeerJSClient] = None
-        self.shutdown_event = asyncio.Event
+        self.shutdown_event = asyncio.Event()
         # Per-iface state.  Holds (pub_b64, listen_port) — NOT the
         # private key.  All operations that would need the priv go
         # through self.oracle (KeyOracleClient), which is the only
@@ -2434,13 +2434,13 @@ class Daemon:
     # --- self-test: verify configured peers exist somewhere in WG ---
 
     async def validate_peer_configs(self):
-        live_peers = set
-        for iface in list_interfaces:
+        live_peers = set()
+        for iface in list_interfaces():
             allowed = await self.oracle.iface_table(iface, "allowed-ips")
-            for pk in allowed.keys:
+            for pk in allowed.keys():
                 live_peers.add(pk)
         ok = True
-        for pk, cfg in self.peer_configs.items:
+        for pk, cfg in self.peer_configs.items():
             if pk not in live_peers:
                 logging.warning(
                     "%s: PublicKey %s not present on any WireGuard interface "
@@ -2466,7 +2466,7 @@ class Daemon:
         """
         new_keys = {}
         new_peers = {}
-        for iface in list_interfaces:
+        for iface in list_interfaces():
             pub = await self.oracle.iface_field(iface, "public-key")
             port_s = await self.oracle.iface_field(iface, "listen-port")
             if not pub or pub == "(none)" or not port_s:
@@ -2489,7 +2489,7 @@ class Daemon:
             # Use allowed-ips (not latest-handshakes) so peers with no
             # handshake yet are still discovered and signalled.
             allowed = await self.oracle.iface_table(iface, "allowed-ips")
-            new_peers[iface] = set(allowed.keys)
+            new_peers[iface] = set(allowed.keys())
         self._iface_keys = new_keys
         self._iface_peers = new_peers
 
@@ -2508,15 +2508,15 @@ class Daemon:
         if not self._iface_keys:
             return None
         scoreboard = {iface: 0 for iface in self._iface_keys}
-        for pk, cfg in self.peer_configs.items:
+        for pk, cfg in self.peer_configs.items():
             if cfg.mode == Mode.IGNORE or cfg.mode == Mode.DNS_ROAM:
                 continue
-            for iface, peers in self._iface_peers.items:
+            for iface, peers in self._iface_peers.items():
                 if pk in peers:
                     scoreboard[iface] += 1
                     break
         ranked = [iface for iface, n in
-                  sorted(scoreboard.items, key=lambda kv: (-kv[1], kv[0]))
+                  sorted(scoreboard.items(), key=lambda kv: (-kv[1], kv[0]))
                   if n > 0]
         if not ranked:
             # Fallback: enrollment-only mode has no configured peers yet.
@@ -2524,15 +2524,15 @@ class Daemon:
             # interface so we still open a PeerJS slot for incoming
             # ENROLL requests.
             if self.global_config.enrollment_enabled:
-                return sorted(self._iface_keys.keys)[0]
+                return sorted(self._iface_keys.keys())[0]
             return None
         chosen = ranked[0]
         if len(ranked) > 1:
             unreachable = []
-            for pk, cfg in self.peer_configs.items:
+            for pk, cfg in self.peer_configs.items():
                 if cfg.mode in (Mode.IGNORE, Mode.DNS_ROAM):
                     continue
-                if pk not in self._iface_peers.get(chosen, set):
+                if pk not in self._iface_peers.get(chosen, set()):
                     unreachable.append(cfg.label)
             if unreachable:
                 logging.warning(
@@ -2560,7 +2560,7 @@ class Daemon:
         Absence of `kind` means a signalling OFFER (backward compatibility).
         """
         # Universal self-loop guard.
-        our_id = self.our_routing_id
+        our_id = self.our_routing_id()
         if our_id and src_id == our_id:
             LOG.event("peerjs", "self-loop", src_id,
                       "received message with our own routing ID — possible "
@@ -2609,8 +2609,8 @@ class Daemon:
         if iface not in self._iface_keys:
             return
         _pub, listen_port = self._iface_keys[iface]
-        peers_on_iface = self._iface_peers.get(iface, set)
-        for pk, cfg in self.peer_configs.items:
+        peers_on_iface = self._iface_peers.get(iface, set())
+        for pk, cfg in self.peer_configs.items():
             if cfg.mode == Mode.IGNORE:
                 continue
             if pk not in peers_on_iface:
@@ -2675,7 +2675,7 @@ class Daemon:
             # Responsive OFFER: advertise our own endpoint so the peer can
             # punch their NAT toward us. Applies to all non-IGNORE modes.
             # Guards prevent OFFER loops and broker overuse.
-            now = time.time
+            now = time.time()
             runtime = self._peer_runtime(pk, iface, cfg)
 
             # If the tunnel is already up, the peer's hole-punch worked
@@ -2798,8 +2798,8 @@ class Daemon:
         # We DO try used tokens, because a client racing for an
         # already-consumed token deserves an authenticated TOKEN_USED
         # response — the user-noticing property
-        tokens = store.list_tokens
-        now = time.time
+        tokens = store.list_tokens()
+        now = time.time()
         matched_token: Optional[bytes] = None
         matched_key:   Optional[bytes] = None
         matched_plaintext: Optional[dict] = None
@@ -2864,7 +2864,7 @@ class Daemon:
             return
 
         # Atomic claim.  Returns None if someone else claimed the token
-        # between list_tokens and try_claim (a different in-flight ENROLL
+        # between list_tokens() and try_claim() (a different in-flight ENROLL
         # or a parallel CLI op).  In that race-loss case, fall through to the
         # same TOKEN_USED response.
         claim = store.try_claim(matched_token, client_pub_b64)
@@ -2902,7 +2902,7 @@ class Daemon:
             return
 
         # Read back allocated WG state.
-        await self.refresh_iface_state
+        await self.refresh_iface_state()
         allowed = (await self.oracle.iface_table(iface, "allowed-ips")
                    ).get(client_pub_b64, "")
         if not allowed:
@@ -2925,7 +2925,7 @@ class Daemon:
         # allowed-ips is the address; if there are wider routes we list
         # them under "allowed_ips" for the client to add to its config.
         addr = ""
-        for tok in allowed.replace(",", " ").split:
+        for tok in allowed.replace(",", " ").split():
             try:
                 net = ipaddress.ip_network(tok, strict=False)
             except ValueError:
@@ -2963,7 +2963,7 @@ class Daemon:
         ok_plaintext = {
             "v":          PROTOCOL_VERSION,
             "ts":         int(now),
-            "address":    addr or allowed.split(",")[0].strip,
+            "address":    addr or allowed.split(",")[0].strip(),
             "allowed_ips": "0.0.0.0/0, ::/0",  # client's view
             "keepalive":  25,
             "server_pubkey":         server_pub_b64,
@@ -2981,7 +2981,7 @@ class Daemon:
             src_id, "enroll_ok", server_pub_b64, ok_blob)
 
         # Cache before sending.  Cache is the source of truth for retry safety;
-        # if send fails after this, the next retry returns the same envelope.
+        # if send() fails after this, the next retry returns the same envelope.
         store.cache_response(client_pub_b64, envelope)
         await self.peerjs.send(envelope)
         LOG.event(client_pub_b64[:12], "enroll-ok", addr,
@@ -3029,7 +3029,7 @@ class Daemon:
         while True:
             await asyncio.sleep(REINJECT_INTERVAL)
             endpoints = await self.oracle.iface_table(iface, "endpoints")
-            ep = endpoints.get(pk, "").strip
+            ep = endpoints.get(pk, "").strip()
             if not ep or ep == "(none)":
                 continue
             handshakes = await self.oracle.iface_table(iface, "latest-handshakes")
@@ -3056,7 +3056,7 @@ class Daemon:
 
     def _start_reinjector(self, pk: str, iface: str, cfg: PeerConfig):
         runtime = self._peer_runtime(pk, iface, cfg)
-        if runtime.reinjector_task is None or runtime.reinjector_task.done:
+        if runtime.reinjector_task is None or runtime.reinjector_task.done():
             runtime.reinjector_task = asyncio.create_task(
                 self._reinjector_loop(pk, iface, cfg))
 
@@ -3106,7 +3106,7 @@ class Daemon:
         ok = await self.peerjs.send(envelope)
         if ok:
             advertised = ",".join(f"{c['ip']}:{c['port']}" for c in candidates)
-            LOG.event(cfg.label, "offer-sent", str(int(time.time)),
+            LOG.event(cfg.label, "offer-sent", str(int(time.time())),
                       f"sent OFFER to {cfg.label} (broker id ...{dst_id[-8:]})"
                       f" advertising {advertised}")
         else:
@@ -3118,11 +3118,11 @@ class Daemon:
         """Signal all ACTIVE peers that are currently DOWN. Called when the
         PeerJS session opens so we don't wait a full SIGNALING_BACKOFF cycle
         after a reconnect or startup race."""
-        await self.refresh_iface_state
-        for iface, (pub, listen_port) in self._iface_keys.items:
+        await self.refresh_iface_state()
+        for iface, (pub, listen_port) in self._iface_keys.items():
             handshakes = await self.oracle.iface_table(iface, "latest-handshakes")
-            peers_here = self._iface_peers.get(iface, set)
-            for pk, cfg in self.peer_configs.items:
+            peers_here = self._iface_peers.get(iface, set())
+            for pk, cfg in self.peer_configs.items():
                 if cfg.mode != Mode.ACTIVE:
                     continue
                 if pk not in peers_here:
@@ -3131,7 +3131,7 @@ class Daemon:
                 if age < HANDSHAKE_DEAD_THRESHOLD:
                     continue
                 runtime = self._peer_runtime(pk, iface, cfg)
-                runtime.last_signal_attempt = time.time
+                runtime.last_signal_attempt = time.time()
                 asyncio.create_task(
                     self.signal_peer(iface, cfg, listen_port))
 
@@ -3139,7 +3139,7 @@ class Daemon:
 
     async def repair_dns(self, iface: str, listen_port: int):
         endpoints = await self.oracle.iface_table(iface, "endpoints")
-        for pk, cfg in self.peer_configs.items:
+        for pk, cfg in self.peer_configs.items():
             if cfg.mode != Mode.DNS_ROAM or not cfg.dns_host:
                 continue
             host_port = cfg.dns_host
@@ -3170,11 +3170,11 @@ class Daemon:
     # --- per-poll work ---
 
     async def poll_once(self):
-        await self.refresh_iface_state
+        await self.refresh_iface_state()
         # Drop stale enrollment state on every poll cycle.  This is the
         # single mechanism that prevents pending-tokens.json from
         # growing unbounded across "admin minted N tokens that nobody
-        # ever used" episodes.  purge_expired is cheap (in-memory
+        # ever used" episodes.  purge_expired() is cheap (in-memory
         # filter + atomic write) and only writes when something
         # actually changed.
         if self.global_config.enrollment_enabled:
@@ -3183,11 +3183,11 @@ class Daemon:
             if removed:
                 LOG.event("enroll", "purged", str(removed),
                           f"purged {removed} expired token/cache entries")
-        for iface, (pub, listen_port) in self._iface_keys.items:
+        for iface, (pub, listen_port) in self._iface_keys.items():
             await self.repair_dns(iface, listen_port)
             handshakes = await self.oracle.iface_table(iface, "latest-handshakes")
-            peers_here = self._iface_peers.get(iface, set)
-            for pk, cfg in self.peer_configs.items:
+            peers_here = self._iface_peers.get(iface, set())
+            for pk, cfg in self.peer_configs.items():
                 if cfg.mode != Mode.ACTIVE:
                     continue
                 if pk not in peers_here:
@@ -3208,13 +3208,13 @@ class Daemon:
                     runtime.offer_exchange_window_start = 0.0
                     runtime.offer_quarantine_until = 0.0
                     if (runtime.reinjector_task is not None
-                            and not runtime.reinjector_task.done):
-                        runtime.reinjector_task.cancel
+                            and not runtime.reinjector_task.done()):
+                        runtime.reinjector_task.cancel()
                         runtime.reinjector_task = None
                     continue
-                if (time.time - runtime.last_signal_attempt
+                if (time.time() - runtime.last_signal_attempt
                         > runtime.signal_backoff):
-                    runtime.last_signal_attempt = time.time
+                    runtime.last_signal_attempt = time.time()
                     runtime.signal_backoff = min(
                         runtime.signal_backoff * 2, SIGNALING_BACKOFF_MAX)
                     asyncio.create_task(
@@ -3236,7 +3236,7 @@ class Daemon:
             "WIREGUARDRTC_KEY_ORACLE_SOCKET", KEY_ORACLE_DEFAULT_SOCKET)
         self.oracle = KeyOracleClient(oracle_sock)
         for attempt in range(1, 31):
-            if await self.oracle.connect:
+            if await self.oracle.connect():
                 logging.info("connected to key oracle at %s", oracle_sock)
                 break
             # The oracle is started by its own systemd unit; wait a bit
@@ -3250,13 +3250,13 @@ class Daemon:
             sys.exit(2)
 
         # And to the raw-socket helper.  CAP_NET_RAW lives there now,
-        # not in our process; raw_inject and wake_via_iface go
+        # not in our process; raw_inject() and wake_via_iface() go
         # through the helper RPC.
         raw_sock = os.environ.get(
             "WIREGUARDRTC_RAW_HELPER_SOCKET", RAW_HELPER_DEFAULT_SOCKET)
         self.raw = RawHelperClient(raw_sock)
         for attempt in range(1, 31):
-            if await self.raw.connect:
+            if await self.raw.connect():
                 logging.info("connected to raw-socket helper at %s", raw_sock)
                 break
             await asyncio.sleep(min(attempt, 5))
@@ -3267,8 +3267,8 @@ class Daemon:
                 "Is wireguardrtc-raw-helper.service running?\n")
             sys.exit(2)
 
-        await self.refresh_iface_state
-        await self.validate_peer_configs
+        await self.refresh_iface_state()
+        await self.validate_peer_configs()
 
         # Boot-time cleanup of any stale enrollment state from the
         # previous instance.  Tokens whose `expires_at` is in the past
@@ -3290,8 +3290,8 @@ class Daemon:
             )
             sys.exit(2)
 
-        self._chosen_iface = self.select_listening_iface
-        our_id = self.our_routing_id
+        self._chosen_iface = self.select_listening_iface()
+        our_id = self.our_routing_id()
         if not our_id:
             if self.global_config.enrollment_enabled:
                 logging.warning(
@@ -3313,31 +3313,31 @@ class Daemon:
                 on_incoming=self.on_incoming,
                 on_open=self.signal_all_active_peers,
             )
-            peerjs_task = asyncio.create_task(self.peerjs.run)
+            peerjs_task = asyncio.create_task(self.peerjs.run())
 
         logging.info("daemon started (%d active, %d passive, %d dns-roam, "
                      "%d ignore peers configured)",
-                     sum(1 for c in self.peer_configs.values
+                     sum(1 for c in self.peer_configs.values()
                          if c.mode == Mode.ACTIVE),
-                     sum(1 for c in self.peer_configs.values
+                     sum(1 for c in self.peer_configs.values()
                          if c.mode == Mode.PASSIVE),
-                     sum(1 for c in self.peer_configs.values
+                     sum(1 for c in self.peer_configs.values()
                          if c.mode == Mode.DNS_ROAM),
-                     sum(1 for c in self.peer_configs.values
+                     sum(1 for c in self.peer_configs.values()
                          if c.mode == Mode.IGNORE))
 
         try:
-            while not self.shutdown_event.is_set:
+            while not self.shutdown_event.is_set():
                 try:
-                    await self.poll_once
+                    await self.poll_once()
                 except Exception as e:
                     logging.exception("poll error: %r", e)
                 # PeerJS skipped at startup because WireGuard interfaces weren't
                 # up yet (race with wg-quick).  Re-check on each poll so we open
                 # the connection as soon as the interfaces appear.
                 if self.peerjs is None:
-                    self._chosen_iface = self.select_listening_iface
-                    late_id = self.our_routing_id
+                    self._chosen_iface = self.select_listening_iface()
+                    late_id = self.our_routing_id()
                     if late_id:
                         logging.info(
                             "PeerJS broker id (this peer): ...%s  "
@@ -3350,17 +3350,17 @@ class Daemon:
                             on_incoming=self.on_incoming,
                             on_open=self.signal_all_active_peers,
                         )
-                        peerjs_task = asyncio.create_task(self.peerjs.run)
+                        peerjs_task = asyncio.create_task(self.peerjs.run())
                 try:
-                    await asyncio.wait_for(self.shutdown_event.wait,
+                    await asyncio.wait_for(self.shutdown_event.wait(),
                                            timeout=POLL_INTERVAL)
                 except asyncio.TimeoutError:
                     pass
         finally:
             if self.peerjs is not None:
-                await self.peerjs.stop
+                await self.peerjs.stop()
             if peerjs_task is not None:
-                peerjs_task.cancel
+                peerjs_task.cancel()
                 try:
                     await peerjs_task
                 except (asyncio.CancelledError, Exception):
@@ -3387,7 +3387,7 @@ def acquire_lock(lock_path: Path):
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
     except PermissionError:
-        if not lock_path.parent.exists:
+        if not lock_path.parent.exists():
             sys.stderr.write(
                 f"[FATAL] lock-file directory {lock_path.parent} does "
                 f"not exist and this process cannot create it "
@@ -3436,12 +3436,12 @@ def probe_capabilities():
 def _fmt_handshake_age(ts_str: str) -> str:
     """Convert a wg latest-handshakes timestamp string to a human-readable age."""
     try:
-        ts = int(ts_str.strip)
+        ts = int(ts_str.strip())
     except (ValueError, AttributeError):
         return "never"
     if ts == 0:
         return "never"
-    age = int(time.time) - ts
+    age = int(time.time()) - ts
     if age < 0:
         return "just now"
     if age < 120:
@@ -3456,12 +3456,12 @@ def cmd_show_config(args):
     gcfg = load_global_config(args.config)
     peer_cfgs = load_peer_configs(args.peers_dir)
 
-    salt_fp = hashlib.sha256(gcfg.salt).hexdigest[:16]
+    salt_fp = hashlib.sha256(gcfg.salt).hexdigest()[:16]
 
     iface_filter = getattr(args, "iface", None)
 
     # Gather kernel state for all (or one) WG interfaces.
-    all_ifaces = list_interfaces
+    all_ifaces = list_interfaces()
     if iface_filter:
         if iface_filter not in all_ifaces:
             print(f"ERROR: interface '{iface_filter}' not found by `wg show interfaces`")
@@ -3483,7 +3483,7 @@ def cmd_show_config(args):
         iface_info[iface] = (pub, port_s)
         aips = get_iface_table(iface, "allowed-ips")
         iface_allowedips[iface] = aips
-        iface_peers[iface] = set(aips.keys)
+        iface_peers[iface] = set(aips.keys())
         iface_endpoints[iface] = get_iface_table(iface, "endpoints")
         iface_handshakes[iface] = get_iface_table(iface, "latest-handshakes")
         iface_keepalive[iface] = get_iface_table(iface, "persistent-keepalive")
@@ -3498,24 +3498,24 @@ def cmd_show_config(args):
           "  (SHA-256 of Salt; must match on every peer)")
     if not iface_info:
         print("  WARNING: no WireGuard interfaces found")
-    for iface, (pub, port) in iface_info.items:
+    for iface, (pub, port) in iface_info.items():
         our_id = routing_id(pub, gcfg.salt)
-        print
+        print()
         print(f"  INTERFACE  {iface}")
         print(f"    public-key   {pub}")
         print(f"    listen-port  {port or '(not set)'}")
         print(f"    broker-id    {our_id}")
-        peers_here = iface_peers.get(iface, set)
+        peers_here = iface_peers.get(iface, set())
         if not peers_here:
             print(f"    (no WireGuard peers configured on {iface})")
             continue
         print(f"    WireGuard peers ({len(peers_here)}):")
         for peer_pk in sorted(peers_here):
             pid = routing_id(peer_pk, gcfg.salt)
-            ep = iface_endpoints.get(iface, {}).get(peer_pk, "(none)").strip
+            ep = iface_endpoints.get(iface, {}).get(peer_pk, "(none)").strip()
             hs = _fmt_handshake_age(iface_handshakes.get(iface, {}).get(peer_pk, "0"))
-            aip = iface_allowedips.get(iface, {}).get(peer_pk, "").strip
-            ka = iface_keepalive.get(iface, {}).get(peer_pk, "off").strip
+            aip = iface_allowedips.get(iface, {}).get(peer_pk, "").strip()
+            ka = iface_keepalive.get(iface, {}).get(peer_pk, "off").strip()
             if peer_pk in peer_cfgs:
                 cfg_label = peer_cfgs[peer_pk].label
                 cfg_mode = peer_cfgs[peer_pk].mode.value
@@ -3529,7 +3529,7 @@ def cmd_show_config(args):
             print(f"        last-handshake   {hs}")
             print(f"        keepalive        {ka}")
             print(f"        {cfg_tag}")
-    print
+    print()
 
     # ------------------------------------------------------------------ #
     # Section 2 — PEERS.D entries: cross-reference with kernel state
@@ -3539,15 +3539,15 @@ def cmd_show_config(args):
     print("=" * 72)
     if not peer_cfgs:
         print(f"  (no peer drop-ins found under {args.peers_dir})")
-    for pk, cfg in peer_cfgs.items:
-        found_on = sorted(i for i, ps in iface_peers.items if pk in ps)
+    for pk, cfg in peer_cfgs.items():
+        found_on = sorted(i for i, ps in iface_peers.items() if pk in ps)
         if iface_filter and iface_filter not in found_on:
             # In filtered mode only show peers relevant to that interface,
             # but still show entries that claim this interface but aren't found.
             pass  # included below via the warning block
         wg_status = f"on {', '.join(found_on)}" if found_on else "NOT FOUND IN KERNEL WG PEERS"
 
-        print
+        print()
         print(f"  PEER [{cfg.label}]  mode={cfg.mode.value}  kernel-status={wg_status}")
         print(f"    public-key  {pk}")
 
@@ -3560,17 +3560,17 @@ def cmd_show_config(args):
             peer_broker_id = routing_id(pk, gcfg.salt)
             print(f"    broker-id   {peer_broker_id}")
             if not found_on:
-                print
+                print()
                 print("    !!! PUBLIC KEY NOT FOUND AS A WG PEER ON THIS MACHINE.")
                 print("    !!! peers.d PublicKey must match a key in `wg show` output")
                 print("    !!! on THIS host — i.e. the REMOTE host's interface public key")
                 print("    !!! as seen by this machine, not the remote's peers.d key.")
-                all_peers = {p for ps in iface_peers.values for p in ps}
+                all_peers = {p for ps in iface_peers.values() for p in ps}
                 if all_peers:
-                    print
+                    print()
                     print("    All WireGuard peers on this machine:")
                     for candidate in sorted(all_peers):
-                        on = [i for i, ps in iface_peers.items if candidate in ps]
+                        on = [i for i, ps in iface_peers.items() if candidate in ps]
                         clabel = peer_cfgs[candidate].label if candidate in peer_cfgs else ""
                         csuffix = f"  [{clabel}]" if clabel else ""
                         cid = routing_id(candidate, gcfg.salt)
@@ -3581,14 +3581,14 @@ def cmd_show_config(args):
                 for iface in found_on:
                     pub_us, port_us = iface_info[iface]
                     our_broker_id = routing_id(pub_us, gcfg.salt)
-                    print
+                    print()
                     print(f"    Suggested peers.d drop-in on the remote host [{cfg.label}]"
                           f" for its side of {iface}:")
                     print(f"      [Peer]")
                     print(f"      PublicKey = {pub_us}  # this host's {iface} public-key")
                     print(f"      Mode = {suggested_mode}")
                     print(f"      # broker-id this host will use on {iface}: {our_broker_id}")
-        print
+        print()
 
 
 def _b64url_nopad(data: bytes) -> str:
@@ -3607,7 +3607,7 @@ def cmd_enroll_token(args):
         sys.exit(2)
 
     # Pick the WG interface whose pubkey we'll embed in the URI.
-    all_ifaces = list_interfaces
+    all_ifaces = list_interfaces()
     iface = args.iface
     if iface is None:
         if not all_ifaces:
@@ -3636,7 +3636,7 @@ def cmd_enroll_token(args):
         sys.exit(2)
 
     # Validate name hint.
-    name_hint = (args.enroll_token or "").strip
+    name_hint = (args.enroll_token or "").strip()
     if not name_hint:
         sys.stderr.write("[FATAL] empty NAME for --enroll-token.\n")
         sys.exit(2)
@@ -3699,7 +3699,7 @@ def cmd_enroll_token(args):
     salt_b64url = _b64url_nopad(gcfg.salt)
     pk_b64url = _b64url_nopad(server_pub_raw)
     token_b64url = _b64url_nopad(token)
-    expires_at = int(time.time + expires_in)
+    expires_at = int(time.time() + expires_in)
 
     # Drop a single-use permit file in the broker's trust directory
     # (mode 0700, root-only).  When the broker later receives a
@@ -3752,15 +3752,15 @@ def cmd_enroll_token(args):
     print(uri)
 
     # Render QR code if stdout is a TTY and qrencode is available.
-    if sys.stdout.isatty:
+    if sys.stdout.isatty():
         try:
             res = subprocess.run(
                 ["qrencode", "-t", "ansiutf8", "-o", "-", uri],
                 capture_output=True, text=True, timeout=5)
             if res.returncode == 0:
-                print
+                print()
                 sys.stdout.write(res.stdout)
-                print
+                print()
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
@@ -3794,7 +3794,7 @@ def main():
     ap.add_argument("--expires", metavar="SECONDS", type=int, default=None,
                     help=f"with --enroll-token: token validity window "
                          f"(default {int(TOKEN_DEFAULT_EXPIRY)}s, range 60..604800)")
-    args = ap.parse_args
+    args = ap.parse_args()
 
     if args.show_config:
         cmd_show_config(args)
@@ -3816,11 +3816,11 @@ def main():
     load_peer_configs(args.peers_dir)
 
     lock_fd = acquire_lock(args.lock_file)  # noqa: F841 — keep it open
-    probe_capabilities
+    probe_capabilities()
 
     daemon = Daemon(args)
 
-    loop = asyncio.new_event_loop
+    loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     def _shutdown(*_):
@@ -3831,10 +3831,10 @@ def main():
         loop.add_signal_handler(sig, _shutdown)
 
     try:
-        loop.run_until_complete(daemon.run)
+        loop.run_until_complete(daemon.run())
     finally:
-        loop.close
+        loop.close()
 
 
 if __name__ == "__main__":
-    main
+    main()
