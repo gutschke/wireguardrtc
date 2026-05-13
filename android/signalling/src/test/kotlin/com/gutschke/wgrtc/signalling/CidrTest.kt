@@ -198,4 +198,82 @@ class CidrTest {
             parseAllowedIps(cfg)
         )
     }
+
+    // ─── cidrsOverlap ─────────────────────────────────────────────────
+
+    @Test fun `cidrsOverlap empty lists return false`() {
+        assertFalse(cidrsOverlap(emptyList(), listOf("10.0.0.0/24")))
+        assertFalse(cidrsOverlap(listOf("10.0.0.0/24"), emptyList()))
+        assertFalse(cidrsOverlap(emptyList(), emptyList()))
+    }
+
+    @Test fun `cidrsOverlap identical CIDRs overlap`() {
+        assertTrue(cidrsOverlap(
+            listOf("10.0.0.0/24"), listOf("10.0.0.0/24")))
+    }
+
+    @Test fun `cidrsOverlap subnet contained in supernet`() {
+        assertTrue(cidrsOverlap(
+            listOf("10.0.5.0/24"), listOf("10.0.0.0/16")))
+        // Symmetric — argument order doesn't matter.
+        assertTrue(cidrsOverlap(
+            listOf("10.0.0.0/16"), listOf("10.0.5.0/24")))
+    }
+
+    @Test fun `cidrsOverlap disjoint subnets return false`() {
+        assertFalse(cidrsOverlap(
+            listOf("10.0.0.0/24"), listOf("192.168.0.0/24")))
+        assertFalse(cidrsOverlap(
+            listOf("10.0.0.0/24"), listOf("10.1.0.0/24")))
+    }
+
+    @Test fun `cidrsOverlap catchall overlaps everything v4`() {
+        assertTrue(cidrsOverlap(
+            listOf("0.0.0.0/0"), listOf("10.0.0.0/24")))
+        assertTrue(cidrsOverlap(
+            listOf("10.0.0.0/24"), listOf("0.0.0.0/0")))
+    }
+
+    @Test fun `cidrsOverlap catchall overlaps single host v4`() {
+        assertTrue(cidrsOverlap(
+            listOf("0.0.0.0/0"), listOf("198.51.100.7/32")))
+    }
+
+    @Test fun `cidrsOverlap mixed families do not overlap`() {
+        assertFalse(cidrsOverlap(
+            listOf("0.0.0.0/0"), listOf("::/0")))
+        assertFalse(cidrsOverlap(
+            listOf("10.0.0.0/24"), listOf("fd00::/8")))
+    }
+
+    @Test fun `cidrsOverlap full-tunnel default overlaps user pool v4`() {
+        // The compiled-in FULL_TUNNEL constant is "0.0.0.0/0,::/0";
+        // tunnels that advertise it overlap with anything in v4 and v6.
+        val full = listOf("0.0.0.0/0", "::/0")
+        assertTrue(cidrsOverlap(full, listOf("10.99.0.0/24")))
+        assertTrue(cidrsOverlap(full, listOf("2001:db8::/64")))
+    }
+
+    @Test fun `cidrsOverlap finds any one overlapping pair in lists`() {
+        val a = listOf("10.0.0.0/24", "192.168.1.0/24")
+        val b = listOf("172.16.0.0/12", "192.168.1.128/25")
+        // Only the 192.168.1.128/25 ⊂ 192.168.1.0/24 pair overlaps;
+        // the function returns true on first hit.
+        assertTrue(cidrsOverlap(a, b))
+    }
+
+    @Test fun `cidrsOverlap silently skips malformed entries`() {
+        val a = listOf("not-a-cidr", "10.0.0.0/24")
+        val b = listOf("garbage", "10.0.0.128/25")
+        assertTrue(cidrsOverlap(a, b))
+        assertFalse(cidrsOverlap(
+            listOf("not-a-cidr"), listOf("10.0.0.0/24")))
+    }
+
+    @Test fun `cidrsOverlap adjacent ranges do not overlap`() {
+        // 10.0.0.0/25 = .0–.127; 10.0.0.128/25 = .128–.255 — touch
+        // boundaries but share no addresses.
+        assertFalse(cidrsOverlap(
+            listOf("10.0.0.0/25"), listOf("10.0.0.128/25")))
+    }
 }

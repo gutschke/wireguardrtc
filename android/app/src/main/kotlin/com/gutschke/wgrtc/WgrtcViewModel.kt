@@ -688,6 +688,31 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  return null
  }
 
+ /**
+ * The tunnels currently considered "active" for the purposes of the
+ * AllowedIPs overlap gate.  Today there are two independent slots:
+ * one joiner-side ([_activeTunnelId]) and one host-side
+ * ([HostModeBackend.activeTunnelId]).  Both surface here so the gate
+ * catches a joiner-side claim that would conflict with an already-up
+ * host (or vice versa).
+ *
+ * When task D4 generalises the app to N concurrent tunnels, this
+ * function grows to return the full active set — no other change in
+ * the gate itself is needed.
+ */
+ private fun activeTunnelsForOverlapGate(): List<Tunnel> {
+ val byId = _tunnels.value.associateBy { it.id }
+ val ids = mutableSetOf<String>()
+ _activeTunnelId.value?.let { ids.add(it) }
+ try {
+ WgrtcApp.instance.hostModeBackend.activeTunnelId?.let { ids.add(it) }
+ } catch (_: Throwable) {
+ // WgrtcApp not initialised yet (unit-test seam) — treat as
+ // no active host-mode tunnel.
+ }
+ return ids.mapNotNull { byId[it] }
+ }
+
  /** Bring this tunnel UP after VPN consent has already been granted by the caller.
  *
  * Step F.3: when the listener has cached a multi-candidate OFFER
@@ -714,6 +739,25 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _connectingTunnelId.value = id
  val t = _tunnels.value.firstOrNull { it.id == id }
  ?: error("no tunnel with id $id")
+ // ─── AllowedIPs overlap gate ─────────────────────────────
+ // Refuse to bring up a tunnel whose claimed CIDR ranges
+ // overlap any tunnel that's already active.  Today the host +
+ // joiner single-instance checks fire first so this is mostly
+ // dormant, but the wiring is in place for when those
+ // restrictions come out (task D4).  See [TunnelOverlapGuard].
+ val activeForGate = activeTunnelsForOverlapGate()
+ val conflict = com.gutschke.wgrtc.data.TunnelOverlapGuard
+ .firstOverlap(t, activeForGate)
+ if (conflict != null) {
+ val msg = "Can't bring up \"${t.name}\" — its address range " +
+ "overlaps the active tunnel \"${conflict.name}\". " +
+ "Disconnect that one first or change AllowedIPs."
+ Log.w("wgrtc-vm", msg)
+ _lastError.value = msg
+ _connectingTunnelId.value = null
+ if (connectJob == currentCoroutineContext()[Job]) connectJob = null
+ throw IllegalStateException(msg)
+ }
  // ─── Host () short-circuit ────────────────────────
  // Host-mode tunnels run on wgbridge_native's gvisor netstack.
  // There's no candidate race for a host (no daemon-driven

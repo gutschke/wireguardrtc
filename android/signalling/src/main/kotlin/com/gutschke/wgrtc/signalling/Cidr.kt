@@ -93,6 +93,38 @@ fun isInAnyCidr(ip: String, cidrs: List<String>): Boolean {
     return false
 }
 
+/** True iff CIDRs `a` and `b` cover any overlapping address.  Both
+ * must be the same address family; mixed v4/v6 always returns false.
+ * Equivalent to "the shorter-prefix range contains the longer-prefix
+ * range's network address".  Used by the multi-tunnel AllowedIPs
+ * overlap gate. */
+internal fun cidrPairOverlaps(
+    aNet: ByteArray, aPrefix: Int,
+    bNet: ByteArray, bPrefix: Int,
+): Boolean {
+    if (aNet.size != bNet.size) return false
+    return if (aPrefix <= bPrefix) cidrContains(aNet, aPrefix, bNet)
+    else cidrContains(bNet, bPrefix, aNet)
+}
+
+/** True iff any CIDR in [a] overlaps any CIDR in [b].  Malformed
+ * entries on either side are silently skipped (same contract as
+ * [isInAnyCidr]).  Order of arguments doesn't matter — the relation
+ * is symmetric. */
+fun cidrsOverlap(a: List<String>, b: List<String>): Boolean {
+    if (a.isEmpty() || b.isEmpty()) return false
+    for (x in a) {
+        val px = parseCidr(x) ?: continue
+        for (y in b) {
+            val py = parseCidr(y) ?: continue
+            if (cidrPairOverlaps(px.first, px.second, py.first, py.second)) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
 /**
  * Extract every `AllowedIPs = a/n, b/m, ...` value from a wg-quick
  * config block, returning a flat list of CIDR strings. Multiple
