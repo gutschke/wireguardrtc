@@ -144,221 +144,44 @@ class MainActivity : ComponentActivity() {
         notificationPermissionLauncher.launch(perm)
     }
 
-    /** Pull a URI out of [intent]. Three sources, all routed through
-     * [handleIncomingUri] so the dispatch is identical:
+    /** Pull a URI out of [intent]. Single legitimate source: third-
+     * party VIEW intents carrying a `wgrtc-enroll://` URI. Skips
+     * history-replayed VIEW intents because the embedded
+     * single-use token would just time out at the daemon and the
+     * resulting "auto-enroll failed" ERROR confuses users.
      *
-     * - `--es config "<text>"` (ADB / test driver: paste-screen prefill OR auto-enroll)
-     * - `intent.data` on `ACTION_VIEW` (URL handler — third-party QR scanner / browser)
-     * - `--es scanned_qr "<text>"` on
-     * `ACTION_SCAN_RESULT` (debug test hook simulating a successful camera scan)
+     * Returns null if no URI is present. Consumes [intent.data] on
+     * success so a recompose doesn't re-fire the same URI.
      *
-     * Returns null if no URI is present. Consumes the source so a
-     * recompose doesn't re-fire the same URI.
-     *
-     * Skips ACTION_VIEW intents replayed via Recents / package-upgrade
-     * (FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY): wgrtc-enroll URIs carry
-     * a single-use token, so a history replay is guaranteed to fail
-     * with a 30-second timeout (the daemon silently drops requests
-     * whose token doesn't resolve, by security design). Skipping the
-     * replay avoids the wasted broker WSS connection and the
-     * misleading "auto-enroll from intent failed: timeout" ERROR. */
+     * (The earlier `--es config`, `ACTION_SCAN_RESULT`, and the
+     * other agentic-test intent surfaces have been moved to the
+     * `agent` buildType so they are not present in
+     * Play-Store / GitHub release builds.) */
     private fun consumeIncomingUri(intent: Intent?): String? {
         if (intent == null) return null
-        intent.getStringExtra("config")?.let {
-            intent.removeExtra("config"); return it
+        if (intent.action != Intent.ACTION_VIEW) return null
+        if ((intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
+            Log.i("wgrtc-main",
+                "ignoring history-replayed VIEW intent " +
+                "(single-use token would just time out): " +
+                intent.data)
+            intent.data = null
+            return null
         }
-        if (intent.action == "com.gutschke.wgrtc.ACTION_SCAN_RESULT") {
-            intent.getStringExtra("scanned_qr")?.let {
-                intent.removeExtra("scanned_qr"); return it
-            }
-        }
-        if (intent.action == Intent.ACTION_VIEW) {
-            if ((intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
-                Log.i("wgrtc-main",
-                    "ignoring history-replayed VIEW intent " +
-                    "(single-use token would just time out): " +
-                    intent.data)
-                intent.data = null
-                return null
-            }
-            val data = intent.data?.toString()
-            if (data != null) {
-                intent.data = null
-                return data
-            }
-        }
-        return null
-    }
-
-    /** Debug-only intent action: connect / disconnect a tunnel
-     * without going through the UI. Requires VPN consent already
-     * granted (pre-grant via `adb shell appops set <pkg> ACTIVATE_VPN
-     * allow`). Used by the cycle-bench harness; reusable for any
-     * E2E test that needs to drive Connect from adb.
-     *
-     * Trigger:
-     * adb shell am start -n com.gutschke.wgrtc.debug/.MainActivity \
-     * -a com.gutschke.wgrtc.ACTION_CONNECT --es tunnel_id <id>
-     *
-     * adb shell am start -n com.gutschke.wgrtc.debug/.MainActivity \
-     * -a com.gutschke.wgrtc.ACTION_DISCONNECT
-     */
-    private fun consumeConnectAction(intent: Intent?) {
-        if (intent == null) return
-        when (intent.action) {
-            "com.gutschke.wgrtc.ACTION_CONNECT" -> {
-                val id = intent.getStringExtra("tunnel_id") ?: return
-                intent.removeExtra("tunnel_id")
-                Log.i("wgrtc-main", "ACTION_CONNECT received tunnel_id=$id")
-                lifecycleScope.launch {
-                    try { vm.connect(id) }
-                    catch (t: Throwable) {
-                        Log.w("wgrtc-main", "ACTION_CONNECT failed", t)
-                    }
-                }
-            }
-            "com.gutschke.wgrtc.ACTION_DISCONNECT" -> {
-                lifecycleScope.launch {
-                    try { vm.disconnect() }
-                    catch (t: Throwable) {
-                        Log.w("wgrtc-main", "ACTION_DISCONNECT failed", t)
-                    }
-                }
-            }
-        }
-    }
-
-    /** Debug-only intent action: add a tunnel from a wg-quick config
-     * text without going through the paste UI. Used by the
-     * host-mode smoke test (which needs to feed a server-style
-     * `[Interface] ListenPort = …` config without an `Endpoint = `
-     * on the `[Peer]`) and by any future E2E test that needs to seed
-     * a tunnel programmatically. Logs the new id at TAG=`wgrtc-main`
-     * so the test driver can grep it back.
-     *
-     * Trigger:
-     * adb shell am start -n com.gutschke.wgrtc.debug/.MainActivity \
-     * -a com.gutschke.wgrtc.ACTION_ADD_LEGACY_TUNNEL \
-     * --es name "<display-name>" \
-     * --es config_text "<wg-quick text>"
-     *
-     * Consumes both extras so a recompose doesn't re-fire. */
-    private fun consumeAddLegacyAction(intent: Intent?) {
-        if (intent == null) return
-        if (intent.action != "com.gutschke.wgrtc.ACTION_ADD_LEGACY_TUNNEL") return
-        val name = intent.getStringExtra("name") ?: return
-        val configText = intent.getStringExtra("config_text") ?: return
-        intent.removeExtra("name"); intent.removeExtra("config_text")
-        try {
-            val t = vm.addLegacyTunnel(name, configText)
-            Log.i("wgrtc-main", "ADD_LEGACY_TUNNEL ok: id=${t.id} name=${t.name}")
-        } catch (e: Throwable) {
-            Log.e("wgrtc-main", "ADD_LEGACY_TUNNEL failed", e)
-        }
-    }
-
-    /** Debug-only intent action: add a host-mode tunnel
-     * without going through the UI. Mirror of
-     * [consumeAddLegacyAction] for the host-side flow. Logs the
-     * new id at TAG=`wgrtc-main` so the test driver can grep it.
-     *
-     * Trigger:
-     * adb shell am start -n com.gutschke.wgrtc.debug/.MainActivity \
-     * -a com.gutschke.wgrtc.ACTION_ADD_HOST_TUNNEL \
-     * --es name "host" \
-     * --es subnet "10.99.0.0/24" \
-     * --es host_ip "10.99.0.1" \
-     * --ei listen_port 51820 \
-     * --es broker "wss://broker.example/peerjs" \
-     * --es broker_key "demo" */
-    private fun consumeAddHostAction(intent: Intent?) {
-        if (intent == null) return
-        if (intent.action != "com.gutschke.wgrtc.ACTION_ADD_HOST_TUNNEL") return
-        val name = intent.getStringExtra("name") ?: return
-        val subnet = intent.getStringExtra("subnet") ?: "10.99.0.0/24"
-        val hostIp = intent.getStringExtra("host_ip") ?: "10.99.0.1"
-        val listenPort = intent.getIntExtra("listen_port", 51820)
-        val broker = intent.getStringExtra("broker") ?: return
-        val brokerKey = intent.getStringExtra("broker_key") ?: "peerjs"
-        intent.removeExtra("name"); intent.removeExtra("subnet")
-        intent.removeExtra("host_ip"); intent.removeExtra("listen_port")
-        intent.removeExtra("broker"); intent.removeExtra("broker_key")
-        try {
-            val t = vm.addHostModeTunnel(
-                name = name, subnet = subnet, hostIp = hostIp,
-                listenPort = listenPort,
-                brokerWss = broker, brokerKey = brokerKey,
-            )
-            Log.i("wgrtc-main", "ADD_HOST_TUNNEL ok: id=${t.id} name=${t.name}")
-        } catch (e: Throwable) {
-            Log.e("wgrtc-main", "ADD_HOST_TUNNEL failed", e)
-        }
-    }
-
-    /** Debug-only intent action: mint an enrollment token on a
-     * host-mode tunnel and log the resulting URI.
-     *
-     * Trigger:
-     * adb shell am start -n com.gutschke.wgrtc.debug/.MainActivity \
-     * -a com.gutschke.wgrtc.ACTION_MINT_HOST_TOKEN \
-     * --es tunnel_id <id> \
-     * --es name_hint "alice-laptop" \
-     * --el ttl_ms 600000 */
-    private fun consumeMintHostTokenAction(intent: Intent?) {
-        if (intent == null) return
-        if (intent.action != "com.gutschke.wgrtc.ACTION_MINT_HOST_TOKEN") return
-        val id = intent.getStringExtra("tunnel_id") ?: return
-        val nameHint = intent.getStringExtra("name_hint") ?: "guest"
-        val ttlMs = intent.getLongExtra("ttl_ms", 600_000L)
-        intent.removeExtra("tunnel_id"); intent.removeExtra("name_hint")
-        intent.removeExtra("ttl_ms")
-        try {
-            val uri = vm.mintHostEnrollToken(id, nameHint, ttlMs)
-            if (uri == null) {
-                Log.w("wgrtc-main",
-                    "MINT_HOST_TOKEN: tunnel $id is not a valid host-mode target")
-            } else {
-                Log.i("wgrtc-main", "MINT_HOST_TOKEN ok: $uri")
-            }
-        } catch (e: Throwable) {
-            Log.e("wgrtc-main", "MINT_HOST_TOKEN failed", e)
-        }
-    }
-
-    /** Debug-only intent action: rename a tunnel by id without going
-     * through the UI. Used by the E2E rename test, which can't
-     * reasonably drive a Compose AlertDialog from adb. No-op when
-     * the action doesn't match or the extras are missing.
-     * Consumes both extras so a recompose doesn't re-fire. */
-    private fun consumeRenameAction(intent: Intent?) {
-        if (intent == null) return
-        if (intent.action != "com.gutschke.wgrtc.ACTION_RENAME_TUNNEL") return
-        val id = intent.getStringExtra("tunnel_id") ?: return
-        val newName = intent.getStringExtra("rename_to") ?: return
-        intent.removeExtra("tunnel_id"); intent.removeExtra("rename_to")
-        vm.renameTunnel(id, newName)
+        val data = intent.data?.toString() ?: return null
+        intent.data = null
+        return data
     }
 
     /** Dispatch a URI received via intent: if it's a wgrtc-enroll URI
      * fire enrollment silently; if it's a wg-quick paste, stash for
      * the paste screen; anything else is logged and ignored. */
-    private fun handleIncomingUri(raw: String, autoConnect: Boolean = false) {
+    private fun handleIncomingUri(raw: String) {
         if (raw.startsWith("wgrtc-enroll://")) {
             lifecycleScope.launch {
                 try {
                     val uri = com.gutschke.wgrtc.signalling.EnrollUri.parse(raw)
-                    val tunnel = vm.enrollAndAdd(uri, deviceLabel = "android-wgrtc", name = null)
-                    // Debug-only auto-connect: a `--ez autoconnect true`
-                    // adb extra on the VIEW intent immediately brings the
-                    // freshly-enrolled tunnel up. Lets the agentic test
-                    // rig exercise the joiner race without requiring an
-                    // unlocked screen + manual Connect tap. Release
-                    // builds ignore this (gated on BuildConfig.DEBUG).
-                    if (autoConnect && BuildConfig.DEBUG) {
-                        Log.i("wgrtc-main",
-                            "auto-connect after enroll: ${tunnel.id}")
-                        vm.connect(tunnel.id)
-                    }
+                    vm.enrollAndAdd(uri, deviceLabel = "android-wgrtc", name = null)
                 } catch (t: Throwable) {
                     Log.e("wgrtc-main", "auto-enroll from intent failed", t)
                 }
@@ -376,29 +199,13 @@ class MainActivity : ComponentActivity() {
         Log.i("wgrtc-main", "onNewIntent fired: action=${intent.action}")
         super.onNewIntent(intent)
         setIntent(intent)
-        consumeIncomingUri(intent)?.let { uri ->
-            handleIncomingUri(uri,
-                autoConnect = intent?.getBooleanExtra("autoconnect", false) == true)
-        }
-        consumeRenameAction(intent)
-        consumeAddLegacyAction(intent)
-        consumeAddHostAction(intent)
-        consumeMintHostTokenAction(intent)
-        consumeConnectAction(intent)
+        consumeIncomingUri(intent)?.let { uri -> handleIncomingUri(uri) }
     }
 
     @androidx.compose.runtime.Composable
     private fun AppNavHost() {
         val nav = rememberNavController()
-        consumeIncomingUri(intent)?.let { uri ->
-            handleIncomingUri(uri,
-                autoConnect = intent?.getBooleanExtra("autoconnect", false) == true)
-        }
-        consumeRenameAction(intent)
-        consumeAddLegacyAction(intent)
-        consumeAddHostAction(intent)
-        consumeMintHostTokenAction(intent)
-        consumeConnectAction(intent)
+        consumeIncomingUri(intent)?.let { uri -> handleIncomingUri(uri) }
 
         // First-launch onboarding gate — read once at composition.
         // Starting at ONBOARDING when the flag is unset means a

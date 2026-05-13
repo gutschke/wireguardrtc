@@ -540,14 +540,6 @@ class ListenerHub internal constructor(
             expiresAt = minted.expiresAtMs / 1000,
             serverName = tunnel.name,
         )
-        // Debug-only URI dump so agentic test rigs can grab the
-        // enrollment string straight from logcat instead of OCRing the
-        // QR. BuildConfig.DEBUG is true only for the .debug variant —
-        // the Play-signed release build elides this entire branch.
-        if (com.gutschke.wgrtc.BuildConfig.DEBUG) {
-            Log.i(TAG, "mintHostEnrollToken: minted URI for tunnel " +
-                "$tunnelId (expires in ${ttlMs}ms): $uri")
-        }
         return uri
     }
 
