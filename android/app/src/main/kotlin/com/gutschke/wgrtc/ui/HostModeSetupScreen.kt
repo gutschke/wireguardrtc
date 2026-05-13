@@ -298,11 +298,13 @@ private fun RoutingModePicker(
                 "[Peer] block.\n\n" +
                 " • Local-only: just the address pool. Joiners " +
                 "use their own internet, but can reach this device " +
-                "and other peers on the tunnel. Works today.\n\n" +
+                "and other peers on the tunnel.\n\n" +
                 " • Full tunnel: 0.0.0.0/0 + ::/0. Joiners send " +
-                "*all* their traffic through this device. Requires " +
-                "the host to forward + masquerade packets to the " +
-                "internet — in the roadmap, not yet wired.\n\n" +
+                "*all* their traffic through this device. The host " +
+                "relays each flow out its own network — IPv4 works " +
+                "today; IPv6 egress is still in development, so " +
+                "v6-preferring joiners may see slow page loads " +
+                "until IPv6 lands.\n\n" +
                 " • Custom: type a CIDR list. Useful for routing " +
                 "specific subnets through (split-tunnel).",
         )
@@ -320,9 +322,8 @@ private fun RoutingModePicker(
         )
         RoutingModeRow(
             label = "Full tunnel (host forwards everything)",
-            sub = "Routes joiners' internet through this device. " +
-                "Requires not yet enabled; advertising " +
-                "this without forwarding leaves joiners offline.",
+            sub = "Joiners send all traffic through this device. " +
+                "IPv4 works; IPv6 egress is still in development.",
             selected = selected == RoutingMode.FULL_TUNNEL,
             onSelect = { onSelect(RoutingMode.FULL_TUNNEL) },
         )
