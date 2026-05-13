@@ -1127,7 +1127,7 @@ def encrypt_envelope(key: bytes,
     project_protocol_signal_wake_candidates memo for rationale."""
     payload = {
         "v": PROTOCOL_VERSION,
-        "ts": int(ts if ts is not None else time.time),
+        "ts": int(ts if ts is not None else time.time()),
         "candidates": list(candidates or []),
     }
     box = SecretBox(key)
@@ -1648,7 +1648,7 @@ class PeerJSClient:
             # or recent (< STABLE_SESSION_S ago) — both keep backoff
             # advancing exponentially, capped at SIGNALING_BACKOFF.
             if (session_start is not None and
-                    time.monotonic - session_start >= STABLE_SESSION_S):
+                    time.monotonic() - session_start >= STABLE_SESSION_S):
                 backoff = 5.0
             else:
                 backoff = min(backoff * 2, SIGNALING_BACKOFF)
@@ -2668,7 +2668,7 @@ class Daemon:
                 # signal_wake: don't touch kernel WG state.  The sender
                 # is asking "where are you" — we fall through to the
                 # responsive-OFFER path which advertises our endpoint.
-                LOG.event(cfg.label, "wake-received", str(int(time.time)),
+                LOG.event(cfg.label, "wake-received", str(int(time.time())),
                           f"signal_wake from {cfg.label} "
                           f"(src broker id ...{src_id[-8:]})")
 
