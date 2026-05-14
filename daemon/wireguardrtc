@@ -5363,6 +5363,23 @@ def _confirm_sas_interactive(phrase):
     return ans == "y"
 
 
+def _confirm_sas_auto(phrase):
+    """Auto-accept the SAS without human verification.
+
+    DANGEROUS in production: defeats the wormhole protocol's
+    MITM-resistance.  An attacker who guessed the wormhole code (or
+    intercepted it in transit) can complete pairing without the user
+    ever seeing the SAS mismatch.  Only use for automated testing or
+    in scripted provisioning where the wormhole code is already
+    delivered out-of-band over a trusted channel.
+    """
+    sys.stdout.write(f"\nSAS phrase: {phrase}\n")
+    sys.stdout.write("⚠️  --auto-confirm-sas: accepting without human "
+                      "verification\n")
+    sys.stdout.flush()
+    return True
+
+
 def cmd_use_wormhole(args):
     """Joiner side: type a wormhole code, exchange enrollment info,
     print a wg-quick config the user can persist."""
@@ -5404,7 +5421,8 @@ def cmd_use_wormhole(args):
                 sas, host_info = await flow.run_joiner(
                     joiner_pubkey_b64=joiner_pub_b64,
                     device_name=device_name,
-                    confirm_sas=_confirm_sas_interactive,
+                    confirm_sas=(_confirm_sas_auto if args.auto_confirm_sas
+                              else _confirm_sas_interactive),
                 )
             except SasAborted:
                 sys.stderr.write("\nAborted: SAS did not match.\n")
@@ -5451,30 +5469,38 @@ def cmd_mint_wormhole(args):
     code_bytes = wormhole_to_bytes(code)
     broker_server, broker_key = _read_broker_config(args.config)
 
+    # Resolve the host's WG identity.  Two paths:
+    #  1. --iface IFACE: read pubkey + listen-port from wg(8) (the
+    #     normal case — host is already running WG on this machine).
+    #  2. --pubkey-override + --endpoint-override: skip the live read.
+    #     Useful for provisioning a peer for a remote machine, for
+    #     pre-staging before WG is installed, or for headless tests
+    #     without a real WG interface.
     iface = args.iface
-    if iface is None:
+    if iface:
+        try:
+            host_pub = wg_show(iface, "public-key")
+            listen_port = wg_show(iface, "listen-port")
+        except Exception as e:
+            sys.stderr.write(f"failed to read WG state for {iface!r}: {e}\n")
+            sys.exit(2)
+        host_pub = (host_pub or "").strip()
+        listen_port = (listen_port or "").strip()
+        if not host_pub or not listen_port:
+            sys.stderr.write(
+                f"interface {iface!r} did not return pubkey/port "
+                "(missing, no permission, or not a WG interface).\n")
+            sys.exit(2)
+        wg_endpoint = args.endpoint or f"0.0.0.0:{listen_port}"
+    elif args.pubkey_override and args.endpoint_override:
+        host_pub = args.pubkey_override.strip()
+        wg_endpoint = args.endpoint_override.strip()
+    else:
         sys.stderr.write(
-            "--mint-wormhole requires --iface <wg-interface> so we know "
-            "which WG identity to advertise to the joiner.\n")
+            "--mint-wormhole requires either --iface <wg-interface> "
+            "(reads pubkey + listen-port from wg(8)) or both "
+            "--pubkey-override + --endpoint-override.\n")
         sys.exit(2)
-
-    # Read host's WG pubkey + listen-port via wg(8).  Requires
-    # CAP_NET_ADMIN (root or the wireguardrtc group).
-    try:
-        host_pub = wg_show(iface, "public-key")
-        listen_port = wg_show(iface, "listen-port")
-    except Exception as e:
-        sys.stderr.write(f"failed to read WG state for {iface!r}: {e}\n")
-        sys.exit(2)
-    host_pub = (host_pub or "").strip()
-    listen_port = (listen_port or "").strip()
-    if not host_pub or not listen_port:
-        sys.stderr.write(
-            f"interface {iface!r} did not return pubkey/port "
-            "(missing, no permission, or not a WG interface).\n")
-        sys.exit(2)
-
-    wg_endpoint = args.endpoint or f"0.0.0.0:{listen_port}"
     assigned_address = args.assigned_address
     allowed_ips = args.allowed_ips or assigned_address
 
@@ -5497,7 +5523,8 @@ def cmd_mint_wormhole(args):
                         host_name=args.host_name or socket.gethostname(),
                         keepalive=args.keepalive,
                     ),
-                    confirm_sas=_confirm_sas_interactive,
+                    confirm_sas=(_confirm_sas_auto if args.auto_confirm_sas
+                              else _confirm_sas_interactive),
                 )
             except SasAborted:
                 sys.stderr.write("\nAborted: SAS did not match.\n")
@@ -5601,6 +5628,22 @@ def main():
                     help="with --use-wormhole: friendly name for "
                          "this device sent to the host.  Defaults to "
                          "this machine's hostname.")
+    ap.add_argument("--pubkey-override", default=None,
+                    help="with --mint-wormhole: WG pubkey to advertise "
+                         "instead of reading from --iface.  Use with "
+                         "--endpoint-override.")
+    ap.add_argument("--endpoint-override", default=None,
+                    help="with --mint-wormhole: external endpoint "
+                         "(ip:port) to advertise instead of reading "
+                         "from --iface.  Use with --pubkey-override.")
+    ap.add_argument("--auto-confirm-sas", action="store_true",
+                    help="with --mint-wormhole / --use-wormhole: "
+                         "auto-accept the SAS phrase without human "
+                         "verification.  DANGEROUS — defeats MITM "
+                         "protection.  Only for automated tests or "
+                         "scripted provisioning where the wormhole "
+                         "code is delivered out-of-band over a "
+                         "trusted channel.")
     args = ap.parse_args()
 
     if args.show_config:
