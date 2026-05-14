@@ -57,6 +57,10 @@ android/**/build/test-results/
 android/**/*.aab
 android/**/*.apk
 
+# Release staging dir (`dist/` is built per release; contents are the
+# .deb + .apk + SHA256SUMS attached to the GitHub Release).
+dist/
+
 # ──────────────────────────────────────────────────────────────────
 # Misc
 # ──────────────────────────────────────────────────────────────────

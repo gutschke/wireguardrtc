@@ -29,12 +29,22 @@ android {
         applicationId = "com.gutschke.wgrtc"
         minSdk = 26
         targetSdk = 35
-        versionCode = 24
-        versionName = "0.2.3"
+        versionCode = 25
+        versionName = "0.2.4"
         // Instrumented (androidTest) tests use AndroidX Test's JUnit 4
         // runner. The connectedDebugAndroidTest task drives them via
         // ADB against whichever device/emulator is currently attached.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Match what wgbridge_native/build.sh produces. Without this
+        // filter, transitive dependencies (libsodium-jni etc.) leak
+        // 32-bit ABIs (armeabi-v7a, x86) into the APK as shells —
+        // without libwgbridge_native.so, the app would install on a
+        // 32-bit device and crash at first JNI call.  32-bit users
+        // are documented in RELEASING.md as a build-from-source case.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     signingConfigs {

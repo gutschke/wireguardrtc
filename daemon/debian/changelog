@@ -1,3 +1,31 @@
+wireguardrtc (0.2.4-1) unstable; urgency=medium
+
+  * Wormhole pairing for the daemon, parity with the Android app
+    (D1).  Two new subcommands:
+      --mint-wormhole [--label NAME] [--iface IFACE] [--parameters STR]
+        prints a 6-letter wormhole code + waits for a peer to dial in;
+      --use-wormhole CODE [--iface IFACE]
+        types the 6-letter code on a remote machine and joins the host.
+    Both sides verify the SAS phrase before committing the new peer.
+    Ristretto255 / SPAKE2 / SAS implementation is vendored — no pypi
+    dependency for the cryptography.
+  * --check-nat subcommand: independent IPv4 / IPv6 classification
+    (full-cone / address-restricted / port-restricted / symmetric /
+    none-detected) with optional rDNS + ISP enrichment.
+  * ProvisionScript hook: wormhole-pair flow now invokes the same
+    hook as token-based enrollment, passing the admin-supplied
+    parameter string via the new WIREGUARDRTC_PROVISION_PARAMETERS
+    environment variable.  Backward-compatible: scripts that read the
+    sidecar still work unchanged.
+  * Test-only command-line flags (--pubkey-override, --auto-confirm-sas)
+    are now gated behind WIREGUARDRTC_ALLOW_TEST_FLAGS=1.  Without
+    the gate they're hidden from --help and refuse to run.
+  * Documentation: man pages are mirrored as docs/*.md (auto-generated
+    from troff).  New docs/provision-scripts.md describes how to
+    write a custom ProvisionScript.
+
+ -- Markus Gutschke <gutschke@users.noreply.github.com>  Wed, 13 May 2026 20:44:00 -0700
+
 wireguardrtc (0.2.3-1) unstable; urgency=high
 
   * Release blocker: restore daemon from v0.2.0 corruption.  A
