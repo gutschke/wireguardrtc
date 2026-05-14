@@ -660,6 +660,340 @@ def wormhole_to_bytes(code):
     return wormhole_normalize(code).encode("utf-8")
 
 
+# ─── SAS wire format (envelopes, routing-id, MAC) ─────────────────────
+#
+# Mirrors signalling/SasWireFormat.kt.  Three message kinds, all
+# wrapped in the OFFER envelope shape so they survive the public
+# PeerJS broker's payload-shape filter.  Wire-format constants are
+# protocol commitments — bumping any of them is wire-incompatible.
+
+import base64 as _base64
+import hmac as _hmac
+
+SAS_STEP_1 = "sas_step_1"
+SAS_STEP_2 = "sas_step_2"
+SAS_CONFIRM = "sas_confirm"
+
+SAS_LABEL_ROUTING_INIT = b"wgrtc/sas/routing-init-2026"
+SAS_LABEL_ROUTING_RESP = b"wgrtc/sas/routing-resp-2026"
+SAS_LABEL_CONFIRM_INIT = b"wgrtc/sas/confirm-init-2026"
+SAS_LABEL_CONFIRM_RESP = b"wgrtc/sas/confirm-resp-2026"
+
+SAS_PAKE_MSG_LEN = 32
+SAS_CONFIRM_MAC_LEN = 16
+
+
+def _b64url_nopad(b):
+    return _base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def sas_routing_id_initiator(code_bytes):
+    """Broker subscription id for the initiator's inbox.  Derived from
+    the wormhole-code bytes via keyed BLAKE2b under a role label, so
+    initiator and responder subscribe to disjoint ids."""
+    digest = hashlib.blake2b(code_bytes, digest_size=32,
+                              key=SAS_LABEL_ROUTING_INIT).digest()
+    return _b64url_nopad(digest)
+
+
+def sas_routing_id_responder(code_bytes):
+    digest = hashlib.blake2b(code_bytes, digest_size=32,
+                              key=SAS_LABEL_ROUTING_RESP).digest()
+    return _b64url_nopad(digest)
+
+
+def _build_sas_envelope(dst_routing_id, kind, metadata_extras):
+    """Common OFFER-wrapped envelope shape, fed by per-kind metadata
+    additions in `metadata_extras` (a dict)."""
+    conn_id = "dc_" + secrets.token_hex(6)
+    md = {"v": PROTOCOL_VERSION, "kind": kind}
+    md.update(metadata_extras)
+    return {
+        "type": "OFFER",
+        "dst": dst_routing_id,
+        "payload": {
+            "sdp": {"sdp": build_peerjs_sdp(), "type": "offer"},
+            "type": "data",
+            "connectionId": conn_id,
+            "label": conn_id,
+            "reliable": False,
+            "serialization": "binary",
+            "metadata": md,
+        },
+    }
+
+
+def build_sas_step1_envelope(dst_routing_id, pake_msg):
+    if len(pake_msg) != SAS_PAKE_MSG_LEN:
+        raise ValueError(
+            f"pake_msg must be {SAS_PAKE_MSG_LEN} bytes "
+            f"(got {len(pake_msg)})")
+    return _build_sas_envelope(
+        dst_routing_id, SAS_STEP_1,
+        {"pake_msg": _base64.b64encode(pake_msg).decode("ascii")})
+
+
+def build_sas_step2_envelope(dst_routing_id, pake_msg):
+    if len(pake_msg) != SAS_PAKE_MSG_LEN:
+        raise ValueError(
+            f"pake_msg must be {SAS_PAKE_MSG_LEN} bytes "
+            f"(got {len(pake_msg)})")
+    return _build_sas_envelope(
+        dst_routing_id, SAS_STEP_2,
+        {"pake_msg": _base64.b64encode(pake_msg).decode("ascii")})
+
+
+def build_sas_confirm_envelope(dst_routing_id, confirm_mac,
+                                encrypted_info=None):
+    if len(confirm_mac) != SAS_CONFIRM_MAC_LEN:
+        raise ValueError(
+            f"confirm_mac must be {SAS_CONFIRM_MAC_LEN} bytes "
+            f"(got {len(confirm_mac)})")
+    extras = {"mac": _base64.b64encode(confirm_mac).decode("ascii")}
+    if encrypted_info is not None:
+        extras["info"] = _base64.b64encode(encrypted_info).decode("ascii")
+    return _build_sas_envelope(dst_routing_id, SAS_CONFIRM, extras)
+
+
+def _extract_sas_metadata(message, expected_kind):
+    """Validate the envelope and return (src, metadata-dict) or None."""
+    if not isinstance(message, dict):
+        return None
+    if message.get("type") != "OFFER":
+        return None
+    src = message.get("src")
+    if not isinstance(src, str):
+        return None
+    pl = message.get("payload")
+    if not isinstance(pl, dict):
+        return None
+    md = pl.get("metadata")
+    if not isinstance(md, dict):
+        return None
+    # Daemon serializes `v` as int; Android does too.  Accept either
+    # string or int (some brokers stringify numbers in transit).
+    v = md.get("v")
+    if v != PROTOCOL_VERSION and v != str(PROTOCOL_VERSION):
+        return None
+    if md.get("kind") != expected_kind:
+        return None
+    return src, md
+
+
+def _decode_b64_field(md, field, expected_len=None):
+    val = md.get(field)
+    if not isinstance(val, str):
+        return None
+    try:
+        out = _base64.b64decode(val, validate=True)
+    except Exception:
+        return None
+    if expected_len is not None and len(out) != expected_len:
+        return None
+    return out
+
+
+def extract_sas_step1(message):
+    """Return (src, pake_msg) for a valid SAS_STEP_1, or None."""
+    meta = _extract_sas_metadata(message, SAS_STEP_1)
+    if meta is None:
+        return None
+    src, md = meta
+    pake = _decode_b64_field(md, "pake_msg", SAS_PAKE_MSG_LEN)
+    if pake is None:
+        return None
+    return src, pake
+
+
+def extract_sas_step2(message):
+    meta = _extract_sas_metadata(message, SAS_STEP_2)
+    if meta is None:
+        return None
+    src, md = meta
+    pake = _decode_b64_field(md, "pake_msg", SAS_PAKE_MSG_LEN)
+    if pake is None:
+        return None
+    return src, pake
+
+
+def extract_sas_confirm(message):
+    """Return (src, mac, encrypted_info_or_None) for a valid SAS_CONFIRM."""
+    meta = _extract_sas_metadata(message, SAS_CONFIRM)
+    if meta is None:
+        return None
+    src, md = meta
+    mac = _decode_b64_field(md, "mac", SAS_CONFIRM_MAC_LEN)
+    if mac is None:
+        return None
+    info = None
+    if "info" in md:
+        info = _decode_b64_field(md, "info")
+        if info is None:
+            return None
+    return src, mac, info
+
+
+def build_sas_confirm_mac(role, sas_key):
+    """16-byte MAC = first 16 bytes of BLAKE2b-32(role_label, key=sas_key).
+
+    This intentionally mirrors Android's sequence (compute 32-byte
+    digest, truncate to 16) byte-for-byte — BLAKE2b output is NOT
+    a prefix of larger output, so the truncate-from-32 step is wire-
+    format-significant.
+    """
+    if len(sas_key) < 16:
+        raise ValueError(
+            f"sasKey too short (got {len(sas_key)}, need >= 16)")
+    if role == "initiator":
+        label = SAS_LABEL_CONFIRM_INIT
+    elif role == "responder":
+        label = SAS_LABEL_CONFIRM_RESP
+    else:
+        raise ValueError(f"role must be 'initiator' or 'responder' "
+                         f"(got {role!r})")
+    full = hashlib.blake2b(label, digest_size=32,
+                           key=sas_key[:32]).digest()
+    return full[:SAS_CONFIRM_MAC_LEN]
+
+
+def verify_sas_confirm_mac(peer_role, sas_key, received_mac):
+    """Constant-time compare via hmac.compare_digest."""
+    if not isinstance(received_mac, (bytes, bytearray)) or \
+            len(received_mac) != SAS_CONFIRM_MAC_LEN:
+        return False
+    expected = build_sas_confirm_mac(peer_role, sas_key)
+    return _hmac.compare_digest(expected, bytes(received_mac))
+
+
+# ─── SAS enrolment info (encrypted inside sas_confirm `info`) ─────────
+#
+# Mirrors SasEnrollInfo.kt.  After SAS-confirm both sides hold the same
+# SPAKE2 key K; we use K[:32] as a secretbox key to wrap a JSON blob
+# carrying tunnel-config bytes:
+#
+#  - JoinerEnrollInfo (joiner → host): joiner's WG pubkey + optional
+#    device label, so the host can add them as a peer.
+#  - HostEnrollInfo (host → joiner): host's WG pubkey, endpoint,
+#    joiner's pre-allocated address, AllowedIPs, optional broker WSS
+#    + DNS + MTU + keepalive + host name.
+#
+# Both carry `v` (protocol version) and `ts` (UTC seconds) for replay
+# resistance, matching the existing ENROLL plaintext convention.
+# Decoder rejects malformed JSON, wrong version, stale timestamp,
+# wg_pubkey not exactly 32 bytes after base64-decode.  All failures
+# return None silently — error shapes shouldn't be observable.
+
+def _is_valid_wg_pubkey_b64(s):
+    if not isinstance(s, str):
+        return False
+    try:
+        return len(base64.b64decode(s, validate=True)) == 32
+    except Exception:
+        return False
+
+
+def _secretbox_encrypt_json(payload, sas_key32):
+    plain = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return SecretBox(sas_key32).encrypt(plain)
+
+
+def _secretbox_decrypt_json(blob, sas_key32):
+    try:
+        plain = SecretBox(sas_key32).decrypt(bytes(blob))
+        return json.loads(plain.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def encode_joiner_enroll_info(
+        sas_key, wg_pubkey_b64, device_name=None, timestamp=None):
+    """Build the encrypted joiner→host blob.
+
+    `sas_key` must be ≥ 32 bytes; we use the first 32.
+    """
+    if len(sas_key) < 32:
+        raise ValueError("sas_key must be ≥ 32 bytes")
+    payload = {
+        "v": PROTOCOL_VERSION,
+        "ts": int(timestamp if timestamp is not None else time.time()),
+        "wg_pubkey": wg_pubkey_b64,
+    }
+    if device_name is not None:
+        payload["device_name"] = device_name
+    else:
+        # Match Android's `encodeDefaults = true` — serialise the
+        # null so both sides hash identical bytes on round-trip
+        # property tests.  Decoder treats absent and null
+        # identically.
+        payload["device_name"] = None
+    return bytes(_secretbox_encrypt_json(payload, bytes(sas_key[:32])))
+
+
+def decode_joiner_enroll_info(blob, sas_key, now=None,
+                               freshness_window=PROTOCOL_FRESHNESS_WINDOW):
+    if len(sas_key) < 32:
+        return None
+    msg = _secretbox_decrypt_json(blob, bytes(sas_key[:32]))
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("v") != PROTOCOL_VERSION:
+        return None
+    ts = msg.get("ts")
+    if not isinstance(ts, int):
+        return None
+    now = now if now is not None else time.time()
+    if abs(now - ts) > freshness_window:
+        return None
+    if not _is_valid_wg_pubkey_b64(msg.get("wg_pubkey")):
+        return None
+    return msg
+
+
+def encode_host_enroll_info(
+        sas_key, wg_pubkey_b64, wg_endpoint, assigned_address,
+        allowed_ips, broker_wss=None, broker_key=None, salt_b64=None,
+        dns=None, mtu=None, keepalive=None, host_name=None,
+        timestamp=None):
+    if len(sas_key) < 32:
+        raise ValueError("sas_key must be ≥ 32 bytes")
+    payload = {
+        "v": PROTOCOL_VERSION,
+        "ts": int(timestamp if timestamp is not None else time.time()),
+        "wg_pubkey": wg_pubkey_b64,
+        "wg_endpoint": wg_endpoint,
+        "assigned_address": assigned_address,
+        "allowed_ips": allowed_ips,
+        "broker_wss": broker_wss,
+        "broker_key": broker_key,
+        "salt": salt_b64,
+        "dns": dns,
+        "mtu": mtu,
+        "keepalive": keepalive,
+        "host_name": host_name,
+    }
+    return bytes(_secretbox_encrypt_json(payload, bytes(sas_key[:32])))
+
+
+def decode_host_enroll_info(blob, sas_key, now=None,
+                             freshness_window=PROTOCOL_FRESHNESS_WINDOW):
+    if len(sas_key) < 32:
+        return None
+    msg = _secretbox_decrypt_json(blob, bytes(sas_key[:32]))
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("v") != PROTOCOL_VERSION:
+        return None
+    ts = msg.get("ts")
+    if not isinstance(ts, int):
+        return None
+    now = now if now is not None else time.time()
+    if abs(now - ts) > freshness_window:
+        return None
+    if not _is_valid_wg_pubkey_b64(msg.get("wg_pubkey")):
+        return None
+    return msg
+
+
 # ─── STUN XOR-MAPPED-ADDRESS parser ────────────────────────────────────
 # Pure function — no I/O, no sockets, testable with synthetic vectors.
 # Handles both family=0x01 (IPv4) and family=0x02 (IPv6) per RFC 5389
