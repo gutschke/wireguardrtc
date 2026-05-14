@@ -5612,13 +5612,51 @@ def cmd_mint_wormhole(args):
         sys.exit(130)
 
     label = args.label or (joiner_info.get("device_name") or "wormhole-peer")
-    sys.stdout.write("\nEnrollment received.  Add this peer to the daemon:\n")
-    sys.stdout.write("=" * 60 + "\n")
-    sys.stdout.write(f"# /etc/wireguardrtc/peers.d/{label}.conf\n")
-    sys.stdout.write("[Peer]\n")
-    sys.stdout.write(f"PublicKey = {joiner_info['wg_pubkey']}\n")
-    sys.stdout.write("Mode = active\n")
-    sys.stdout.write("=" * 60 + "\n")
+    # Sanitise the label for the ProvisionScript contract — same rules
+    # the daemon applies to token-based enrol NAMEs.
+    label = "".join(c for c in label
+                     if c.isalnum() or c in "._@-")[:64] or "wormhole-peer"
+
+    # Try to integrate with the running daemon's ProvisionScript so
+    # the new peer auto-lands on the WG interface.  Two conditions
+    # must hold:
+    #  1. --iface was given (the script needs to know which iface).
+    #  2. The global config exists and has a [Enrollment]
+    #     ProvisionScript pointing at an executable file.
+    # If either fails, fall back to printing the peer drop-in for the
+    # operator to apply by hand.
+    provision_handled = False
+    if iface and args.config and Path(args.config).is_file():
+        try:
+            gcfg = load_global_config(args.config)
+        except SystemExit:
+            gcfg = None
+        if gcfg and gcfg.provision_script:
+            ok, err = run_provision_script(
+                gcfg.provision_script,
+                iface=iface,
+                name=label,
+                client_pub_b64=joiner_info["wg_pubkey"],
+            )
+            if ok:
+                sys.stdout.write(
+                    f"\nProvisionScript {gcfg.provision_script} applied "
+                    f"the new peer to {iface} (name={label!r}).\n")
+                provision_handled = True
+            else:
+                sys.stderr.write(
+                    f"\nProvisionScript FAILED: {err}\n"
+                    "Falling back to printing the peer drop-in.\n")
+
+    if not provision_handled:
+        sys.stdout.write(
+            "\nEnrollment received.  Add this peer to the daemon:\n")
+        sys.stdout.write("=" * 60 + "\n")
+        sys.stdout.write(f"# /etc/wireguardrtc/peers.d/{label}.conf\n")
+        sys.stdout.write("[Peer]\n")
+        sys.stdout.write(f"PublicKey = {joiner_info['wg_pubkey']}\n")
+        sys.stdout.write("Mode = active\n")
+        sys.stdout.write("=" * 60 + "\n")
 
 
 def main():
