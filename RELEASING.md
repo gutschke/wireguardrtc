@@ -65,6 +65,19 @@ Keep `versionCode` monotonic: the Play Console rejects uploads whose `versionCod
      internal-testing channel.
 ```
 
+## Always-rebuild rule
+
+Every `git push` from this repo must end with a rebuild of all distributable artefacts, even when no GitHub Release or Play upload is planned for that push:
+
+```bash
+( cd daemon  && dpkg-buildpackage -us -uc -b )
+( cd android && ./gradlew :app:assembleRelease :app:bundleRelease )
+```
+
+The AAB is the easy one to forget — most local Android iteration only runs `:app:assembleRelease`, which leaves `app/build/outputs/bundle/release/app-release.aab` stale.  Forgetting to rebuild it before a Play upload either silently ships the previous source state or burns a `versionCode` slot when Play rejects the duplicate.  Same hazard for the `.deb`: a stale package in the parent directory gets `dpkg -i`-ed during smoke-testing and the daemon comes up at the previous version while git claims the new one.
+
+Treat the rebuild as part of the push, not part of the release.
+
 ## Hot-fix workflow
 
 For a critical fix between scheduled releases:
