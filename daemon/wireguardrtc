@@ -5236,6 +5236,69 @@ def cmd_check_nat(args):
     sys.exit(0 if any_viable else 1)
 
 
+# ─── Test-only flag gate ──────────────────────────────────────────────
+#
+# Some CLI flags bypass safety checks of the wormhole-pairing protocol
+# (and similar features later) so that automated test harnesses can
+# drive a flow end-to-end without a human at the terminal.  In normal
+# operation these flags are foot-guns: someone could accidentally
+# auto-accept a SAS phrase they should have verified, or advertise a
+# fabricated WG pubkey, or skip a wg(8) read.
+#
+# Single env-var gate: WIREGUARDRTC_ALLOW_TEST_FLAGS=1.  Without it:
+#  - Affected flags don't show up in `--help` (argparse.SUPPRESS).
+#  - If any of them appears on the command line, the daemon refuses
+#    to start and points the user at the env var.
+# With it:
+#  - The flags show up in `--help` with a [TEST-ONLY] tag.
+#  - On dispatch, a warning line is printed naming every test flag in
+#    effect so the override is obvious in transcripts / logs.
+
+TEST_FLAGS_ENABLED = (
+    os.environ.get("WIREGUARDRTC_ALLOW_TEST_FLAGS") == "1")
+
+_TEST_FLAG_ATTRS = (
+    # (argparse dest, CLI flag) for every test-only flag.
+    ("pubkey_override", "--pubkey-override"),
+    ("endpoint_override", "--endpoint-override"),
+    ("auto_confirm_sas", "--auto-confirm-sas"),
+)
+
+
+def _test_flag_help(text):
+    """Help-text wrapper: visible only when WIREGUARDRTC_ALLOW_TEST_FLAGS=1.
+    Otherwise the flag is registered with `argparse.SUPPRESS` so it's
+    invisible in `--help` but still recognised on the command line —
+    which lets us produce a clear "set the env var" error instead of
+    argparse's generic "unrecognized argument"."""
+    if TEST_FLAGS_ENABLED:
+        return f"[TEST-ONLY] {text}"
+    return argparse.SUPPRESS
+
+
+def _enforce_test_flag_gate(args):
+    """Refuse to honor any test-only flag without the env-var gate.
+    Conversely, print a loud warning when test flags ARE in effect so
+    the override is obvious in logs / CI transcripts."""
+    in_use = [cli for attr, cli in _TEST_FLAG_ATTRS
+              if getattr(args, attr, None)]
+    if in_use and not TEST_FLAGS_ENABLED:
+        sys.stderr.write(
+            f"Refusing to honor test-only flag(s): "
+            f"{', '.join(in_use)}.\n"
+            f"These flags bypass safety checks (SAS verification, "
+            f"live WG-state read, …) and are intended for automated "
+            f"test harnesses only.\n"
+            f"To enable: set WIREGUARDRTC_ALLOW_TEST_FLAGS=1 in the "
+            f"environment.\n")
+        sys.exit(2)
+    if in_use:
+        sys.stderr.write(
+            f"⚠️  WIREGUARDRTC_ALLOW_TEST_FLAGS=1: honoring "
+            f"{', '.join(in_use)}.  Don't use this outside a "
+            f"test harness.\n")
+
+
 def _read_broker_config(global_config_path):
     """Read [Signaling] Server / Key from the global config file.
     Falls back to defaults if the file doesn't exist or doesn't
@@ -5629,21 +5692,24 @@ def main():
                          "this device sent to the host.  Defaults to "
                          "this machine's hostname.")
     ap.add_argument("--pubkey-override", default=None,
-                    help="with --mint-wormhole: WG pubkey to advertise "
-                         "instead of reading from --iface.  Use with "
-                         "--endpoint-override.")
+                    help=_test_flag_help(
+                        "with --mint-wormhole: WG pubkey to advertise "
+                        "instead of reading from --iface.  Use with "
+                        "--endpoint-override."))
     ap.add_argument("--endpoint-override", default=None,
-                    help="with --mint-wormhole: external endpoint "
-                         "(ip:port) to advertise instead of reading "
-                         "from --iface.  Use with --pubkey-override.")
+                    help=_test_flag_help(
+                        "with --mint-wormhole: external endpoint "
+                        "(ip:port) to advertise instead of reading "
+                        "from --iface.  Use with --pubkey-override."))
     ap.add_argument("--auto-confirm-sas", action="store_true",
-                    help="with --mint-wormhole / --use-wormhole: "
-                         "auto-accept the SAS phrase without human "
-                         "verification.  DANGEROUS — defeats MITM "
-                         "protection.  Only for automated tests or "
-                         "scripted provisioning where the wormhole "
-                         "code is delivered out-of-band over a "
-                         "trusted channel.")
+                    help=_test_flag_help(
+                        "with --mint-wormhole / --use-wormhole: "
+                        "auto-accept the SAS phrase without human "
+                        "verification.  Defeats the wormhole "
+                        "protocol's MITM defence.  Only for automated "
+                        "tests or scripted provisioning where the "
+                        "wormhole code is delivered out-of-band over "
+                        "a trusted channel."))
     args = ap.parse_args()
 
     if args.show_config:
@@ -5656,9 +5722,11 @@ def main():
         cmd_check_nat(args)
         return
     if args.mint_wormhole:
+        _enforce_test_flag_gate(args)
         cmd_mint_wormhole(args)
         return
     if args.use_wormhole:
+        _enforce_test_flag_gate(args)
         cmd_use_wormhole(args)
         return
 
