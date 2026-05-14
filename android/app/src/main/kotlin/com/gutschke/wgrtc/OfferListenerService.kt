@@ -55,6 +55,29 @@ class OfferListenerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // UX1: a user tapping the notification's "Stop tracking"
+        // action delivers an Intent with action ACTION_DISMISS back
+        // to us.  We must still call startForeground() within the
+        // 5-second window before bailing — Android enforces it for
+        // EVERY startForegroundService delivery, including the
+        // sticky-redelivery case where the system recreates the
+        // process and re-runs us with the dismiss intent before we
+        // ever ran the normal start path.  Without this we'd hit
+        // ForegroundServiceDidNotStartInTimeException → ANR.
+        if (intent?.action == ACTION_DISMISS) {
+            Log.i(TAG, "ACTION_DISMISS received; stopping FGS")
+            startForegroundCompat(buildNotification(0))
+            // Cancel the activeCountFlow collector explicitly —
+            // otherwise it can keep running long enough to fire a
+            // new notify() AFTER we've cancelled the notification,
+            // creating a brief flicker / re-post race.  scope.cancel
+            // in onDestroy only runs after stopSelf's async teardown.
+            watchJob?.cancel()
+            watchJob = null
+            stopForegroundCompat(removeNotification = true)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         // Foreground promotion must happen within ~5 s of
         // startForegroundService(); doing it unconditionally on
         // every start keeps the contract simple. Re-issuing the
@@ -117,64 +140,32 @@ class OfferListenerService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun stopForegroundCompat(removeNotification: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(
+                if (removeNotification) STOP_FOREGROUND_REMOVE
+                else STOP_FOREGROUND_DETACH)
+        } else {
+            stopForeground(removeNotification)
+        }
+        if (removeNotification) {
+            // Belt-and-suspenders: also cancel the notification by
+            // id.  Without this the FGS notification can briefly
+            // linger on some Android builds because
+            // stopForeground(REMOVE) and the underlying service
+            // teardown race each other.
+            notificationManager.cancel(NOTIFICATION_ID)
+        }
+    }
+
     private fun buildNotification(count: Int): Notification {
-        val openApp = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
         val hidden = WgrtcApp.instance.settings.hideListenerNotification
-        val channel = if (hidden) CHANNEL_ID_HIDDEN else CHANNEL_ID
-        val text = if (count == 0)
-            "wgrtc — listening for endpoint updates"
-        else
-            "wgrtc — tracking $count tunnel${if (count == 1) "" else "s"}"
-        return NotificationCompat.Builder(this, channel)
-            .setContentTitle("wgrtc")
-            .setContentText(text)
-            // stat_sys_vpn_ic is not in the public android.R; use a
-            // stable system fallback that always renders.
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(openApp)
-            .setOngoing(true)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(
-                if (hidden) NotificationCompat.PRIORITY_MIN
-                else NotificationCompat.PRIORITY_LOW
-            )
-            .build()
+        return buildNotificationFor(this, count, hidden)
     }
 
     private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val normal = NotificationChannel(
-            CHANNEL_ID, "Endpoint tracking",
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description =
-                "Ongoing notification while wgrtc keeps your " +
-                "enrolled tunnels' server endpoints up to date."
-            setShowBadge(false)
-        }
-        // Min-importance channel for the hide-notification advanced
-        // setting. Android still requires a foreground-service to
-        // post *some* notification; this one's IMPORTANCE_MIN keeps
-        // it out of the shade. Users who care can re-enable from
-        // Settings inside the app or via Android's per-channel
-        // notification controls.
-        val hidden = NotificationChannel(
-            CHANNEL_ID_HIDDEN, "Endpoint tracking (hidden)",
-            NotificationManager.IMPORTANCE_MIN,
-        ).apply {
-            description =
-                "Minimum-importance version of the endpoint-tracking " +
-                "notification. Used when the in-app 'Hide listener " +
-                "notification' advanced setting is enabled."
-            setShowBadge(false)
-        }
-        notificationManager.createNotificationChannel(normal)
-        notificationManager.createNotificationChannel(hidden)
+        ensureChannelsOn(notificationManager)
     }
 
     private val notificationManager: NotificationManager
@@ -186,7 +177,130 @@ class OfferListenerService : Service() {
         const val NOTIFICATION_ID = 1
         const val TAG = "wgrtc-svc"
 
+        // UX1: notification action that the user can tap to stop
+        // the FGS without going to Settings.  Routed back to
+        // [onStartCommand] which calls stopForeground(REMOVE) +
+        // stopSelf().  Choosing a service-targeted intent (rather
+        // than a BroadcastReceiver hop) avoids a separate
+        // <receiver> in the manifest and matches what the system
+        // FGS lifecycle wants — the dismiss is a single-shot,
+        // start-then-stop command.
+        const val ACTION_DISMISS = "com.gutschke.wgrtc.OFFER_LISTENER_DISMISS"
+
+        // Action label exposed in the notification + asserted by
+        // the unit-style test.  Visible to the user.  "Stop
+        // tracking" leads with the verb users expect for "I want
+        // this off" — tapping it actually stops the endpoint-
+        // following work, not just the visual.  Parenthetical
+        // clarifies the side-effect.
+        const val ACTION_DISMISS_LABEL = "Stop tracking (dismiss)"
+
+        // Distinct PendingIntent request codes so the two getService
+        // / getActivity slots don't collide in the PendingIntent
+        // cache (Android keys reused PendingIntents by
+        // (Component, requestCode, Intent#filterEquals)).  Public
+        // constants so any other code touching the same intents
+        // hits the same slot — accidental collision would clobber
+        // one or the other.
+        const val REQ_OPEN_APP = 0
+        const val REQ_DISMISS = 1
+
         fun startIntent(context: Context): Intent =
             Intent(context, OfferListenerService::class.java)
+
+        fun dismissIntent(context: Context): Intent =
+            Intent(context, OfferListenerService::class.java)
+                .setAction(ACTION_DISMISS)
+
+        /**
+         * Create the notification channels on first launch.
+         * Idempotent — Android dedupes by channel id, so calling
+         * this multiple times is safe.  Exposed at the companion
+         * level so tests can prime the channels before posting a
+         * notification directly via NotificationManager.notify
+         * (without spinning up the whole service).
+         */
+        fun ensureChannelsOn(notificationManager: NotificationManager) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val normal = NotificationChannel(
+                CHANNEL_ID, "Endpoint tracking",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description =
+                    "Ongoing notification while wgrtc keeps your " +
+                    "enrolled tunnels' server endpoints up to date."
+                setShowBadge(false)
+            }
+            // Min-importance channel for the hide-notification
+            // advanced setting.  Android still requires a foreground
+            // service to post SOME notification; IMPORTANCE_MIN keeps
+            // it out of the shade.  Users can re-enable from in-app
+            // settings or per-channel system controls.
+            val hidden = NotificationChannel(
+                CHANNEL_ID_HIDDEN, "Endpoint tracking (hidden)",
+                NotificationManager.IMPORTANCE_MIN,
+            ).apply {
+                description =
+                    "Minimum-importance version of the endpoint-" +
+                    "tracking notification.  Used when the in-app " +
+                    "'Hide listener notification' advanced setting " +
+                    "is enabled."
+                setShowBadge(false)
+            }
+            notificationManager.createNotificationChannel(normal)
+            notificationManager.createNotificationChannel(hidden)
+        }
+
+        /**
+         * Build the FGS notification.  Pure-ish factory that takes
+         * the [hidden] choice as a parameter so tests don't have to
+         * wire up [WgrtcApp] / [SettingsStore] to exercise it.
+         */
+        fun buildNotificationFor(
+            context: Context,
+            count: Int,
+            hidden: Boolean,
+        ): Notification {
+            val openApp = PendingIntent.getActivity(
+                context, REQ_OPEN_APP,
+                Intent(context, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE
+                    or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val dismiss = PendingIntent.getService(
+                context, REQ_DISMISS,
+                dismissIntent(context),
+                PendingIntent.FLAG_IMMUTABLE
+                    or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val channel = if (hidden) CHANNEL_ID_HIDDEN else CHANNEL_ID
+            val text = if (count == 0)
+                "wgrtc — listening for endpoint updates"
+            else
+                "wgrtc — tracking $count tunnel${if (count == 1) "" else "s"}"
+            return NotificationCompat.Builder(context, channel)
+                .setContentTitle("wgrtc")
+                .setContentText(text)
+                // stat_sys_vpn_ic is not in the public android.R;
+                // use a stable system fallback that always renders.
+                .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setContentIntent(openApp)
+                .setOngoing(true)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setPriority(
+                    if (hidden) NotificationCompat.PRIORITY_MIN
+                    else NotificationCompat.PRIORITY_LOW
+                )
+                .addAction(
+                    // ic_menu_close_clear_cancel is in android.R and
+                    // therefore always available; no extra resource
+                    // baked into the APK.
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    ACTION_DISMISS_LABEL,
+                    dismiss,
+                )
+                .build()
+        }
     }
 }
