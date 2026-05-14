@@ -1826,8 +1826,18 @@ def get_iface_table(iface, field) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
-    """Returns (external_ip, external_port) on success, or None."""
+async def stun_query(server, timeout=STUN_TIMEOUT,
+                     family=socket.AF_INET) -> Optional[tuple]:
+    """Returns (external_ip, external_port) on success, or None.
+
+    The `family` kwarg selects IPv4 (AF_INET, default) or IPv6
+    (AF_INET6) for both the upstream getaddrinfo resolution and
+    the local UDP bind.  Dual-stack STUN servers (most public
+    services — Google, Cloudflare, …) accept queries over either
+    transport and return a family-appropriate reflexive address;
+    a host calling `stun_query` over v6 gets back the v6 ext IP
+    and vice versa.  The wire-format response parser already
+    handles both families (RFC 5389 §15.2)."""
     if ":" not in server:
         return None
     host, port_s = server.rsplit(":", 1)
@@ -1837,7 +1847,7 @@ async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
         return None
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, None, family=socket.AF_INET,
+        infos = await loop.getaddrinfo(host, None, family=family,
                                        type=socket.SOCK_DGRAM)
     except socket.gaierror:
         return None
@@ -1848,9 +1858,14 @@ async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
     txid = os.urandom(12)
     request = struct.pack("!HHL12s", 0x0001, 0, STUN_MAGIC_COOKIE, txid)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.setblocking(False)
-    sock.bind(("0.0.0.0", 0))
+    # AF_INET wildcards on "0.0.0.0"; AF_INET6 on "::".  Letting
+    # the kernel pick the source means STUN reflects whichever
+    # GUA the egress interface advertises — which is what we
+    # actually want to publish as the endpoint.
+    bind_addr = "0.0.0.0" if family == socket.AF_INET else "::"
+    sock.bind((bind_addr, 0))
     try:
         sock.sendto(request, (server_ip, port))
         deadline = loop.time() + timeout
@@ -1861,30 +1876,14 @@ async def stun_query(server, timeout=STUN_TIMEOUT) -> Optional[tuple]:
                                               timeout=remaining)
             except asyncio.TimeoutError:
                 return None
-            if len(data) < 20:
-                continue
-            msg_type, msg_len, magic, resp_txid = struct.unpack("!HHL12s",
-                                                                data[:20])
-            if (msg_type != 0x0101 or magic != STUN_MAGIC_COOKIE
-                    or resp_txid != txid):
-                continue
-            offset = 20
-            end = 20 + msg_len
-            while offset + 4 <= end:
-                atype, alen = struct.unpack("!HH", data[offset:offset + 4])
-                offset += 4
-                if atype == 0x0020 and alen >= 8:
-                    family = data[offset + 1]
-                    if family == 0x01:
-                        xport = struct.unpack("!H",
-                                              data[offset + 2:offset + 4])[0]
-                        xip = struct.unpack("!L",
-                                            data[offset + 4:offset + 8])[0]
-                        ext_port = xport ^ (STUN_MAGIC_COOKIE >> 16)
-                        ext_ip = socket.inet_ntoa(
-                            struct.pack("!L", xip ^ STUN_MAGIC_COOKIE))
-                        return ext_ip, ext_port
-                offset += alen + ((4 - (alen % 4)) % 4)
+            # Delegate to the shared parser, which handles both
+            # IPv4 (family 0x01) and IPv6 (family 0x02) XOR-MAPPED-
+            # ADDRESS attributes per RFC 5389 §15.2.  Previously
+            # stun_query had its own inline parser that only handled
+            # v4, so a v6 STUN response was silently dropped.
+            parsed = _parse_stun_xor_mapped(data, txid)
+            if parsed is not None:
+                return parsed
         return None
     finally:
         sock.close()
@@ -2043,6 +2042,99 @@ async def _stun_query_with_server(server):
     return server, await stun_query(server)
 
 
+async def _stun_query_with_server_family(server, family):
+    """Same wrapper, but pinned to a specific address family.  Used
+    by the dual-stack helper so v4 and v6 probes can be attributed
+    independently in logs / strict-mode filtering."""
+    return server, family, await stun_query(server, family=family)
+
+
+async def get_public_ips_all(stun_servers, state) -> list:
+    """Dual-stack reflexive-address discovery.  For each configured
+    STUN server, probe over IPv4 AND IPv6 in parallel and return a
+    deduped list of (family, ip) tuples in completion order.
+
+    A host that has v4-only connectivity returns only AF_INET
+    entries (v6 probes fail at getaddrinfo / bind / send, which
+    `stun_query` reports as None).  A dual-stack host returns
+    both families.
+
+    PublicIp override (single string OR comma-separated list of
+    addresses; each entry's family inferred from the address
+    itself) bypasses STUN entirely — same semantics as
+    [get_public_ipv4_all], extended for v6.
+
+    Strict mode (`[Stun] Strict = yes`) drops non-globally-
+    routable addresses regardless of family.
+
+    Returns `[]` when nothing usable came back."""
+    # PublicIp override path: comma-separated list, family inferred
+    # per entry.  Mirrors the wg-quick Address syntax so admins can
+    # use the same mental model.
+    if getattr(state, "public_ip", None):
+        out = []
+        for token in str(state.public_ip).split(","):
+            ip = token.strip()
+            if not ip:
+                continue
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                LOG.event("stun", "public_ip", ip,
+                          f"PublicIp override entry {ip!r} is not a "
+                          f"valid IP address; skipping",
+                          level=logging.WARNING)
+                continue
+            fam = (socket.AF_INET if isinstance(addr, ipaddress.IPv4Address)
+                   else socket.AF_INET6)
+            out.append((fam, str(addr)))
+            LOG.event("stun", "public_ip", str(addr),
+                      f"public {('IPv4' if fam == socket.AF_INET else 'IPv6')} "
+                      f"= {addr} (configured override; STUN skipped)")
+        return out
+    if not stun_servers:
+        return []
+    strict = getattr(state, "stun_strict", False)
+    # Submit both v4 and v6 probes for every server in parallel.
+    # Servers that don't have an AAAA record return None on the v6
+    # leg; hosts without v6 egress also return None.  Either way,
+    # nothing breaks — we just filter Nones below.
+    tasks = []
+    for server in stun_servers:
+        tasks.append(asyncio.create_task(
+            _stun_query_with_server_family(server, socket.AF_INET)))
+        tasks.append(asyncio.create_task(
+            _stun_query_with_server_family(server, socket.AF_INET6)))
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    seen: set = set()
+    out: list = []
+    for entry in raw:
+        if isinstance(entry, BaseException):
+            LOG.event("stun", "task-error", repr(entry),
+                      f"STUN task raised {type(entry).__name__}: "
+                      f"{entry}; continuing with surviving responses",
+                      level=logging.WARNING)
+            continue
+        server, family, result = entry
+        if result is None:
+            continue
+        ext_ip, _ = result
+        if strict and not _stun_response_passes_strict(server, ext_ip):
+            continue
+        if ext_ip in seen:
+            continue
+        seen.add(ext_ip)
+        out.append((family, ext_ip))
+        fam_label = "IPv4" if family == socket.AF_INET else "IPv6"
+        LOG.event("stun", "public_ip", ext_ip,
+                  f"public {fam_label} mapped as {ext_ip} via {server}")
+    if not out:
+        LOG.event("stun", "public_ip", None,
+                  "STUN: no valid response from any configured server "
+                  "(neither v4 nor v6)")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Step C: multi-candidate enumeration
 # ---------------------------------------------------------------------------
@@ -2103,6 +2195,37 @@ def _is_candidate_eligible_v4(ip_str: str) -> bool:
     if addr.is_reserved: return False
     if addr in _RFC7335_CLAT: return False
     return True
+
+
+def _is_candidate_eligible_v6(ip_str: str) -> bool:
+    """True if `ip_str` is a v6 IP usable as a candidate.  Drops
+    loopback (::1), link-local (fe80::/10), multicast (ff00::/8),
+    unspecified (::), and v4-mapped (::ffff:0:0/96 — those should
+    travel as their v4 form, not as a v6 candidate).  Keeps GUA
+    AND ULA (fc00::/7) — admins running an internal-only mesh over
+    ULA legitimately want those advertised inside their network."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(addr, ipaddress.IPv6Address):
+        return False
+    if addr.is_loopback or addr.is_link_local: return False
+    if addr.is_multicast or addr.is_unspecified: return False
+    if addr.ipv4_mapped is not None: return False
+    return True
+
+
+def _is_candidate_eligible(ip_str: str) -> bool:
+    """Family-agnostic eligibility — dispatches to the v4 or v6
+    helper based on whether the address parses as v4 or v6."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return False
+    if isinstance(addr, ipaddress.IPv4Address):
+        return _is_candidate_eligible_v4(ip_str)
+    return _is_candidate_eligible_v6(ip_str)
 
 
 def _is_private_v4(ip_str: str) -> bool:
@@ -2351,7 +2474,11 @@ async def discover_local_candidates(
     """
     iface_addrs_provider = iface_addrs_provider or _enumerate_iface_addrs_v4
     default_iface_provider = default_iface_provider or _default_route_iface_v4
-    stun_provider = stun_provider or get_public_ipv4_all
+    # Default to the dual-stack helper.  It returns
+    # `[(family, ip), …]`; the loop below also accepts the legacy
+    # flat-list `[ip, ip, …]` form (= all-v4) so tests that pre-date
+    # the v6 work keep passing.
+    stun_provider = stun_provider or get_public_ips_all
     own_wg = set(own_wg_ifaces or [])
     advertise_set = set(global_config.advertise_interfaces)
     suppress_set = set(global_config.suppress_interfaces)
@@ -2391,14 +2518,25 @@ async def discover_local_candidates(
             "kind": kind, "_rank": rank,
         })
 
-    # Rank 0: PublicIp override.
-    if getattr(global_config, "public_ip", None):
-        if _is_candidate_eligible_v4(global_config.public_ip):
-            _add(global_config.public_ip, "stun", 0)
+    # Rank 0: PublicIp override.  Comma-separated form covers dual-
+    # stack — admin sets `PublicIp = 203.0.113.5, 2001:db8::5` to
+    # publish both families.  Single-address form is back-compat.
+    pub = getattr(global_config, "public_ip", None)
+    if pub:
+        for entry in str(pub).split(","):
+            ip = entry.strip()
+            if ip and _is_candidate_eligible(ip):
+                _add(ip, "stun", 0)
 
-    # Rank 10: STUN reflexive (deduped vs PublicIp).
-    for ip in (stun_ips or []):
-        if _is_candidate_eligible_v4(ip):
+    # Rank 10: STUN reflexive (deduped vs PublicIp).  Accept both
+    # the legacy flat-list form ("1.2.3.4") and the new dual-stack
+    # tuple form ((AF_INET, "1.2.3.4")).
+    for entry in (stun_ips or []):
+        if isinstance(entry, tuple) and len(entry) >= 2:
+            ip = entry[1]
+        else:
+            ip = entry
+        if _is_candidate_eligible(ip):
             _add(ip, "stun", 10)
 
     # Rank 20-60: local interface addresses.
