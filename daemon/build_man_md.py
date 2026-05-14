@@ -205,10 +205,16 @@ def convert(text, source_name="man"):
     # Accumulator for normal paragraph text; flushed on macro boundaries.
     para = []
     # When set, the next chunk of output (whether from a macro or
-    # from plain text) becomes the TP tag instead of paragraph
-    # content.  The next paragraph after the tag is the body, indented
-    # under the tag bullet.
+    # from plain text) becomes the TP tag (or the IP bullet content)
+    # instead of paragraph content.  After the capture flushes, body
+    # paragraphs are indented under the bullet.
     tp_capture = None  # None or a list to accumulate the tag
+    # If set, the captured content is emitted on the SAME line as
+    # this prefix (used for .IP bullets where the prefix is `- ` and
+    # the content has to share the line so deeper nesting doesn't
+    # cross the 4-space code-block threshold).  When None, the
+    # default `- **tag**` form is used.
+    tp_capture_bullet_prefix = None
 
     def flush_para():
         nonlocal tp_capture
@@ -228,23 +234,31 @@ def convert(text, source_name="man"):
         out.append(text_out)
         para.clear()
 
-    def emit_tp_tag(tag_md):
-        """Emit `- **tag**` at the current indent, then push a deeper
-        indent so the body lines fall under the bullet."""
+    def emit_tp_tag(tag_md, bullet_prefix=None):
+        """Emit a bullet line and push a body indent so the next
+        paragraphs fall under it.  When `bullet_prefix` is None
+        (default), use `<current_indent>- {tag_md}` — the .TP case.
+        When set, use the explicit prefix and inline the tag content
+        on the same line — the .IP-with-tag case."""
         out.append("")
-        out.append(f"{indent_stack[-1]}- {tag_md}")
+        if bullet_prefix is None:
+            out.append(f"{indent_stack[-1]}- {tag_md}")
+        else:
+            out.append(f"{bullet_prefix}{tag_md}")
         indent_stack.append(indent_stack[-1] + "  ")
 
     def maybe_emit_tp():
         """Called after every line that might contribute to a TP tag.
         If we now have at least one piece of tag content, emit the
         tag and transition to body mode (push indent)."""
-        nonlocal tp_capture
+        nonlocal tp_capture, tp_capture_bullet_prefix
         if tp_capture is not None and tp_capture:
             tag_md = "".join(tp_capture).strip() or "*(no tag)*"
+            prefix = tp_capture_bullet_prefix
             tp_capture = None
-            emit_tp_tag(tag_md)
-            tp_depth_marks.append(True)
+            tp_capture_bullet_prefix = None
+            emit_tp_tag(tag_md, bullet_prefix=prefix)
+            block_kinds.append("tp")
 
     def close_tp_if_open():
         """If we're currently inside a TP body (indented), pop the
@@ -256,12 +270,22 @@ def convert(text, source_name="man"):
         # an explicit flag.
         pass
 
-    # State stack for indent (RS/RE) AND TP body.  Each entry is an
-    # indent prefix.
+    # Indent prefix for the current block.  Indent_stack[0] = "" is
+    # the section margin.  Each .TP / .IP-with-tag pushes a deeper
+    # prefix; .RS pushes a marker without changing the indent (it
+    # acts as a barrier so .IP's pop-walk stops there).
     indent_stack = [""]
-    # Track which entries on the indent stack came from a TP body
-    # (so .PP / .SH can pop them).  A simple parallel-list flag.
-    tp_depth_marks = []
+    # Parallel to indent_stack but one shorter (no entry for the
+    # bottom "" element).  Each entry tags how its corresponding
+    # indent_stack level got pushed:
+    #   "tp" — by .TP or .IP-with-tag (poppable by .PP / next .TP/.IP
+    #          / .SH / .SS / .RE-of-containing-RS)
+    #   "rs" — by .RS (poppable only by the matching .RE; acts as a
+    #          floor for pop_tp_levels so an .IP inside .RS doesn't
+    #          tear down the surrounding .TP body).
+    # When the kind is "rs", the corresponding indent_stack entry is
+    # the SAME prefix as the previous level (no indent change).
+    block_kinds = []
     # Are we inside a synopsis block (.SY/.YS)?
     in_synopsis = False
     synopsis_buf = []
@@ -269,10 +293,13 @@ def convert(text, source_name="man"):
     in_pre = False
 
     def pop_tp_levels():
-        """Pop every TP-introduced indent level on top of the stack."""
-        while indent_stack and tp_depth_marks and tp_depth_marks[-1]:
+        """Pop TP/IP indent levels back down to the nearest .RS
+        barrier (or the section margin if no .RS is active).  Called
+        on .PP / .SH / .SS / next .TP / next .IP-with-tag — anything
+        that says "we're done with the current bullet's body"."""
+        while block_kinds and block_kinds[-1] == "tp":
             indent_stack.pop()
-            tp_depth_marks.pop()
+            block_kinds.pop()
 
     title_set = False
 
@@ -293,7 +320,7 @@ def convert(text, source_name="man"):
                 tag_md = "".join(tp_capture).strip() or "*(no tag)*"
                 tp_capture = None
                 emit_tp_tag(tag_md)
-                tp_depth_marks.append(True)
+                block_kinds.append("tp")
             if not in_pre:
                 out.append("")
             else:
@@ -348,7 +375,7 @@ def convert(text, source_name="man"):
             out.append(f"## {heading}")
             out.append("")
             indent_stack[:] = [""]
-            tp_depth_marks[:] = []
+            block_kinds[:] = []
             continue
 
         if macro == "SS":
@@ -360,7 +387,7 @@ def convert(text, source_name="man"):
             out.append(f"### {heading}")
             out.append("")
             indent_stack[:] = [""]
-            tp_depth_marks[:] = []
+            block_kinds[:] = []
             continue
 
         if macro in ("PP", "LP", "P"):
@@ -393,36 +420,66 @@ def convert(text, source_name="man"):
             continue
 
         if macro == "IP":
-            # .IP [TAG] [INDENT-WIDTH] — works like a flat .TP whose
-            # tag is on the same line.  Push the body indent so the
-            # paragraph text following lands inside the bullet
-            # instead of resetting to the section margin.
-            flush_para()
-            pop_tp_levels()
+            # .IP [TAG] [INDENT-WIDTH] semantics:
+            #   - With a bullet tag (\\(bu): start a new bullet.  The
+            #     CONTENT (next non-macro line, or the next inline-
+            #     emphasis macro's output) gets put on the SAME line
+            #     as `- ` — putting it on a separate indented line
+            #     would let Markdown's 4-space-indent rule treat the
+            #     content as a code block, especially at deeper nest
+            #     levels (e.g. inside a .TP body inside an .RS).
+            #   - With a label tag: bold the label on the bullet line,
+            #     content follows the same rule.
+            #   - With no tag: just a paragraph break at the current
+            #     indent (idiomatic troff way to start a new para
+            #     inside a TP body or RS block).
             args = _split_args(rest)
             tag = args[0] if args else ""
+            if not tag:
+                # Naked .IP — paragraph break WITHIN the current
+                # body (TP body, RS block, …).  Do NOT pop tp levels:
+                # the source uses this idiom specifically to start
+                # another paragraph under the same bullet.
+                flush_para()
+                out.append("")
+                continue
+            # Bullet-with-tag: this DOES end the previous IP's body
+            # (a new bullet at the same level), so pop those.
+            flush_para()
+            pop_tp_levels()
             if tag in ("\\(bu", "•", "*", "o"):
-                bullet_line = f"{indent_stack[-1]}- "
-            elif tag:
-                bullet_line = f"{indent_stack[-1]}- **{_inline(tag)}**"
+                ip_bullet_prefix = f"{indent_stack[-1]}- "
             else:
-                # No tag — emit an anonymous list item header so the
-                # body still indents.
-                bullet_line = f"{indent_stack[-1]}- "
-            out.append(bullet_line)
-            indent_stack.append(indent_stack[-1] + "  ")
-            tp_depth_marks.append(True)
+                ip_bullet_prefix = (
+                    f"{indent_stack[-1]}- **{_inline(tag)}** ")
+            # Capture the next text/macro line as the bullet content,
+            # to be emitted on the SAME line as the prefix.
+            tp_capture = []
+            tp_capture_bullet_prefix = ip_bullet_prefix
             continue
 
         if macro == "RS":
-            indent_stack.append(indent_stack[-1] + "  ")
-            tp_depth_marks.append(False)
+            # Push an "rs" barrier onto block_kinds.  The indent
+            # itself doesn't change (re-use the current prefix) —
+            # Markdown's nested list takes care of visual nesting
+            # via the bullet hierarchy and adding an extra `  `
+            # here would push bullets past the 4-space code-block
+            # threshold.  The barrier exists so that an .IP inside
+            # this .RS doesn't tear down the surrounding .TP body
+            # via pop_tp_levels().
+            flush_para()
+            indent_stack.append(indent_stack[-1])
+            block_kinds.append("rs")
             continue
         if macro == "RE":
-            if len(indent_stack) > 1:
+            # Pop everything down to and including the topmost "rs".
+            flush_para()
+            while block_kinds and block_kinds[-1] != "rs":
                 indent_stack.pop()
-                if tp_depth_marks:
-                    tp_depth_marks.pop()
+                block_kinds.pop()
+            if block_kinds and block_kinds[-1] == "rs":
+                indent_stack.pop()
+                block_kinds.pop()
             continue
 
         if macro == "EX":
