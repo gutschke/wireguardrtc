@@ -275,8 +275,9 @@ def classify_nat_result(probes):
         return NatVerdict(
             kind="no_nat_or_cone_port_preserving",
             port_preserving=True, cone=True, external_ips=external_ips,
-            summary="Port-preserving cone NAT (or no NAT at all).  wgrtc's "
-                    "hole-punch is expected to work as designed.",
+            summary="Port-preserving — direct hole-punch works.  "
+                    "(Whether NAT is actually present is determined "
+                    "separately by comparing local vs external address.)",
             wgrtc_viable=True)
 
     if cone is True and not preserving:
@@ -3966,6 +3967,40 @@ def cmd_enroll_token(args):
     )
 
 
+def _reverse_dns(ip, timeout=2.0):
+    """Best-effort PTR lookup with a wall-clock timeout.  Returns the
+    hostname on success, None on failure or timeout.  Runs in a
+    daemon thread so the main thread can move on if the resolver is
+    slow or unreachable."""
+    import threading
+    result = [None]
+
+    def worker():
+        try:
+            host, _, _ = socket.gethostbyaddr(ip)
+            result[0] = host
+        except Exception:
+            pass
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    return result[0]
+
+
+def _ip_equal(a, b):
+    """Compare two address strings for representational equality.
+    Canonicalises via inet_pton/inet_ntop so e.g. '::1' == '0:0:0:0:0:0:0:1'."""
+    if a is None or b is None:
+        return False
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            return socket.inet_pton(fam, a) == socket.inet_pton(fam, b)
+        except OSError:
+            continue
+    return a == b
+
+
 def _discover_local_ip(family):
     """Ask the kernel which local address it would route outbound traffic
     over for the given family.  Returns the address as a string, or None
@@ -4052,6 +4087,13 @@ def _check_nat_family(family, servers, src_ports):
     return probes, failures, family_label
 
 
+def _format_with_rdns(ip):
+    """Return 'IP' or 'IP (rdns)' if reverse lookup succeeds within the
+    short timeout.  Used for one-line address display."""
+    host = _reverse_dns(ip, timeout=2.0) if ip else None
+    return f"{ip} ({host})" if host else (ip or "(none)")
+
+
 def _print_family_verdict(family, servers, src_ports):
     """Run a single-family probe and print its section.  Returns True if
     the family is viable for wgrtc (port-preserving cone or single
@@ -4059,7 +4101,7 @@ def _print_family_verdict(family, servers, src_ports):
     family_label = "IPv4" if family == socket.AF_INET else "IPv6"
     local_ip = _discover_local_ip(family)
     print(f"━━ {family_label} ━━")
-    print(f"Local address: {local_ip or '(no route)'}")
+    print(f"Local address: {_format_with_rdns(local_ip)}")
     if local_ip is None:
         print(f"No {family_label} route on this host — skipping STUN probe.")
         print()
@@ -4069,8 +4111,24 @@ def _print_family_verdict(family, servers, src_ports):
     probes, failures, _ = _check_nat_family(family, servers, src_ports)
     verdict = classify_nat_result(probes)
     print()
-    ext_ips = verdict.external_ips or ["(none)"]
-    print(f"External {family_label}: {', '.join(ext_ips)}")
+    if verdict.external_ips:
+        for ip in verdict.external_ips:
+            print(f"External {family_label}: {_format_with_rdns(ip)}")
+    else:
+        print(f"External {family_label}: (none)")
+    # NAT presence is orthogonal to port-preservation: a network can
+    # legitimately have no NAT (IPv6 direct), or NAT (RFC1918 v4, or
+    # NAT66/NPT on v6 with a different external prefix), and either
+    # case may be port-preserving from STUN's perspective.  Compute
+    # this independently of the port classifier.
+    if verdict.external_ips:
+        nat_detected = not any(_ip_equal(local_ip, ext)
+                                for ext in verdict.external_ips)
+        if nat_detected:
+            print(f"NAT presence:  detected "
+                  f"(external address differs from local)")
+        else:
+            print(f"NAT presence:  none — direct end-to-end")
     print(f"Verdict:       {verdict.kind}")
     print(f"  cone:             {verdict.cone}")
     print(f"  port-preserving:  {verdict.port_preserving}")

@@ -30,6 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,6 +51,10 @@ import com.gutschke.wgrtc.signalling.IpFamily
 import com.gutschke.wgrtc.signalling.NatClassification
 import com.gutschke.wgrtc.signalling.NatType
 import com.gutschke.wgrtc.signalling.classifyNat
+import com.gutschke.wgrtc.signalling.lookupIsp
+import com.gutschke.wgrtc.signalling.reverseDns
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -406,9 +411,18 @@ private fun NetworkCheckVerdict(r: NatClassification) {
             viable = false
         }
         r.natType == NatType.CONE_PRESERVING -> {
-            headline = "$familyLabel: port-preserving" +
-                (if (r.family == IpFamily.V6) " (no NAT typical)"
-                 else " cone NAT (or none)")
+            // Disambiguate "port-preserving cone NAT" from "no NAT at
+            // all" using the local-vs-external comparison the classifier
+            // has already done.
+            headline = when (r.natDetected) {
+                false -> "$familyLabel: no NAT — direct end-to-end"
+                true ->
+                    if (r.family == IpFamily.V6)
+                        "$familyLabel: NAT66 / NPT, port-preserving"
+                    else
+                        "$familyLabel: cone NAT, port-preserving"
+                null -> "$familyLabel: port-preserving"
+            }
             detail = "wgrtc's hole-punch should work as designed " +
                 "over $familyLabel."
             viable = true
@@ -445,19 +459,59 @@ private fun NetworkCheckVerdict(r: NatClassification) {
     )
     Spacer(Modifier.height(4.dp))
     Text(detail, style = MaterialTheme.typography.bodyMedium)
+
+    // Background reverse-DNS + ISP lookups.  These are best-effort
+    // UI sugar — the verdict itself doesn't wait for them.  Each
+    // lookup independently writes its result into local state, which
+    // triggers a recomposition when it arrives (or when the timeout
+    // hits and we never set anything).
+    var localRdns by remember(r) { mutableStateOf<String?>(null) }
+    var externalRdns by remember(r) { mutableStateOf<String?>(null) }
+    var isp by remember(r) { mutableStateOf<String?>(null) }
+    LaunchedEffect(r) {
+        coroutineScope {
+            r.localIp?.let { li ->
+                launch { localRdns = reverseDns(li) }
+            }
+            r.externalIp?.let { ei ->
+                launch { externalRdns = reverseDns(ei) }
+                launch { isp = lookupIsp(ei) }
+            }
+        }
+    }
+
     val localIp = r.localIp
     val externalIp = r.externalIp
     if (localIp != null) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "Local $familyLabel: $localIp",
+            "Local $familyLabel: $localIp" +
+                (localRdns?.let { "  ($it)" } ?: ""),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
     if (externalIp != null) {
         Text(
-            "External $familyLabel: $externalIp",
+            "External $familyLabel: $externalIp" +
+                (externalRdns?.let { "  ($it)" } ?: ""),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    // NAT presence: shown only after the verdict so the user can read
+    // it alongside the addresses they're already looking at.
+    if (r.natDetected != null && r.localIp != null && r.externalIp != null) {
+        Text(
+            if (r.natDetected == true) "NAT: detected (external differs from local)"
+            else "NAT: none — direct end-to-end",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    isp?.let {
+        Text(
+            "ISP: $it",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

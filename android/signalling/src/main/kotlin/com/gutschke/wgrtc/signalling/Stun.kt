@@ -87,6 +87,15 @@ data class NatClassification(
     /** Address family this classification applies to.  Two passes
      * (v4 + v6) on dual-stack networks may yield different verdicts. */
     val family: IpFamily,
+    /** True if the external address differs from the local address
+     * (any kind of address translation in the path: NAT44, NAT66,
+     * NPTv6, CGNAT, SLAAC privacy address remap, …).  False if local
+     * matches external (direct end-to-end routing).  Null when we
+     * couldn't determine either side.  Orthogonal to port-preservation
+     * — a port-preserving cone NAT and a direct route both look the
+     * same to STUN; only the local↔external comparison tells them
+     * apart. */
+    val natDetected: Boolean?,
     /** All distinct (externalIp, externalPort) we observed; useful for
      * diagnostics when multiple STUN servers disagree. */
     val observations: List<StunMapping>,
@@ -374,13 +383,13 @@ fun classifyNat(
     val localIp = discoverLocalAddress(family)
     if (servers.isEmpty()) {
         return NatClassification(
-            NatType.UNKNOWN, null, localIp, family, emptyList(),
+            NatType.UNKNOWN, null, localIp, family, null, emptyList(),
             "no servers supplied")
     }
     if (localIp == null) {
         val familyName = if (family == IpFamily.V4) "IPv4" else "IPv6"
         return NatClassification(
-            NatType.UNKNOWN, null, null, family, emptyList(),
+            NatType.UNKNOWN, null, null, family, null, emptyList(),
             "no $familyName route on this device")
     }
 
@@ -394,7 +403,7 @@ fun classifyNat(
         }
     } catch (_: Exception) {
         return NatClassification(
-            NatType.UNKNOWN, null, localIp, family, emptyList(),
+            NatType.UNKNOWN, null, localIp, family, null, emptyList(),
             "could not allocate a source port")
     }
 
@@ -406,7 +415,7 @@ fun classifyNat(
 
     if (obs.isEmpty()) {
         return NatClassification(
-            NatType.UNKNOWN, null, localIp, family, emptyList(),
+            NatType.UNKNOWN, null, localIp, family, null, emptyList(),
             "no STUN responses received")
     }
 
@@ -416,15 +425,28 @@ fun classifyNat(
     val ipNote = if (ips.size > 1)
         " (multi-WAN? saw external IPs: ${ips.sorted().joinToString(",")})" else ""
 
+    // Orthogonal to port classification: did the address get
+    // rewritten in the path?  Compare via InetAddress equality so
+    // representational quirks (`::1` vs `0:0:0:0:0:0:0:1`) don't
+    // produce a false positive.
+    val natDetected: Boolean? = run {
+        val locAddr = runCatching { InetAddress.getByName(localIp) }.getOrNull()
+            ?: return@run null
+        val extAddrs = obs.mapNotNull {
+            runCatching { InetAddress.getByName(it.externalIp) }.getOrNull()
+        }.toSet()
+        if (extAddrs.isEmpty()) null else locAddr !in extAddrs
+    }
+
     return when {
         ports.size > 1 -> NatClassification(
-            NatType.SYMMETRIC, externalIp, localIp, family, obs,
+            NatType.SYMMETRIC, externalIp, localIp, family, natDetected, obs,
             "external port differs per server${ipNote} — symmetric NAT")
         ports.first() == sourcePort -> NatClassification(
-            NatType.CONE_PRESERVING, externalIp, localIp, family, obs,
-            "external port == source port${ipNote} — port-preserving cone NAT (or none)")
+            NatType.CONE_PRESERVING, externalIp, localIp, family, natDetected, obs,
+            "external port == source port${ipNote} — port-preserving")
         else -> NatClassification(
-            NatType.CONE_REMAPPED, externalIp, localIp, family, obs,
+            NatType.CONE_REMAPPED, externalIp, localIp, family, natDetected, obs,
             "external port consistent but != source${ipNote} — cone but not preserving")
     }
 }
