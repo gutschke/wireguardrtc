@@ -52,6 +52,47 @@ def _split_args(line):
     return out
 
 
+def _inline_escapes_only(s):
+    """Translate character escapes only — `\\-` → `-`, `\\&` → empty,
+    `\\(em` → `—`, etc.  Drops font-change sequences (`\\fB`, `\\fI`,
+    `\\fR`, `\\fP`) entirely rather than emitting HTML tags, since
+    this helper is used for preformatted blocks where HTML doesn't
+    render."""
+    if not s:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            c = s[i + 1]
+            if c == "f" and i + 2 < n:
+                # font change — drop the 3-char sequence
+                i += 3
+                continue
+            if c == "(":
+                if s[i:i+4] == "\\(bu":
+                    out.append("*"); i += 4; continue
+                if s[i:i+4] == "\\(em":
+                    out.append("--"); i += 4; continue
+                if s[i:i+4] == "\\(en":
+                    out.append("-"); i += 4; continue
+                # unknown special — drop the 4-char sequence
+                i += 4
+                continue
+            if c == "-":
+                out.append("-"); i += 2; continue
+            if c == "&":
+                i += 2; continue
+            if c == "\\":
+                out.append("\\"); i += 2; continue
+            # unknown backslash — keep next char, drop backslash
+            out.append(c); i += 2; continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def _inline(s):
     """Translate inline troff escapes into Markdown.  Bold/italic
     runs (\\fB ... \\fR) are converted to **bold** / *italic*.
@@ -223,6 +264,7 @@ def convert(text, source_name="man"):
     tp_depth_marks = []
     # Are we inside a synopsis block (.SY/.YS)?
     in_synopsis = False
+    synopsis_buf = []
     # Are we inside an example/preformatted block (.EX/.EE or .nf/.fi)?
     in_pre = False
 
@@ -260,7 +302,12 @@ def convert(text, source_name="man"):
         # Non-macro line.
         if not raw.startswith(".") and not raw.startswith("'"):
             if in_pre:
-                out.append(raw)
+                # Code-block content still needs troff character
+                # escapes processed (\-, \&, \(em, …) so users don't
+                # see literal backslashes in the rendered fence.  We
+                # use the "escapes only" helper because HTML emphasis
+                # tags wouldn't render inside ``` anyway.
+                out.append(_inline_escapes_only(raw))
             elif tp_capture is not None:
                 # The .TP's tag line is plain text — capture it and
                 # immediately emit (a tag is one source line).
@@ -296,7 +343,7 @@ def convert(text, source_name="man"):
             flush_para()
             pop_tp_levels()
             args = _split_args(rest)
-            heading = " ".join(args) if args else ""
+            heading = " ".join(_inline(a) for a in args) if args else ""
             out.append("")
             out.append(f"## {heading}")
             out.append("")
@@ -308,7 +355,7 @@ def convert(text, source_name="man"):
             flush_para()
             pop_tp_levels()
             args = _split_args(rest)
-            heading = " ".join(args) if args else ""
+            heading = " ".join(_inline(a) for a in args) if args else ""
             out.append("")
             out.append(f"### {heading}")
             out.append("")
@@ -346,16 +393,25 @@ def convert(text, source_name="man"):
             continue
 
         if macro == "IP":
-            # .IP [TAG] [INDENT-WIDTH]
+            # .IP [TAG] [INDENT-WIDTH] — works like a flat .TP whose
+            # tag is on the same line.  Push the body indent so the
+            # paragraph text following lands inside the bullet
+            # instead of resetting to the section margin.
             flush_para()
+            pop_tp_levels()
             args = _split_args(rest)
             tag = args[0] if args else ""
             if tag in ("\\(bu", "•", "*", "o"):
-                out.append(f"{indent_stack[-1]}- ")
+                bullet_line = f"{indent_stack[-1]}- "
             elif tag:
-                out.append(f"{indent_stack[-1]}- **{_inline(tag)}**")
+                bullet_line = f"{indent_stack[-1]}- **{_inline(tag)}**"
             else:
-                out.append("")
+                # No tag — emit an anonymous list item header so the
+                # body still indents.
+                bullet_line = f"{indent_stack[-1]}- "
+            out.append(bullet_line)
+            indent_stack.append(indent_stack[-1] + "  ")
+            tp_depth_marks.append(True)
             continue
 
         if macro == "RS":
@@ -394,28 +450,41 @@ def convert(text, source_name="man"):
             continue
 
         if macro == "SY":
-            # Synopsis opener: bolded command name + collected args until YS.
+            # Synopsis opener.  Buffer the command line into
+            # `synopsis_buf` until .YS so all the in-line .B / .OP
+            # macros that follow contribute to the same logical
+            # synopsis paragraph instead of escaping into the
+            # surrounding flow.
             flush_para()
-            out.append("")
             in_synopsis = True
-            cmd = rest.strip()
-            out.append(f"**{cmd}**  ")
+            synopsis_buf[:] = [f"<b>{_inline(rest.strip())}</b>"]
             continue
         if macro == "YS":
+            if synopsis_buf:
+                out.append("")
+                out.append(" ".join(synopsis_buf))
+                out.append("")
             in_synopsis = False
-            out.append("")
+            synopsis_buf[:] = []
             continue
         if macro == "OP":
-            # Synopsis option marker → [arg]
+            # Synopsis option marker → [arg arg …]
             args = _split_args(rest)
-            out.append(f"&nbsp;&nbsp;\\[{' '.join(args)}\\]  ")
+            arg_text = " ".join(_inline(a) for a in args)
+            piece = f"\\[{arg_text}\\]"
+            if in_synopsis:
+                synopsis_buf.append(piece)
+            else:
+                out.append(piece)
             continue
 
-        # Inline-emphasis macros — produce a fragment that either goes
-        # to the TP-tag accumulator (if active) or the current
-        # paragraph.
+        # Inline-emphasis macros — produce a fragment that goes to
+        # the active sink: synopsis buffer > TP-tag accumulator >
+        # current paragraph.
         def _append_inline(fragment):
-            if tp_capture is not None:
+            if in_synopsis:
+                synopsis_buf.append(fragment)
+            elif tp_capture is not None:
                 tp_capture.append(fragment)
             else:
                 para.append(fragment)
