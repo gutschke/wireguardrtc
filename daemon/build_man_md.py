@@ -77,6 +77,14 @@ def _inline_escapes_only(s):
                     out.append("--"); i += 4; continue
                 if s[i:i+4] == "\\(en":
                     out.append("-"); i += 4; continue
+                if s[i:i+4] == "\\(+-":
+                    out.append("+/-"); i += 4; continue
+                if s[i:i+4] == "\\(co":
+                    out.append("(c)"); i += 4; continue
+                if s[i:i+4] == "\\(rg":
+                    out.append("(R)"); i += 4; continue
+                if s[i:i+4] == "\\(de":
+                    out.append("deg"); i += 4; continue
                 # unknown special — drop the 4-char sequence
                 i += 4
                 continue
@@ -142,6 +150,22 @@ def _inline(s):
                     out.append("–")
                     i += 4
                     continue
+                if s[i:i+4] == "\\(+-":
+                    out.append("±")
+                    i += 4
+                    continue
+                if s[i:i+4] == "\\(co":
+                    out.append("©")
+                    i += 4
+                    continue
+                if s[i:i+4] == "\\(rg":
+                    out.append("®")
+                    i += 4
+                    continue
+                if s[i:i+4] == "\\(de":
+                    out.append("°")
+                    i += 4
+                    continue
                 # unknown special — drop the 4-char sequence so
                 # output is at least readable.
                 i += 4
@@ -168,6 +192,91 @@ def _inline(s):
     if open_marker:
         out.append(open_marker)
     return "".join(out)
+
+
+def _render_tbl(buf):
+    """Render a tbl(1) table body (the lines between .TS and .TE) into
+    a GitHub-flavoured Markdown table.  The subset of tbl(1) we handle
+    matches what wireguardrtc(8) uses: a single format-spec line
+    (`l l lx.`), an optional `_` divider acting as a header separator,
+    and rows whose cells are tab-separated.  A trailing column whose
+    content opens with `T{` and closes with `T}` on a later line gets
+    its body lines joined with a single space."""
+    # Step 1: locate the format spec.  It's the first non-empty line
+    # whose stripped text ends with `.`.  Everything before it is
+    # global-options (tab(;), allbox, …) which we ignore for now.
+    spec = None
+    body_start = 0
+    for idx, line in enumerate(buf):
+        s = line.strip()
+        if not s:
+            continue
+        if s.endswith("."):
+            spec = s[:-1].strip()
+            body_start = idx + 1
+            break
+    cols = max(1, len(spec.split())) if spec else 1
+
+    # Step 2: walk the body, collecting rows.  A row is a list of
+    # cell strings; the special row `["_"]` marks a horizontal
+    # divider (typically the header separator).
+    rows = []
+    multi = None  # accumulator for a T{ … T} multi-line cell
+    cur = []     # cells of the current row being built
+    for line in buf[body_start:]:
+        if multi is not None:
+            if line.strip() == "T}":
+                cur.append(" ".join(multi).strip())
+                multi = None
+                rows.append(cur)
+                cur = []
+            else:
+                multi.append(_inline(line.strip()))
+            continue
+        s = line.rstrip()
+        if not s.strip():
+            continue
+        if s.strip() == "_":
+            # Horizontal divider — header separator.
+            rows.append(["_"])
+            continue
+        cells = s.split("\t")
+        if cells and cells[-1].strip() == "T{":
+            for c in cells[:-1]:
+                cur.append(_inline(c.strip()))
+            multi = []
+            continue
+        for c in cells:
+            cur.append(_inline(c.strip()))
+        rows.append(cur)
+        cur = []
+    if cur:
+        rows.append(cur)
+
+    # Step 3: locate the header.  If we saw a `_` divider, the row
+    # immediately before it is the header; otherwise the first row.
+    header = None
+    body = []
+    sep_idx = next((i for i, r in enumerate(rows) if r == ["_"]), None)
+    if sep_idx is not None and sep_idx > 0:
+        header = rows[sep_idx - 1]
+        body = [r for r in rows[sep_idx + 1:] if r != ["_"]]
+    elif rows:
+        header = rows[0]
+        body = [r for r in rows[1:] if r != ["_"]]
+    else:
+        header = [""] * cols
+
+    def _pad(row):
+        row = [c.replace("|", "\\|") for c in row]
+        return (row + [""] * cols)[:cols]
+
+    out = []
+    out.append("| " + " | ".join(_pad(header)) + " |")
+    out.append("|" + "|".join(["---"] * cols) + "|")
+    for r in body:
+        out.append("| " + " | ".join(_pad(r)) + " |")
+    return out
 
 
 def _alt_font(args, fonts):
@@ -291,6 +400,10 @@ def convert(text, source_name="man"):
     synopsis_buf = []
     # Are we inside an example/preformatted block (.EX/.EE or .nf/.fi)?
     in_pre = False
+    # Are we inside a tbl(1) table (.TS/.TE)?  All lines between go
+    # to tbl_buf and get parsed in one shot when .TE arrives.
+    in_tbl = False
+    tbl_buf = []
 
     def pop_tp_levels():
         """Pop TP/IP indent levels back down to the nearest .RS
@@ -311,6 +424,12 @@ def convert(text, source_name="man"):
         if raw.startswith(".\\\""):
             continue
         if raw.startswith("'\\\""):
+            continue
+        # Inside a tbl(1) table everything goes verbatim into the
+        # buffer except the closing .TE, which falls through to the
+        # macro dispatcher below.
+        if in_tbl and not raw.startswith(".TE"):
+            tbl_buf.append(raw)
             continue
         # Empty lines preserve paragraph breaks.
         if raw == "":
@@ -398,6 +517,20 @@ def convert(text, source_name="man"):
 
         if macro == "br":
             flush_para()
+            continue
+
+        if macro == "sp":
+            # Vertical space — render as a paragraph break.  The
+            # optional numeric arg (number of blank lines) is ignored;
+            # Markdown collapses runs of blanks anyway.
+            flush_para()
+            out.append("")
+            continue
+
+        if macro in ("ne", "in", "ti", "ad", "na", "hy", "nh", "ll",
+                     "pl", "vs", "ps", "ft"):
+            # Layout directives without a Markdown analogue — drop
+            # silently rather than leak as an HTML comment.
             continue
 
         if macro == "TP":
@@ -582,18 +715,25 @@ def convert(text, source_name="man"):
             maybe_emit_tp()
             continue
 
-        if macro in ("TS", "TE"):
-            # Tables — emit as a preformatted block; rendering as MD
-            # tables would need full layout parsing.
-            if macro == "TS":
-                flush_para()
+        if macro == "TS":
+            # Start of a troff tbl(1) table.  Collect every following
+            # line up to .TE, then parse into a Markdown table.  The
+            # subset of tbl we handle covers what wireguardrtc.8 uses:
+            # a single format-spec line (`l l lx.`), an optional `_`
+            # divider acting as the header separator, and rows whose
+            # cells are tab-separated.  Multi-line cell bodies wrapped
+            # in `T{` … `T}` get joined with `<br>`.
+            flush_para()
+            in_tbl = True
+            tbl_buf = []
+            continue
+        if macro == "TE":
+            if in_tbl:
                 out.append("")
-                out.append("```")
-                in_pre = True
-            else:
-                out.append("```")
+                out.extend(_render_tbl(tbl_buf))
                 out.append("")
-                in_pre = False
+                in_tbl = False
+                tbl_buf = []
             continue
 
         # Unknown macro — preserve as HTML comment so the omission is

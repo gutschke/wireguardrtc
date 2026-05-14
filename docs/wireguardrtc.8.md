@@ -193,18 +193,23 @@ Files are parsed with the same INI parser as the global config (case-sensitive k
 ## PEER MODES
 
 - <b>active</b>
-<!-- TROFF sp  -->
-<!-- TROFF sp  -->
-<!-- TROFF sp  -->
-  The daemon proactively monitors the tunnel.  Every poll cycle it reads <b>latest-handshakes</b> from the kernel; if the most recent handshake is older than <b>HANDSHAKE_DEAD_THRESHOLD</b> (180 seconds — the WireGuard rekey interval of 120 s plus a 60 s grace period) the tunnel is considered dead and the daemon sends a PeerJS OFFER carrying this host's current public endpoint.  On receiving the OFFER the remote peer punches its NAT and updates its kernel endpoint, causing a fresh handshake. Outbound OFFERs are rate-limited with exponential backoff starting at 30 seconds and capped at 300 seconds per peer. In addition to proactive polling, <b>active</b> peers also respond to incoming OFFERs when the tunnel is down: the daemon sends its own current endpoint back immediately, so both sides can punch their respective NATs concurrently.  This cuts cold-start latency in active-active configurations from up to one full backoff cycle to a few seconds. Use <b>active</b> for server-to-server tunnels and for any peer that is expected to be persistently online.
+  The daemon proactively monitors the tunnel.  Every poll cycle it reads <b>latest-handshakes</b> from the kernel; if the most recent handshake is older than <b>HANDSHAKE_DEAD_THRESHOLD</b> (180 seconds — the WireGuard rekey interval of 120 s plus a 60 s grace period) the tunnel is considered dead and the daemon sends a PeerJS OFFER carrying this host's current public endpoint.  On receiving the OFFER the remote peer punches its NAT and updates its kernel endpoint, causing a fresh handshake.
+
+  Outbound OFFERs are rate-limited with exponential backoff starting at 30 seconds and capped at 300 seconds per peer.
+
+  In addition to proactive polling, <b>active</b> peers also respond to incoming OFFERs when the tunnel is down: the daemon sends its own current endpoint back immediately, so both sides can punch their respective NATs concurrently.  This cuts cold-start latency in active-active configurations from up to one full backoff cycle to a few seconds.
+
+  Use <b>active</b> for server-to-server tunnels and for any peer that is expected to be persistently online.
 
 - <b>passive</b>
-<!-- TROFF sp  -->
-  The daemon never initiates outbound PeerJS signalling for this peer. However, when an incoming OFFER arrives from the remote peer and the tunnel is down, the daemon automatically responds with its own current endpoint.  This allows the remote peer to punch its NAT toward this host even when the remote peer is behind a restricted-cone NAT that requires knowing the destination endpoint before it will forward traffic. Use <b>passive</b> for mobile devices or intermittently-connected clients that should initiate contact themselves.  The server-side daemon will respond to each client's OFFER so that both NATs are punched before the WireGuard handshake fires.
+  The daemon never initiates outbound PeerJS signalling for this peer. However, when an incoming OFFER arrives from the remote peer and the tunnel is down, the daemon automatically responds with its own current endpoint.  This allows the remote peer to punch its NAT toward this host even when the remote peer is behind a restricted-cone NAT that requires knowing the destination endpoint before it will forward traffic.
+
+  Use <b>passive</b> for mobile devices or intermittently-connected clients that should initiate contact themselves.  The server-side daemon will respond to each client's OFFER so that both NATs are punched before the WireGuard handshake fires.
 
 - <b>dns-roam</b>
-<!-- TROFF sp  -->
-  PeerJS is not used.  Instead, the daemon resolves the hostname given in <b>DnsHost</b> every poll cycle.  When the resolved address changes it calls <b>wg set *iface* peer *pubkey* endpoint *ip*:*port*</b> and wakes the kernel WireGuard module to trigger a new handshake. Use <b>dns-roam</b> for peers behind dynamic DNS (DDNS) where you control the hostname but the underlying IP changes unpredictably.
+  PeerJS is not used.  Instead, the daemon resolves the hostname given in <b>DnsHost</b> every poll cycle.  When the resolved address changes it calls <b>wg set *iface* peer *pubkey* endpoint *ip*:*port*</b> and wakes the kernel WireGuard module to trigger a new handshake.
+
+  Use <b>dns-roam</b> for peers behind dynamic DNS (DDNS) where you control the hostname but the underlying IP changes unpredictably.
 
 - <b>ignore</b>
   The daemon takes no action for this peer.  Useful for upstream VPN provider tunnels, relay servers, or any peer whose endpoint is managed by another mechanism.
@@ -237,9 +242,11 @@ The hole-punching sequence, as executed after receiving a valid OFFER, is:
   <b>wg set *iface* peer *pubkey* endpoint *ip*:*port*</b> is called to tell the kernel WireGuard module where the remote peer now lives.
 
 - **3.** <b>Handshake wake.</b>
-<!-- TROFF sp  -->
-<!-- TROFF sp  -->
-  A 1-byte UDP datagram is sent through the WireGuard interface using <b>SO_BINDTODEVICE</b> to force it through the correct interface regardless of routing table preference.  The kernel WireGuard module observes the outbound traffic, sees a pending handshake for the updated endpoint, and initiates it. For peers with a <b>/32</b> allowed-ip the datagram is addressed to that host address.  For peers with a wider subnet the first usable host address is used.  For <b>0.0.0.0/0</b> catch-all peers, <b>192.0.2.1</b> (TEST-NET-1, RFC 5737) is used; any address in the /0 range would work, but 192.0.2.1 is unlikely to exist as a real host and is clearly bogon. The conntrack NAT mapping created by the raw injection lasts approximately 30 seconds (default <b>nf_conntrack_udp_timeout</b> on Linux).  The wake step must trigger a handshake within this window; in practice the WireGuard handshake completes in under 1 second.
+  A 1-byte UDP datagram is sent through the WireGuard interface using <b>SO_BINDTODEVICE</b> to force it through the correct interface regardless of routing table preference.  The kernel WireGuard module observes the outbound traffic, sees a pending handshake for the updated endpoint, and initiates it.
+
+  For peers with a <b>/32</b> allowed-ip the datagram is addressed to that host address.  For peers with a wider subnet the first usable host address is used.  For <b>0.0.0.0/0</b> catch-all peers, <b>192.0.2.1</b> (TEST-NET-1, RFC 5737) is used; any address in the /0 range would work, but 192.0.2.1 is unlikely to exist as a real host and is clearly bogon.
+
+  The conntrack NAT mapping created by the raw injection lasts approximately 30 seconds (default <b>nf_conntrack_udp_timeout</b> on Linux).  The wake step must trigger a handshake within this window; in practice the WireGuard handshake completes in under 1 second.
 
 ## CRYPTOGRAPHY
 
@@ -250,11 +257,11 @@ All signalling payloads are end-to-end encrypted; the PeerJS broker sees only op
 For each peer pair (A, B) a shared symmetric key is derived:
 
 - **1.** Perform X25519 Diffie-Hellman:
-<!-- TROFF sp  -->
+
   <b>shared = X25519(my_wg_private_key, peer_wg_public_key)</b>
 
 - **2.** Apply keyed BLAKE2b for domain separation:
-<!-- TROFF sp  -->
+
   <b>key = BLAKE2b-256(shared, key=wg-peerjs/v1/sigbox)</b>
 
 The domain label ensures that this key is cryptographically independent from WireGuard's own session keys, even though both derive from the same Curve25519 keypair.
@@ -582,7 +589,7 @@ The recommended deployment uses the static system user <b>wireguardrtc</b> (crea
 
 ### Signalling security
 
-The PeerJS broker is treated as an untrusted relay. All endpoint information is encrypted with <b>SecretBox</b> before transmission; the broker cannot learn the IP address or port of any peer, and cannot forge or replay endpoint updates (the freshness window is 90 seconds).
+The PeerJS broker is treated as an untrusted relay. All endpoint information is encrypted with <b>SecretBox</b> before transmission; the broker cannot learn the IP address or port of any peer, and cannot forge or replay endpoint updates (the freshness window is ±90 seconds).
 
 Two different installations that share the same WireGuard key pair but use different salts are cryptographically isolated on the broker: their routing IDs will not collide, and their payloads are encrypted under different derived keys.
 
@@ -626,35 +633,16 @@ This is the same privsep pattern OpenSSH uses to keep the network-facing <b>sshd
 
 The following timing constants are compiled into the daemon.  They are not configurable without editing the source.
 
-```
-l l lx.
-Constant	Value	Purpose
-_
-POLL_INTERVAL	30 s	T{
-Interval between poll cycles
-T}
-HANDSHAKE_DEAD_THRESHOLD	180 s	T{
-Tunnel considered dead after this
-T}
-SIGNALING_BACKOFF	300 s	T{
-Minimum time between OFFERs per peer
-T}
-PEERJS_HEARTBEAT	5 s	T{
-WebSocket HEARTBEAT cadence
-T}
-STUN_TIMEOUT	2.5 s	T{
-Per-server STUN query timeout
-T}
-RAW_INJECT_REPEATS	3	T{
-Raw-inject burst count
-T}
-RAW_INJECT_GAP	50 ms	T{
-Delay between burst packets
-T}
-PROTOCOL_FRESHNESS_WINDOW	90 s	T{
-Replay protection window ()
-T}
-```
+| Constant | Value | Purpose |
+|---|---|---|
+| POLL_INTERVAL | 30 s | Interval between poll cycles |
+| HANDSHAKE_DEAD_THRESHOLD | 180 s | Tunnel considered dead after this |
+| SIGNALING_BACKOFF | 300 s | Minimum time between OFFERs per peer |
+| PEERJS_HEARTBEAT | 5 s | WebSocket HEARTBEAT cadence |
+| STUN_TIMEOUT | 2.5 s | Per-server STUN query timeout |
+| RAW_INJECT_REPEATS | 3 | Raw-inject burst count |
+| RAW_INJECT_GAP | 50 ms | Delay between burst packets |
+| PROTOCOL_FRESHNESS_WINDOW | 90 s | Replay protection window (±) |
 
 ## DIAGNOSTICS
 
