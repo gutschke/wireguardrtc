@@ -265,6 +265,21 @@ Local v6 iface enumeration.  Added `_enumerate_iface_addrs_v6`: shells out to `i
 
 Files: `daemon/wireguardrtc` (enumerator + parser + dispatch), `daemon/tests/54_iface_v6.py` (7 tests), `daemon/tests/27_candidate_enumerate.py` (test-helper update).
 
-### V6.D5 — (next)
+### V6.D5 — 2026-05-14
 
-Skip hole-punching for v6-active peers.  `inject_raw_udp` + `wake_via_iface` are v4-only; calling them with a v6 endpoint either errors or no-ops.  Plan: detect the active endpoint's family before invoking, skip the raw-inject leg for v6 endpoints, log a one-shot informational line.
+Hole-punching now skipped cleanly for v6 endpoints at three layers:
+
+1. **Helper `_endpoint_is_v6(ip_or_endpoint)`** — accepts bare v4 / bare v6 / `v4:port` / `[v6]:port` / None / garbage.  Tolerant of every form `wg show` and the candidate-pair flow produce; defensive against malformed input.
+2. **`raw_inject(src_port, dst_ip, dst_port)`** — early-returns `False` for v6 destinations before opening the raw socket.  Without this, a CAP_NET_RAW-equipped daemon would crash inside `socket.inet_aton(dst_ip)` when handed a v6 string.
+3. **`wake_via_iface(iface, target_ip)`** — early-returns for v6 targets; v6 peers rely on PersistentKeepalive instead of the explicit nudge.
+4. **`RawHelperClient.inject` + `.wake`** — the daemon's IPC seam to the privileged broker.  Gating here saves a round trip per skipped call and avoids a noisy "refused" log line on the broker side.  Tests use a fake `_rpc` to verify the v6 path doesn't even attempt the IPC.
+
+State logger emits `hole-punch.skip-v6 <dst>` / `wake.skip-v6 <target>` on each skipped call — once per state transition thanks to the existing memo dedup.
+
+14/14 V6.D5 tests pass.  All previous tests stay green.
+
+Files: `daemon/wireguardrtc` (helper + 4 gate sites), `daemon/tests/55_skip_hole_punch_v6.py` (14 tests, including async tests of `RawHelperClient`).
+
+### V6.A1 — (next)
+
+Android joiner side: candidate ranker must accept v6 candidates from the host's enrolment payload.  Today the ranker filters by family.  Per RFC 8305 prefer v6 in dual-stack scenarios.

@@ -3325,6 +3325,44 @@ class PeerJSClient:
 # ---------------------------------------------------------------------------
 
 
+def _endpoint_is_v6(ip_or_endpoint) -> bool:
+    """Best-effort family classifier for an endpoint string.
+
+    Accepts:
+      - bare v4: "203.0.113.5"             → False
+      - bare v6: "2001:db8::1"             → True
+      - v4:port: "203.0.113.5:51820"       → False
+      - bracketed v6: "[2001:db8::1]:51820" → True
+      - None, "", garbage                  → False (defensive)
+
+    The bracketed form is what wg-quick / wg show prints for v6
+    endpoints.  We strip the brackets + port and try to parse;
+    fall through to a bare ipaddress.ip_address() parse if the
+    bracket dance doesn't apply.
+
+    Used to gate the IPv4-only raw-inject / wake-via-iface paths
+    so they don't see v6 destinations they can't handle.  IPv6
+    hole-punching is out of scope (CLAUDE.md §7); when the active
+    endpoint is v6 the kernel WG module dials it directly without
+    needing raw-inject pinhole help."""
+    if not ip_or_endpoint:
+        return False
+    s = str(ip_or_endpoint).strip()
+    # Bracketed [v6]:port form
+    if s.startswith("[") and "]" in s:
+        s = s[1:s.index("]")]
+    # bare ip:port — but ONLY split if there's exactly one colon,
+    # because v6 addresses contain many colons.  A bare v6 has 2+
+    # colons and won't match this case; a "v4:port" has exactly 1.
+    elif s.count(":") == 1:
+        s = s.split(":", 1)[0]
+    try:
+        addr = ipaddress.ip_address(s)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(addr, ipaddress.IPv6Address)
+
+
 def build_raw_udp_packet(src_port, dst_ip, dst_port, payload=b""):
     ip_hdr = struct.pack(
         "!BBHHHBBH4s4s",
@@ -3351,7 +3389,18 @@ def build_raw_udp_packet(src_port, dst_ip, dst_port, payload=b""):
 def raw_inject(src_port, dst_ip, dst_port):
     """Send 3 empty UDP packets from a "stolen" source port. UDP is lossy and
     NAT mapping creation can race with the peer's incoming handshake; sending
-    a small burst is cheap insurance."""
+    a small burst is cheap insurance.
+
+    IPv4-only by construction (AF_INET raw socket + build_raw_udp_packet's
+    v4 header layout).  When the destination is an IPv6 address we return
+    False without opening the socket — IPv6 typically doesn't NAT, so the
+    kernel WG module dials the v6 endpoint directly without raw-inject
+    pinhole help.  See V6.D5 in docs/ipv6-design.md."""
+    if _endpoint_is_v6(dst_ip):
+        LOG.event("hole-punch", "skip-v6", dst_ip,
+                  f"skipping raw-inject for IPv6 destination {dst_ip}; "
+                  f"v6 endpoints don't need NAT-traversal pinhole keep-alive")
+        return False
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         s.setsockopt(socket.SOL_IP, socket.IP_HDRINCL, 1)
@@ -3475,7 +3524,17 @@ def wake_via_iface(iface: str, target_ip: str):
     for the matching peer and initiates a handshake with the current endpoint.
 
     Uses SO_BINDTODEVICE so the packet is forced through `iface`, regardless
-    of routing-table preference. Requires CAP_NET_RAW (already granted)."""
+    of routing-table preference. Requires CAP_NET_RAW (already granted).
+
+    IPv4-only: the AF_INET socket can't send to a v6 target.  When the
+    target is v6 we return without sending; the kernel WG module's
+    PersistentKeepalive handles wake-on-idle for v6 peers without
+    needing this nudge.  See V6.D5 in docs/ipv6-design.md."""
+    if _endpoint_is_v6(target_ip):
+        LOG.event("wake", "skip-v6", target_ip,
+                  f"skipping wake_via_iface for IPv6 target {target_ip} on "
+                  f"{iface}; v6 peers rely on PersistentKeepalive instead")
+        return
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         try:
@@ -4027,6 +4086,18 @@ class RawHelperClient:
 
     async def inject(self, iface: str, src_port: int,
                      dst_ip: str, dst_port: int) -> bool:
+        # V6.D5: raw-inject is IPv4-only by construction (AF_INET
+        # raw socket on the helper side, v4 header build).  Skip
+        # the RPC entirely for v6 destinations — saves a round trip
+        # and avoids a noisy "refused" log line on the helper side.
+        # The kernel WG module dials v6 endpoints directly without
+        # needing pinhole keepalive (CLAUDE.md §7).
+        if _endpoint_is_v6(dst_ip):
+            LOG.event("hole-punch", "skip-v6", dst_ip,
+                      f"raw-inject skipped for IPv6 dst {dst_ip} "
+                      f"(v6 endpoints don't need NAT-traversal "
+                      f"pinhole keep-alive)")
+            return False
         try:
             resp = await self._rpc({
                 "op": "inject",
@@ -4043,6 +4114,14 @@ class RawHelperClient:
         return True
 
     async def wake(self, iface: str, target_ip: str) -> bool:
+        # V6.D5: wake_via_iface uses AF_INET socket; skip for v6.
+        # The kernel module relies on PersistentKeepalive (default
+        # 25 s) to keep v6 peers fresh; we don't need to nudge.
+        if _endpoint_is_v6(target_ip):
+            LOG.event("wake", "skip-v6", target_ip,
+                      f"wake skipped for IPv6 target {target_ip}; "
+                      f"v6 peers rely on PersistentKeepalive instead")
+            return False
         try:
             resp = await self._rpc({
                 "op": "wake",
