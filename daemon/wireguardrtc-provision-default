@@ -2,28 +2,39 @@
 # wireguardrtc-provision-default — minimal ProvisionScript hook for
 # stock wg-quick deployments.
 #
-# Contract (called by wireguardrtc daemon):
+# Contract (called by wireguardrtc daemon or wireguardrtc CLI):
 #   wireguardrtc-provision-default IFACE NAME PUBKEY_BASE64
 #   Exit 0 on success.  Daemon reads back the allocation via `wg show`.
 #
 # Behaviour:
-#   1. Reads address pool from /etc/wireguardrtc/provisioning.conf:
-#        Pool = 10.99.0.0/24       # CIDR; first usable host is reserved
-#                                  # for the server, allocations start at the
-#                                  # second usable host
-#   2. Computes the next-available host address in that CIDR by scanning
-#      already-allocated addresses in /etc/wireguard/IFACE.conf and the
-#      live `wg show IFACE allowed-ips` table.
-#   3. Appends a [Peer] block to /etc/wireguard/IFACE.conf for persistence.
-#   4. Runs `wg syncconf IFACE <(wg-quick strip IFACE)` to apply without
-#      disrupting existing peers.
+#   1. If WIREGUARDRTC_PROVISION_ASSIGNED_ADDRESS is set (passed by
+#      `wireguardrtc --mint-wormhole --assigned-address ...`), the
+#      script uses that address directly — after verifying it sits
+#      inside the configured Pool and is not already in use.  This is
+#      the wormhole-pair case where the host has already told the
+#      joiner which address to expect.
+#   2. Otherwise: reads address pool from /etc/wireguardrtc/
+#      provisioning.conf (`Pool = X.X.X.X/Y`) and computes the
+#      lowest-numbered free /32 inside that pool by scanning the
+#      current `/etc/wireguard/IFACE.conf` (both [Interface] Address
+#      and [Peer] AllowedIPs lines) plus the live kernel state via
+#      `wg show IFACE allowed-ips`.
+#   3. Appends a [Peer] block to /etc/wireguard/IFACE.conf for
+#      persistence and runs `wg syncconf IFACE <(wg-quick strip IFACE)`
+#      to apply without disrupting existing peers.
+#
+# Env-var overrides (mainly for the test harness; production deploys
+# use the standard paths):
+#   WIREGUARDRTC_PROVISIONING_CONF — path to provisioning.conf
+#   WIREGUARDRTC_WG_CONF           — path to the wg-quick conf file
+#   WIREGUARDRTC_PROVISION_ASSIGNED_ADDRESS
+#                                  — explicit /32 to assign
 #
 # Limitations:
 #   - IPv4 single-pool only.  Edit this script for IPv6 dual-stack or
 #     multi-pool deployments, or replace it with your own ProvisionScript.
-#   - Allocation is monotonic (starts where the highest-allocated address
-#     ends + 1).  Does not reuse addresses freed by removed peers.
-#   - Requires CAP_NET_ADMIN to invoke `wg syncconf` and `wg set`.
+#   - Allocation reuses freed addresses (lowest free wins).
+#   - Requires CAP_NET_ADMIN to invoke `wg syncconf`.
 #
 # Logging: anything written to stderr is captured by the daemon and
 # included in a PROVISION_FAILED response if exit != 0.
@@ -34,15 +45,15 @@ IFACE="${1:?usage: $0 IFACE NAME PUBKEY_BASE64}"
 NAME="${2:?usage: $0 IFACE NAME PUBKEY_BASE64}"
 PUBKEY="${3:?usage: $0 IFACE NAME PUBKEY_BASE64}"
 
-CONF="/etc/wireguardrtc/provisioning.conf"
-WG_CONF="/etc/wireguard/${IFACE}.conf"
+CONF="${WIREGUARDRTC_PROVISIONING_CONF:-/etc/wireguardrtc/provisioning.conf}"
+WG_CONF="${WIREGUARDRTC_WG_CONF:-/etc/wireguard/${IFACE}.conf}"
+ASSIGNED="${WIREGUARDRTC_PROVISION_ASSIGNED_ADDRESS:-}"
 
 [[ -r "$CONF" ]] || {
     echo "missing $CONF (need: 'Pool = X.X.X.X/Y')" >&2
     exit 1
 }
 
-# Trivial INI scan for `Pool = ...` (case-sensitive).
 POOL=$(awk -F'=' '/^[[:space:]]*Pool[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$CONF")
 [[ -n "$POOL" ]] || { echo "no Pool = ... line in $CONF" >&2; exit 1; }
 
@@ -51,11 +62,14 @@ POOL=$(awk -F'=' '/^[[:space:]]*Pool[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); p
     exit 1
 }
 
-# Find next free address: collect all currently-used hosts inside POOL,
-# pick the smallest that's not in use AND inside the pool's host range.
+# Collect all currently-used host addresses inside the pool — both
+# the [Interface] Address (the server's own address; reserving it
+# prevents F4-style "allocator picks server's address") and every
+# [Peer] AllowedIPs, plus the live kernel state from `wg show`.  The
+# awk regex is anchored so it doesn't accidentally match a comment or
+# embedded substring.
 USED=$(
     {
-        # Addresses currently in the conf file (peers + interface).
         awk '/^[[:space:]]*(Address|AllowedIPs)[[:space:]]*=/ {
                 sub(/^[^=]*=/,"")
                 gsub(/[[:space:]]/,"")
@@ -66,7 +80,6 @@ USED=$(
                     print a
                 }
         }' "$WG_CONF"
-        # Plus anything live in the kernel.
         wg show "$IFACE" allowed-ips 2>/dev/null \
             | awk '{
                   for (i = 2; i <= NF; i++) {
@@ -78,13 +91,18 @@ USED=$(
     } | sort -u
 )
 
-# Compute the next free /32 inside the pool.  We use Python for proper
-# CIDR arithmetic (no need to take a dependency on ipcalc).
-NEW_ADDR=$(python3 - "$POOL" <<EOF
+# Compute the chosen address.  We hand BOTH the pool spec and the
+# used-set to python via argv so bash heredoc/herestring redirection
+# quirks can't drop the data (an earlier bug here: `python3 - "$POOL"
+# <<EOF ... EOF <<<"$USED"` silently produced an empty stdin because
+# bash only honoured the last redirection AND not in the way you'd
+# expect).  Passing data via argv is also faster and easier to reason
+# about — single source of truth.
+NEW_ADDR=$(python3 -c '
 import ipaddress, sys
 pool = ipaddress.ip_network(sys.argv[1], strict=False)
 used = set()
-for line in sys.stdin.read().splitlines():
+for line in sys.argv[2].splitlines():
     line = line.strip()
     if not line:
         continue
@@ -92,15 +110,30 @@ for line in sys.stdin.read().splitlines():
         used.add(ipaddress.ip_address(line))
     except ValueError:
         pass
+assigned = sys.argv[3]
+if assigned:
+    try:
+        a = ipaddress.ip_address(assigned)
+    except ValueError:
+        sys.stderr.write(f"assigned address {assigned!r} is not a valid IP\n")
+        sys.exit(2)
+    if a not in pool.hosts():
+        sys.stderr.write(
+            f"assigned address {a} is not in pool {pool}\n")
+        sys.exit(2)
+    if a in used:
+        sys.stderr.write(
+            f"assigned address {a} is already in use\n")
+        sys.exit(2)
+    print(a)
+    sys.exit(0)
 for host in pool.hosts():
     if host not in used:
         print(host)
         sys.exit(0)
-sys.stderr.write("pool {} exhausted\n".format(pool))
+sys.stderr.write(f"pool {pool} exhausted\n")
 sys.exit(1)
-EOF
-<<<"$USED"
-)
+' "$POOL" "$USED" "$ASSIGNED")
 
 [[ -n "$NEW_ADDR" ]] || { echo "could not allocate address from $POOL" >&2; exit 1; }
 
@@ -119,6 +152,7 @@ mv "$TMP" "$WG_CONF"
 trap - EXIT
 
 # Apply to running interface without disrupting existing peers.
+# Stubbed-out wg/wg-quick in test harnesses; real one needs root.
 wg syncconf "$IFACE" <(wg-quick strip "$IFACE")
 
 # Diagnostics on stderr (the daemon doesn't propagate these on success).

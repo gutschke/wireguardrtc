@@ -28,8 +28,8 @@ wgrtc = importlib.util.module_from_spec(spec)
 loader.exec_module(wgrtc)
 
 
-BROKER_WSS = os.environ.get("WGRTC_BROKER_WSS", wgrtc.DEFAULT_PEERJS_SERVER)
-BROKER_KEY = os.environ.get("WGRTC_BROKER_KEY", wgrtc.DEFAULT_PEERJS_KEY)
+BROKER_WSS = os.environ.get("WGRTC_BROKER_WSS", wgrtc.PUBLIC_PEERJS_SERVER)
+BROKER_KEY = os.environ.get("WGRTC_BROKER_KEY", wgrtc.PUBLIC_PEERJS_KEY)
 PUBKEY_B64 = base64.b64encode(bytes(32)).decode("ascii")
 
 

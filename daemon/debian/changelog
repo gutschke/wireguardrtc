@@ -1,3 +1,34 @@
+wireguardrtc (0.2.5-1) unstable; urgency=medium
+
+  * D1.10 follow-ups: make a vanilla-Ubuntu install actually work for
+    daemon-side wormhole pairing without manual config rescue.
+  * F1 (broker UX): drop the literal `your.broker.example` placeholder
+    from the shipped config.  Daemon now refuses to start until the
+    admin picks a broker — inline error message names both viable
+    options (public 0.peerjs.com vs self-host Docker recipe) so the
+    admin doesn't need to consult external docs.
+  * F2 (enrollment defaults): ship `[Enrollment]` UNCOMMENTED so the
+    out-of-the-box install supports wormhole + token enrollment via
+    the broker-mediated default ProvisionScript path.
+  * F3 (daemon-managed pairs): `--mint-wormhole` and `--use-wormhole`
+    now write a peers.d-style drop-in to
+    `/var/lib/wireguardrtc/auto-enrolled.d/` after a successful pair.
+    The daemon picks it up and actively maintains the new tunnel.
+    Drop-in files are chowned to the daemon user when written as
+    root.  Daemon logs a one-line kernel-vs-managed-peer inventory
+    after the first poll so admins notice peers that aren't being
+    maintained.
+  * F4 + F5 (provision-default): the address allocator was silently
+    broken by a bash heredoc/herestring redirection quirk (always
+    returned pool.hosts()[0]).  Rewrite to pass USED via argv;
+    [Interface] Address is now properly reserved.  New
+    `WIREGUARDRTC_PROVISION_ASSIGNED_ADDRESS` env var lets the
+    wormhole-pair host advertise a specific address to the joiner
+    and have provision-default honour it (validating pool membership
+    + collision).
+
+ -- Markus Gutschke <gutschke@users.noreply.github.com>  Wed, 14 May 2026 13:25:00 -0700
+
 wireguardrtc (0.2.4-1) unstable; urgency=medium
 
   * Wormhole pairing for the daemon, parity with the Android app

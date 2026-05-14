@@ -65,7 +65,7 @@ PEERS_DIR = CONFIG_DIR / "peers.d"
 LOCK_FILE = Path(os.environ.get("WIREGUARDRTC_LOCK_FILE",
                                  "/run/wireguardrtc/lock"))
 
-__version__ = "0.2.4"          # unified across daemon + Android app
+__version__ = "0.2.5"          # unified across daemon + Android app
 PROTOCOL_VERSION = 1
 PROTOCOL_LABEL = b"wg-peerjs/v1/sigbox"  # wire format is locked; do not change
 PROTOCOL_FRESHNESS_WINDOW = 90.0  # seconds; reject older or further-in-future
@@ -1351,8 +1351,24 @@ def classify_nat_result(probes):
                 "is undetermined.  Re-run with more STUN servers reachable.",
         wgrtc_viable=preserving)
 
-DEFAULT_PEERJS_SERVER = "wss://0.peerjs.com/peerjs"
-DEFAULT_PEERJS_KEY = "peerjs"
+# Shared by the public PeerJS broker (the only one we recognise as a
+# canned option) — for everything else the admin sets PeerJsServer
+# explicitly.  We intentionally do NOT default to either of these:
+# requiring an explicit choice is how F1 surfaces the broker decision
+# to the admin instead of silently routing traffic through 0.peerjs.com.
+PUBLIC_PEERJS_SERVER = "wss://0.peerjs.com/peerjs"
+PUBLIC_PEERJS_KEY = "peerjs"
+
+# Placeholder fragments from the shipped config example.  If any of
+# these appear in an admin-edited config the validator refuses to
+# start — they were always meant as illustrative defaults to replace,
+# not as working settings.
+_PLACEHOLDER_BROKER_FRAGMENTS = (
+    "your.broker.example",        # legacy shipped value
+    "your-broker.example",        # new shipped placeholder hostname
+    "YOUR_SECRET_KEY",
+    "CHANGE_ME",
+)
 
 STUN_MAGIC_COOKIE = 0x2112A442
 
@@ -1408,6 +1424,60 @@ class GlobalConfig:
     suppress_interfaces: list = dataclasses.field(default_factory=list)
 
 
+def _validate_broker_config(path, server: str, key: str) -> None:
+    """Enforce F1: refuse to start when the PeerJS broker has not
+    been deliberately chosen by the admin.
+
+    Detects two failure modes:
+      (a) PeerJsServer empty / missing — admin never edited the
+          shipped config.
+      (b) PeerJsServer / PeerJsKey contain placeholder fragments
+          (your.broker.example, YOUR_SECRET_KEY, …) — admin left
+          shipped illustrative defaults in place.
+
+    On either, print a multi-line guide naming the two viable options
+    inline so the admin doesn't have to consult external docs, then
+    exit(2)."""
+    bad = ""
+    if not server:
+        bad = "PeerJsServer is unset"
+    else:
+        for frag in _PLACEHOLDER_BROKER_FRAGMENTS:
+            if frag in server or frag in key:
+                bad = (f"PeerJsServer / PeerJsKey still contain the "
+                       f"shipped placeholder {frag!r}")
+                break
+    if not bad:
+        return
+    sys.stderr.write(
+        f"[FATAL] {path}: {bad}.\n"
+        "\n"
+        "wireguardrtc needs a PeerJS broker URL to relay encrypted\n"
+        "endpoint updates between peers.  This is a deliberate choice\n"
+        "the admin must make — the daemon never silently defaults to\n"
+        "any third-party service.  Open the config and uncomment one\n"
+        "of:\n"
+        "\n"
+        "  Option A — public broker (testing / small home use):\n"
+        "    PeerJsServer = wss://0.peerjs.com/peerjs\n"
+        "    PeerJsKey    = peerjs\n"
+        "  (rate-limited; no service-level agreement; fine for\n"
+        "  ad-hoc pairings.)\n"
+        "\n"
+        "  Option B — self-hosted broker (recommended for production):\n"
+        "    docker run -d --name peerjs-broker --restart=always \\\n"
+        "        -p 9000:9000 peerjs/peerjs-server --port 9000 \\\n"
+        "        --key MY_KEY\n"
+        "    Then in the config:\n"
+        "    PeerJsServer = ws://your-broker.example.com:9000/peerjs\n"
+        "    PeerJsKey    = MY_KEY\n"
+        "\n"
+        "See wireguardrtc(8) §SELF-HOSTING for details on running\n"
+        "your own broker.\n"
+    )
+    sys.exit(2)
+
+
 def load_global_config(path: Path) -> GlobalConfig:
     cp = configparser.ConfigParser()
     cp.optionxform = str  # preserve case for base64 values
@@ -1424,8 +1494,9 @@ def load_global_config(path: Path) -> GlobalConfig:
         sys.exit(2)
     salt = salt_str.encode("utf-8")
 
-    peerjs_server = cp.get("Global", "PeerJsServer", fallback=DEFAULT_PEERJS_SERVER).strip()
-    peerjs_key = cp.get("Global", "PeerJsKey", fallback=DEFAULT_PEERJS_KEY).strip()
+    peerjs_server = cp.get("Global", "PeerJsServer", fallback="").strip()
+    peerjs_key = cp.get("Global", "PeerJsKey", fallback="").strip()
+    _validate_broker_config(path, peerjs_server, peerjs_key)
 
     public_ip_str = cp.get("Global", "PublicIp", fallback="").strip()
     public_ip = None
@@ -1535,10 +1606,25 @@ def write_auto_active_peer(state_dir: Path, pubkey_b64: str,
     Mode=active.  Filename is the SHA-256 fingerprint of the pubkey
     (truncated, hex) so admin and auto-enrolled drop-ins can never
     collide on filename, and re-enrollment of the same pubkey
-    overwrites idempotently."""
+    overwrites idempotently.
+
+    Ownership: when running as root (typical for the wormhole CLI
+    invoked via sudo), chown the drop-in to the daemon's runtime
+    user so the long-running, unprivileged wireguardrtc service can
+    actually read it on next poll.  The token-based enrollment path
+    runs as the daemon user already, so this is a no-op there."""
     aa_dir = auto_active_dir(state_dir)
     aa_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(aa_dir, 0o700)
+    # 0750 lets the daemon user (which the dir was meant for) traverse
+    # the directory even when the file was written by root via the
+    # wormhole CLI.  Previous 0700 broke that.
+    os.chmod(aa_dir, 0o750)
+    daemon_uid, daemon_gid = _wireguardrtc_runtime_ids()
+    if os.geteuid() == 0 and daemon_uid is not None:
+        try:
+            os.chown(aa_dir, daemon_uid, daemon_gid)
+        except OSError:
+            pass
     fp = hashlib.sha256(pubkey_b64.encode("utf-8")).hexdigest()[:16]
     # Sanitise label for use as a filename hint — admin-supplied
     # via the URI's name field, but already validated by
@@ -1556,15 +1642,42 @@ def write_auto_active_peer(state_dir: Path, pubkey_b64: str,
             f"Mode = active\n"
             f"# Iface = {iface}\n")
     tmp = path.with_suffix(".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # 0640 + group-readable so the daemon (member of the
+    # wireguardrtc group) can ingest even when the writer was root.
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(body)
+        if os.geteuid() == 0 and daemon_uid is not None:
+            try:
+                os.chown(tmp, daemon_uid, daemon_gid)
+            except OSError:
+                pass
     except BaseException:
         try: os.unlink(tmp)
         except OSError: pass
         raise
     os.replace(tmp, path)
+
+
+_WG_RUNTIME_IDS_CACHE = None
+
+
+def _wireguardrtc_runtime_ids():
+    """Look up the (uid, gid) of the `wireguardrtc` runtime user.
+    Cached.  Returns (None, None) if pwd lookup fails — the caller
+    then skips chown and relies on the file being readable via
+    standard fs permissions (still useful for the test harness)."""
+    global _WG_RUNTIME_IDS_CACHE
+    if _WG_RUNTIME_IDS_CACHE is not None:
+        return _WG_RUNTIME_IDS_CACHE
+    try:
+        import pwd
+        ent = pwd.getpwnam("wireguardrtc")
+        _WG_RUNTIME_IDS_CACHE = (ent.pw_uid, ent.pw_gid)
+    except (KeyError, OSError):
+        _WG_RUNTIME_IDS_CACHE = (None, None)
+    return _WG_RUNTIME_IDS_CACHE
 
 
 def load_peer_configs(directory: Path,
@@ -2621,6 +2734,7 @@ def run_provision_script(script_path: str, iface: str, name: str,
                          client_pub_b64: str,
                          token: bytes = b"",
                          parameters: str = "",
+                         assigned_address: str = "",
                          timeout: float = 15.0) -> tuple:
     """Invoke the user-supplied provisioning hook.
 
@@ -2688,6 +2802,18 @@ def run_provision_script(script_path: str, iface: str, name: str,
     # where parameters come from the admin's pre-staged sidecar.
     if parameters:
         env["WIREGUARDRTC_PROVISION_PARAMETERS"] = parameters
+    # Wormhole-pair flow passes --assigned-address; the host already
+    # promised this address to the joiner during SAS, so the
+    # ProvisionScript must use it verbatim (not run its own allocator).
+    # wireguardrtc-provision-default honours this env var; custom
+    # scripts that ignore it fall back to their own allocator (and
+    # then the joiner's WG iface won't talk to the host until the
+    # admin reconciles).
+    if assigned_address:
+        # Strip any /prefix the caller might have included — the env
+        # var is a host IP, the script appends /32 itself.
+        addr = assigned_address.split("/", 1)[0]
+        env["WIREGUARDRTC_PROVISION_ASSIGNED_ADDRESS"] = addr
     try:
         res = subprocess.run(
             [str(script), iface, name, client_pub_b64],
@@ -4367,6 +4493,35 @@ class Daemon:
                       f"OFFER not sent to {cfg.label}: PeerJS unavailable",
                       level=logging.WARNING)
 
+    def _log_peer_management_inventory(self):
+        """F3 visibility: one INFO line per WG interface summarising
+        which kernel peers the daemon is managing vs. which it sees in
+        the kernel but doesn't have a drop-in for (i.e., will be
+        ignored — gradual-adoption behaviour, CLAUDE.md §2).
+
+        Reads `self._iface_peers`, which is populated by
+        `refresh_iface_state()` via the key-oracle's `iface_table`
+        RPC.  Direct `wg show` from the daemon's address space hits
+        EPERM on the prod kernel (project_wg_show_privilege memo)."""
+        if not self._iface_peers:
+            return
+        configured = set(self.peer_configs.keys())
+        for iface in sorted(self._iface_peers):
+            peers = self._iface_peers[iface]
+            if not peers:
+                continue
+            managed = peers & configured
+            unmanaged = peers - configured
+            logging.info(
+                "%s: %d peer(s) in kernel — %d managed, %d unmanaged "
+                "(no drop-in under peers.d/ or auto-enrolled.d/)",
+                iface, len(peers), len(managed), len(unmanaged))
+            for pub in sorted(unmanaged):
+                logging.info(
+                    "%s: unmanaged peer pubkey=%s — drop a "
+                    "/etc/wireguardrtc/peers.d/<label>.conf with "
+                    "this PublicKey to opt it in", iface, pub)
+
     async def signal_all_active_peers(self):
         """Signal all ACTIVE peers that are currently DOWN. Called when the
         PeerJS session opens so we don't wait a full SIGNALING_BACKOFF cycle
@@ -4424,6 +4579,14 @@ class Daemon:
 
     async def poll_once(self):
         await self.refresh_iface_state()
+        # F3 visibility: log the kernel-vs-config inventory once,
+        # after the first poll has populated _iface_peers from the
+        # key oracle.  Quiet afterwards — the StateLogger covers
+        # per-peer transitions; this single shot is just to bootstrap
+        # the admin's mental model on first start.
+        if not self._inventory_logged:
+            self._log_peer_management_inventory()
+            self._inventory_logged = True
         # Drop stale enrollment state on every poll cycle.  This is the
         # single mechanism that prevents pending-tokens.json from
         # growing unbounded across "admin minted N tokens that nobody
@@ -4578,6 +4741,14 @@ class Daemon:
                          if c.mode == Mode.DNS_ROAM),
                      sum(1 for c in self.peer_configs.values()
                          if c.mode == Mode.IGNORE))
+
+        # F3 visibility — per-interface inventory of kernel peers vs.
+        # peers visible to the daemon.  Logged once after the first
+        # poll populates _iface_peers (we can't read peer state here
+        # synchronously without privilege escalation; we route
+        # through the key oracle, same path the rest of the daemon
+        # uses).
+        self._inventory_logged = False
 
         try:
             while not self.shutdown_event.is_set():
@@ -5309,18 +5480,21 @@ def _enforce_test_flag_gate(args):
 
 
 def _read_broker_config(global_config_path):
-    """Read [Signaling] Server / Key from the global config file.
-    Falls back to defaults if the file doesn't exist or doesn't
-    specify these values.  Used by the wormhole CLI subcommands."""
+    """Read [Global] PeerJsServer / PeerJsKey from the daemon's config
+    file.  Used by the wormhole CLI subcommands so they pick up the
+    same broker the long-running daemon uses.
+
+    Raises SystemExit(2) via _validate_broker_config if the admin has
+    not yet chosen a broker — same UX as the long-running daemon."""
     cp = configparser.ConfigParser()
     cp.optionxform = str
     try:
         cp.read(global_config_path)
     except Exception:
         pass
-    server = cp.get("Signaling", "Server",
-                     fallback=DEFAULT_PEERJS_SERVER)
-    key = cp.get("Signaling", "Key", fallback=DEFAULT_PEERJS_KEY)
+    server = cp.get("Global", "PeerJsServer", fallback="").strip()
+    key = cp.get("Global", "PeerJsKey", fallback="").strip()
+    _validate_broker_config(global_config_path, server, key)
     return server, key
 
 
@@ -5533,6 +5707,38 @@ def cmd_use_wormhole(args):
     if host_info.get("host_name"):
         sys.stdout.write(f"\nPaired with: {host_info['host_name']}\n")
 
+    # F3 (joiner side): when this machine runs the wireguardrtc daemon
+    # too, the new tunnel needs a peers.d-style drop-in for the host's
+    # pubkey so the daemon will actively maintain the link.  We only
+    # write it when the config exists AND AutoActive is enabled; pure
+    # CLI users (no daemon installed) silently skip this and apply the
+    # printed wg-quick config by hand as before.
+    if args.config and Path(args.config).is_file():
+        try:
+            gcfg = load_global_config(args.config)
+        except SystemExit:
+            gcfg = None
+        if gcfg and gcfg.auto_active_enrollment and gcfg.state_dir:
+            host_label = host_info.get("host_name") or "wormhole-host"
+            host_label = "".join(c for c in host_label
+                                  if c.isalnum() or c in "._@-")[:64] \
+                          or "wormhole-host"
+            try:
+                write_auto_active_peer(
+                    gcfg.state_dir,
+                    pubkey_b64=host_info["wg_pubkey"],
+                    label=host_label,
+                    iface="",  # joiner doesn't know which iface yet
+                )
+                sys.stdout.write(
+                    f"\nDaemon drop-in written under "
+                    f"{auto_active_dir(gcfg.state_dir)}/ — "
+                    f"the daemon will track this peer.\n")
+            except OSError as e:
+                sys.stderr.write(
+                    f"[WARN] could not write peer drop-in for the "
+                    f"new host: {e}\n")
+
 
 def cmd_mint_wormhole(args):
     """Host side: generate a wormhole code, advertise it, await a
@@ -5647,12 +5853,38 @@ def cmd_mint_wormhole(args):
                 name=label,
                 client_pub_b64=joiner_info["wg_pubkey"],
                 parameters=args.parameters or "",
+                assigned_address=assigned_address,
             )
             if ok:
                 sys.stdout.write(
                     f"\nProvisionScript {gcfg.provision_script} applied "
                     f"the new peer to {iface} (name={label!r}).\n")
                 provision_handled = True
+                # F3: mark the peer as daemon-managed by writing the
+                # corresponding drop-in under <state_dir>/auto-enrolled.d/.
+                # Without this the daemon ignores the just-paired peer
+                # (CLAUDE.md §2 "Per-pubkey drop-in gates daemon
+                # behaviour") and the tunnel never recovers from a
+                # NAT-rebinding or roam.
+                if gcfg.auto_active_enrollment and gcfg.state_dir:
+                    try:
+                        write_auto_active_peer(
+                            gcfg.state_dir,
+                            pubkey_b64=joiner_info["wg_pubkey"],
+                            label=label,
+                            iface=iface,
+                        )
+                        sys.stdout.write(
+                            f"Peer drop-in written under "
+                            f"{auto_active_dir(gcfg.state_dir)}/ — the "
+                            f"daemon will now maintain this tunnel.\n")
+                    except OSError as e:
+                        sys.stderr.write(
+                            f"[WARN] could not write peer drop-in: {e}\n"
+                            "The kernel peer is in place but the daemon "
+                            "will not actively maintain its NAT-traversal "
+                            "until you add /etc/wireguardrtc/peers.d/"
+                            f"{label}.conf with this peer's pubkey.\n")
             else:
                 sys.stderr.write(
                     f"\nProvisionScript FAILED: {err}\n"
