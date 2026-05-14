@@ -64,6 +64,59 @@ class EnrollConfigRendererTest {
         assertTrue(pubB64.endsWith("="), "expected padding; got '$pubB64'")
     }
 
+    @Test fun `V6_A1 happy-eyeballs prefers v6 candidate within the same kind tier`() {
+        // Host advertises both v4 and v6 STUN-discovered addresses
+        // at the same rank.  Joiner should bracket-and-publish the
+        // v6 entry as the initial Endpoint = X line.
+        val cfg = renderEnrollConfig(sampleUri, ok(basePlain.copy(
+            serverEndpointHint = null,
+            candidates = listOf(
+                EndpointCandidate(ip = "203.0.113.5", port = 51820, kind = "stun"),
+                EndpointCandidate(ip = "2001:db8::5", port = 51820, kind = "stun"),
+            ),
+        )))
+        assertTrue(
+            cfg.contains("Endpoint = [2001:db8::5]:51820"),
+            "expected v6-first within same kind; got:\n$cfg",
+        )
+        assertFalse(
+            cfg.contains("Endpoint = 203.0.113.5"),
+            "v4 should not win when same-kind v6 is present:\n$cfg",
+        )
+    }
+
+    @Test fun `V6_A1 falls back to v4 STUN when only v6 is LAN-only`() {
+        // Across different kinds, the host's rank is authoritative.
+        // A v6 ULA "lan" entry must NOT beat a v4 public "stun" entry
+        // — joiner can't route to ULA from outside the host LAN.
+        val cfg = renderEnrollConfig(sampleUri, ok(basePlain.copy(
+            serverEndpointHint = null,
+            candidates = listOf(
+                EndpointCandidate(ip = "203.0.113.5", port = 51820, kind = "stun"),
+                EndpointCandidate(ip = "fd00::1",     port = 51820, kind = "lan"),
+            ),
+        )))
+        assertTrue(
+            cfg.contains("Endpoint = 203.0.113.5:51820"),
+            "public v4 STUN must beat ULA v6 LAN; got:\n$cfg",
+        )
+    }
+
+    @Test fun `V6_A1 serverEndpointHint still wins over candidates`() {
+        // The hint is the host's preferred contact address (typically
+        // the v4 STUN result).  When set, candidates are ignored —
+        // even if they contain a v6 entry that happy-eyeballs would
+        // otherwise prefer.  Listener-driven roam can pick v6 later.
+        val cfg = renderEnrollConfig(sampleUri, ok(basePlain.copy(
+            // hint left set (basePlain.serverEndpointHint = "1.2.3.4:51820")
+            candidates = listOf(
+                EndpointCandidate(ip = "2001:db8::5", port = 51820, kind = "stun"),
+            ),
+        )))
+        assertTrue(cfg.contains("Endpoint = 1.2.3.4:51820"),
+            "hint should take precedence; got:\n$cfg")
+    }
+
     @Test fun `missing server_endpoint_hint AND no candidates throws with actionable message`() {
         val ex = assertThrows<IllegalStateException> {
             renderEnrollConfig(sampleUri, ok(basePlain.copy(

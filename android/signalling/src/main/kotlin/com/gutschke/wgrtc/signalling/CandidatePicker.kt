@@ -105,6 +105,53 @@ fun pickReceiverCandidates(
 }
 
 /**
+ * V6.A1 — happy-eyeballs preference for the joiner's enrollment
+ * config picker.  Within each [EndpointCandidate.kind] tier
+ * (`"stun"` / `"lan"` / `"mesh"` / null), float v6 entries to the
+ * front while preserving relative order between entries of the
+ * same (kind, family).  Across different kinds the host's original
+ * rank is authoritative — a v6 LAN ULA can't beat a v4 public
+ * STUN candidate, because the joiner usually isn't on the host's
+ * LAN.  See `docs/ipv6-design.md` §2.1 / §4.2.
+ *
+ * Pure function — exhaustively unit-tested in
+ * [CandidateRankV6Test].
+ */
+fun preferV6WithinKind(
+    candidates: List<EndpointCandidate>,
+): List<EndpointCandidate> {
+    if (candidates.isEmpty()) return candidates
+    // Walk the input to capture the kind order as the host wrote
+    // it.  We can't `groupBy` and iterate the map because Kotlin
+    // doesn't preserve insertion order for groupBy keys in every
+    // jdk target combination.  An explicit "first-seen" list is
+    // safest.
+    val kindOrder = LinkedHashSet<String?>()
+    for (c in candidates) kindOrder.add(c.kind)
+    val out = ArrayList<EndpointCandidate>(candidates.size)
+    for (k in kindOrder) {
+        val inKind = candidates.filter { it.kind == k }
+        // v6 first (relative order kept), then v4.  Stable
+        // partition: filter + filter preserves original ordering
+        // within each subset.
+        out.addAll(inKind.filter { isV6Address(it.ip) })
+        out.addAll(inKind.filter { !isV6Address(it.ip) })
+    }
+    return out
+}
+
+/**
+ * Lightweight family classifier — a v6 address always contains
+ * at least one colon, and a v4 dotted-quad never does.  Tolerates
+ * malformed strings (no colon → false; we keep them in v4-bucket
+ * so the sort doesn't crash on corrupted input).  Brackets are
+ * not expected here — [EndpointCandidate.ip] carries the bare
+ * address per the wire format.
+ */
+private fun isV6Address(ip: String): Boolean = ip.contains(':')
+
+
+/**
  * Production helper: enumerate the receiver's currently-active local
  * v4 interfaces using [NetworkInterface.getNetworkInterfaces]. Skips
  * loopback, link-local, and operationally-down interfaces — same

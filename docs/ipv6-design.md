@@ -280,6 +280,22 @@ State logger emits `hole-punch.skip-v6 <dst>` / `wake.skip-v6 <target>` on each 
 
 Files: `daemon/wireguardrtc` (helper + 4 gate sites), `daemon/tests/55_skip_hole_punch_v6.py` (14 tests, including async tests of `RawHelperClient`).
 
-### V6.A1 — (next)
+### V6.A1 — 2026-05-14
 
-Android joiner side: candidate ranker must accept v6 candidates from the host's enrolment payload.  Today the ranker filters by family.  Per RFC 8305 prefer v6 in dual-stack scenarios.
+Joiner-side happy-eyeballs for the enrollment-config renderer.  Discovered during the audit that the joiner already structurally accepts v6 candidates — PS19 added the dual-stack STUN parser, PS24 fixed v6 endpoint bracketing in `formatEndpoint`, and `EndpointCandidate` carries `ip: String` opaquely.  What was missing: the `EnrollConfigRenderer` picks `candidates.firstOrNull()` for the initial wg-quick `Endpoint = X` line, so whatever family the host put first wins.
+
+Added `preferV6WithinKind(candidates)` to `signalling/CandidatePicker.kt`.  Stable sort: within each `kind` tier (`"stun"` / `"lan"` / `"mesh"` / null), v6 entries float to the front while preserving relative order between same-(kind, family) entries.  Across different kinds the host's original rank is authoritative — a v6 "lan" ULA can't beat a v4 "stun" public candidate because the joiner usually isn't on the host's LAN.
+
+Applied in `EnrollConfigRenderer.kt` between `plain.candidates` and `firstOrNull`.  `serverEndpointHint` still takes precedence — that's the host's deliberate preferred-contact choice; listener-driven roam can switch to v6 later if the host advertises one.
+
+10 new unit tests in `signalling/src/test/.../CandidateRankV6Test.kt` covering: empty, v4-only, v6-only, within-kind preference, kind-order respect, multiple per kind (stable sub-order), null-kind tier, distinct-kind isolation, port preservation, defensive parse.  3 renderer-level tests added to `EnrollConfigRendererTest.kt` (within-kind v6 wins; cross-kind v4-STUN beats v6-LAN; hint still wins over candidates).
+
+All `:signalling:testDebugUnitTest` + `:app:testDebugUnitTest` (filtered to the renderer / picker / iface suites) pass.
+
+Files: `android/signalling/src/main/kotlin/.../CandidatePicker.kt` (helper + classifier), `android/app/src/main/kotlin/.../EnrollConfigRenderer.kt` (wire-in), tests in the matching `src/test` locations.
+
+**Not yet addressed:** the listener-driven roam path uses `EndpointUpdate` (which has no `kind` field) for per-message candidate dispatch.  Adding family-preference there is a follow-up — the roam mechanism re-races candidates and will land on whatever works, so the bias is less urgent.  Worth a tracked task once V6.A2/A3 are done.
+
+### V6.A2 — (next)
+
+Android joiner VpnService route table: when `AllowedIPs` contains `::/0`, ensure `VpnService.Builder.addRoute(IPv6.ANY, 0)` is called.  Without it, v6 traffic destined for the tunnel falls off the route table and goes via the underlying network (or fails entirely).

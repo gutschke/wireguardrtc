@@ -4,6 +4,7 @@ import com.gutschke.wgrtc.signalling.EnrollOkPlain
 import com.gutschke.wgrtc.signalling.EnrollResult
 import com.gutschke.wgrtc.signalling.EnrollUri
 import com.gutschke.wgrtc.signalling.formatEndpoint
+import com.gutschke.wgrtc.signalling.preferV6WithinKind
 import java.util.Base64
 
 /**
@@ -36,8 +37,14 @@ import java.util.Base64
  */
 fun renderEnrollConfig(uri: EnrollUri, ok: EnrollResult.Ok): String {
  val plain: EnrollOkPlain = ok.plaintext
+ // V6.A1: within each kind tier of the candidates list, prefer
+ // IPv6 (RFC 8305 happy-eyeballs).  The host's overall rank
+ // ordering (stun before lan, etc.) is preserved; only the
+ // within-tier family preference flips when both families are
+ // advertised at the same tier.
+ val candidatesV6First = plain.candidates?.let(::preferV6WithinKind)
  val endpoint = plain.serverEndpointHint
- ?: plain.candidates?.firstOrNull()?.let { formatEndpoint(it.ip, it.port) }
+ ?: candidatesV6First?.firstOrNull()?.let { formatEndpoint(it.ip, it.port) }
  ?: throw IllegalStateException(
  "ENROLL_OK has no server endpoint; host needs PublicIp or STUN " +
  "discovery to advertise a usable address")
