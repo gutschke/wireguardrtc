@@ -994,6 +994,174 @@ def decode_host_enroll_info(blob, sas_key, now=None,
     return msg
 
 
+# ─── Wormhole flow controller ──────────────────────────────────────────
+#
+# Orchestrates SPAKE2 + SAS + enrollment over a transport object.  The
+# transport contract is narrow:
+#   await transport.send(envelope_dict)
+#   envelope = await transport.recv()    # awaitable; returns next inbound
+#   await transport.close()
+#
+# Production uses PeerJSClient under the hood (or a thin adapter that
+# turns its callback API into a queue); tests substitute an in-memory
+# queue pair.  Keeping the transport behind an interface lets the
+# protocol logic be exercised without touching the network.
+
+class SasAborted(Exception):
+    """The local user pressed "no" on the SAS comparison.  Distinct
+    from WormholeFailed so the caller can show a "you aborted"
+    message instead of a generic failure."""
+
+
+class WormholeFailed(Exception):
+    """Wormhole pairing failed for a non-user reason: malformed
+    inbound envelope, MAC mismatch (different code), broker error,
+    bad enroll-info payload.  Message gives the specific reason."""
+
+
+class WormholeFlow:
+    """One-side wormhole-pairing state machine.
+
+    Args:
+        role: "initiator" (joiner; sends sas_step_1) or
+              "responder" (host; sends sas_step_2 in reply).
+        code_bytes: UTF-8 of the canonical (uppercase, alphabet-only)
+                    wormhole code.
+        transport: object with async send(envelope), async recv()
+                   returning envelope dict, async close().
+    """
+
+    def __init__(self, role, code_bytes, transport):
+        if role not in ("initiator", "responder"):
+            raise ValueError(
+                f"role must be 'initiator' or 'responder' (got {role!r})")
+        self._role = role
+        self._code_bytes = bytes(code_bytes)
+        self._transport = transport
+        if role == "initiator":
+            self._our_id = sas_routing_id_initiator(self._code_bytes)
+            self._peer_id = sas_routing_id_responder(self._code_bytes)
+        else:
+            self._our_id = sas_routing_id_responder(self._code_bytes)
+            self._peer_id = sas_routing_id_initiator(self._code_bytes)
+        # SPAKE2 role mapping: initiator=alice, responder=bob.
+        self._spake = Spake2(role=("alice" if role == "initiator" else "bob"),
+                              password=self._code_bytes)
+
+    @property
+    def our_routing_id(self):
+        return self._our_id
+
+    @property
+    def peer_routing_id(self):
+        return self._peer_id
+
+    async def _recv_kind(self, *extractors):
+        """Wait for an inbound that matches at least one extractor.
+        Each extractor takes the envelope and returns a parsed tuple
+        or None.  Returns (extractor_index, parsed_value)."""
+        while True:
+            env = await self._transport.recv()
+            for i, ex in enumerate(extractors):
+                parsed = ex(env)
+                if parsed is not None:
+                    return i, parsed
+
+    async def run_joiner(self, joiner_pubkey_b64, device_name=None,
+                          confirm_sas=None):
+        """Initiator (joiner) side.  Sends sas_step_1, awaits sas_step_2,
+        derives + displays SAS, awaits user confirmation, sends
+        sas_confirm with encrypted JoinerEnrollInfo, awaits responder's
+        sas_confirm, decrypts HostEnrollInfo, returns (sas_phrase,
+        host_info_dict).
+
+        confirm_sas: callable taking the SAS phrase and returning True
+                     iff the user accepted.  Raises SasAborted if False.
+        """
+        if confirm_sas is None:
+            confirm_sas = lambda phrase: True
+        # Step 1: send our PAKE message.
+        my_msg = self._spake.start()
+        await self._transport.send(
+            build_sas_step1_envelope(self._peer_id, my_msg))
+        # Step 2: await peer's PAKE message.
+        _, (_src, peer_msg) = await self._recv_kind(extract_sas_step2)
+        sas_key = self._spake.finish(peer_msg)
+        # User confirmation.
+        sas_phrase = derive_sas(sas_key)
+        if not confirm_sas(sas_phrase):
+            raise SasAborted(sas_phrase)
+        # Pack the joiner's info and send our confirm.
+        info_blob = encode_joiner_enroll_info(
+            sas_key=sas_key,
+            wg_pubkey_b64=joiner_pubkey_b64,
+            device_name=device_name,
+        )
+        my_mac = build_sas_confirm_mac("initiator", sas_key)
+        await self._transport.send(build_sas_confirm_envelope(
+            self._peer_id, my_mac, encrypted_info=info_blob))
+        # Receive peer's confirm + encrypted HostEnrollInfo.
+        _, (_src2, peer_mac, peer_info) = await self._recv_kind(
+            extract_sas_confirm)
+        if not verify_sas_confirm_mac("responder", sas_key, peer_mac):
+            raise WormholeFailed(
+                "peer sas_confirm MAC did not verify — wrong code "
+                "or a relay-MITM that completed PAKE on each side")
+        if peer_info is None:
+            raise WormholeFailed(
+                "peer's sas_confirm did not include enroll-info; "
+                "responder may be older than the encrypted-info "
+                "extension")
+        host_info = decode_host_enroll_info(peer_info, sas_key=sas_key)
+        if host_info is None:
+            raise WormholeFailed(
+                "peer's enroll-info blob did not decrypt / validate")
+        return sas_phrase, host_info
+
+    async def run_host(self, host_info, confirm_sas=None):
+        """Responder (host) side.  Awaits sas_step_1, sends sas_step_2,
+        derives SAS, awaits user confirmation, awaits joiner's
+        sas_confirm with JoinerEnrollInfo, sends our sas_confirm with
+        HostEnrollInfo, returns (sas_phrase, joiner_info_dict).
+
+        host_info: dict with keys matching encode_host_enroll_info's
+                   keyword args.
+        confirm_sas: as in run_joiner.
+        """
+        if confirm_sas is None:
+            confirm_sas = lambda phrase: True
+        # Step 1: await peer's PAKE message.
+        _, (_src, peer_msg) = await self._recv_kind(extract_sas_step1)
+        # Step 2: send ours, derive key.
+        my_msg = self._spake.start()
+        await self._transport.send(
+            build_sas_step2_envelope(self._peer_id, my_msg))
+        sas_key = self._spake.finish(peer_msg)
+        sas_phrase = derive_sas(sas_key)
+        if not confirm_sas(sas_phrase):
+            raise SasAborted(sas_phrase)
+        # Receive peer's confirm + encrypted JoinerEnrollInfo.
+        _, (_src2, peer_mac, peer_info) = await self._recv_kind(
+            extract_sas_confirm)
+        if not verify_sas_confirm_mac("initiator", sas_key, peer_mac):
+            raise WormholeFailed(
+                "peer sas_confirm MAC did not verify — wrong code "
+                "or a relay-MITM that completed PAKE on each side")
+        if peer_info is None:
+            raise WormholeFailed(
+                "peer's sas_confirm did not include enroll-info")
+        joiner_info = decode_joiner_enroll_info(peer_info, sas_key=sas_key)
+        if joiner_info is None:
+            raise WormholeFailed(
+                "peer's enroll-info blob did not decrypt / validate")
+        # Send our confirm with encrypted HostEnrollInfo back.
+        host_blob = encode_host_enroll_info(sas_key=sas_key, **host_info)
+        my_mac = build_sas_confirm_mac("responder", sas_key)
+        await self._transport.send(build_sas_confirm_envelope(
+            self._peer_id, my_mac, encrypted_info=host_blob))
+        return sas_phrase, joiner_info
+
+
 # ─── STUN XOR-MAPPED-ADDRESS parser ────────────────────────────────────
 # Pure function — no I/O, no sockets, testable with synthetic vectors.
 # Handles both family=0x01 (IPv4) and family=0x02 (IPv6) per RFC 5389
