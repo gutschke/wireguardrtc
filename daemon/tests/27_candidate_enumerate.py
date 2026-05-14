@@ -63,15 +63,24 @@ def gcfg(public_ip=None, advertise=None, suppress=None,
 
 
 def discover(global_config, listen_port, own_wg_ifaces=None,
-             iface_addrs=None, default_iface=None, stun_ips=None):
-    """Test wrapper: pass synthetic iface/route/STUN data."""
+             iface_addrs=None, iface_addrs_v6=None,
+             default_iface=None, stun_ips=None):
+    """Test wrapper: pass synthetic iface/route/STUN data.
+
+    `iface_addrs_v6` defaults to an empty list — these v4-focused
+    tests don't care about v6 ifaces; the V6.D4 work added a new
+    provider with a real default (reads /proc/net/if_inet6) that
+    would otherwise pollute the test output with the host's real
+    v6 addresses."""
     async def iface_p(): return list(iface_addrs or [])
+    async def iface_v6_p(): return list(iface_addrs_v6 or [])
     async def default_p(): return default_iface
     async def stun_p(servers, state): return list(stun_ips or [])
     return asyncio.run(wgrtc.discover_local_candidates(
         global_config, listen_port,
         own_wg_ifaces=set(own_wg_ifaces or []),
         iface_addrs_provider=iface_p,
+        iface_addrs_v6_provider=iface_v6_p,
         default_iface_provider=default_p,
         stun_provider=stun_p,
     ))

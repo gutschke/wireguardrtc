@@ -254,3 +254,17 @@ PublicIp now accepts comma-separated dual-stack values: `PublicIp = 203.0.113.5,
 7/7 V6.D3 tests pass; 20/20 pre-existing candidate-enumerator tests stay green.  No iface-enumeration v6 path yet — STUN-derived v6 candidates suffice for the common case (host has a routable GUA and STUN tells us the public mapping).  Local v6 iface enumeration is a future enhancement (V6.D4?) if we want the LAN-rank-50 equivalent on v6 networks.
 
 Files: `daemon/wireguardrtc` (eligibility helper + dual-stack PublicIp/STUN paths), `daemon/tests/53_candidate_v6.py` (7 tests).
+
+### V6.D4 — 2026-05-14
+
+Local v6 iface enumeration.  Added `_enumerate_iface_addrs_v6`: shells out to `ip -6 -o addr show` and falls back to a pure-stdlib parser of `/proc/net/if_inet6` when `ip` is missing or returns empty.  The fallback parser is exposed as `_parse_proc_if_inet6(text) -> [(iface, ip), …]` and is tested directly with synthetic kernel output.  Scope filter: only `00` (global = GUA + ULA) is kept; link-local (`20`), host (`10`), site (`40`) are dropped.
+
+`discover_local_candidates` now takes an `iface_addrs_v6_provider` kwarg and emits v6 ifaces at rank 55 (LAN equivalent for v6, just below v4 LAN at rank 50 — small bias toward v4 in mixed environments until we have happy-eyeballs data; tune later).  Advertise/suppress/own-wg gates apply to both families.
+
+**Regression test fix:** `tests/27_candidate_enumerate.py`'s `discover()` helper previously didn't stub the new v6 provider; the production default reads `/proc/net/if_inet6` and on the dev box that pulled in 7 real GUA + ULA addresses, breaking the v4-focused expectations.  Added a `iface_addrs_v6=None` parameter (defaults empty), all 20 pre-existing tests pass again.
+
+Files: `daemon/wireguardrtc` (enumerator + parser + dispatch), `daemon/tests/54_iface_v6.py` (7 tests), `daemon/tests/27_candidate_enumerate.py` (test-helper update).
+
+### V6.D5 — (next)
+
+Skip hole-punching for v6-active peers.  `inject_raw_udp` + `wake_via_iface` are v4-only; calling them with a v6 endpoint either errors or no-ops.  Plan: detect the active endpoint's family before invoking, skip the raw-inject leg for v6 endpoints, log a one-shot informational line.

@@ -2306,6 +2306,100 @@ def _enumerate_iface_addrs_v4_ioctl() -> list:
     return addrs
 
 
+def _parse_proc_if_inet6(text: str) -> list:
+    """Parse /proc/net/if_inet6 contents into [(iface, ip_str), ...].
+
+    The kernel emits one row per address with fixed columns:
+        <addr-hex32> <iface-idx> <prefix-len> <scope> <flags> <iface-name>
+    where `scope` is hex: 00 = global, 10 = host (loopback),
+    20 = link-local, 40 = site-local, 50 = compat.  We keep only
+    global (and explicitly skip link-local / host / multicast)
+    because that's what we'd want to publish to a remote peer.
+
+    Pure-stdlib: no subprocess, no ioctl.  Useful inside the
+    daemon's strict systemd sandbox where /proc is readable but
+    `ip` may return empty output (the same SIGSYS sandbox finding
+    that bit the v4 enumeration path)."""
+    out: list = []
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) < 6:
+            continue
+        hexaddr, _idx, _plen, scope_hex, _flags, iface = toks[:6]
+        if scope_hex != "00":
+            # Drop link-local (20), host (10), site-local (40), …
+            # Keep only globally-scoped addresses (which includes
+            # both GUA and ULA — admins running ULA-only meshes
+            # legitimately advertise those inside their network).
+            continue
+        if len(hexaddr) != 32:
+            continue
+        try:
+            blocks = [hexaddr[i:i + 4] for i in range(0, 32, 4)]
+            ip = ":".join(blocks)
+            # Round-trip through inet_pton/inet_ntop to compact
+            # (collapse runs of zeros to ::, lowercase).
+            packed = socket.inet_pton(socket.AF_INET6, ip)
+            ip = socket.inet_ntop(socket.AF_INET6, packed)
+        except (ValueError, OSError):
+            continue
+        out.append((iface, ip))
+    return out
+
+
+def _enumerate_iface_addrs_v6_proc() -> list:
+    """Pure-stdlib v6 iface enumeration via /proc/net/if_inet6.
+    Returns [(iface, ip_str), ...].  Empty list on read failure."""
+    try:
+        with open("/proc/net/if_inet6", "r", encoding="utf-8") as f:
+            return _parse_proc_if_inet6(f.read())
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+
+
+async def _enumerate_iface_addrs_v6() -> list:
+    """Default v6 provider: shell out to `ip -6 -o addr show` and
+    parse, falling through to /proc/net/if_inet6 when `ip` is
+    missing or returns no usable lines.  Returns
+    [(iface_name, ip_str), ...] with bare v6 strings (no brackets,
+    no /prefix).  Filters by scope=global on the proc-fallback
+    path; the `ip` shellout output is filtered by `scope global`
+    pattern matching."""
+    out_str = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip", "-6", "-o", "addr", "show",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, _err_b = await proc.communicate()
+        out_str = out_b.decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError):
+        _warn_iproute2_missing_once()
+    addrs: list = []
+    for line in out_str.splitlines():
+        toks = line.split()
+        try:
+            i_inet = toks.index("inet6")
+            iface = toks[1]
+            ip_with_prefix = toks[i_inet + 1]
+            ip_str = ip_with_prefix.split("/")[0]
+        except (ValueError, IndexError):
+            continue
+        # Only keep `scope global` so we don't accidentally publish
+        # link-local or host-scoped addresses (loopback) to peers.
+        if "scope" in toks:
+            si = toks.index("scope")
+            if si + 1 < len(toks) and toks[si + 1] != "global":
+                continue
+        addrs.append((iface, ip_str))
+    if addrs:
+        return addrs
+    # `ip` either wasn't available or returned nothing — fall back
+    # to /proc/net/if_inet6 (already filters scope=global).
+    return _enumerate_iface_addrs_v6_proc()
+
+
 async def _enumerate_iface_addrs_v4() -> list:
     """Default provider: shell out to `ip -4 -o addr show` and parse,
     falling through to a SIOCGIFADDR-based stdlib enumeration when
@@ -2456,6 +2550,7 @@ async def discover_local_candidates(
     global_config, listen_port: int,
     own_wg_ifaces=None,
     iface_addrs_provider=None,
+    iface_addrs_v6_provider=None,
     default_iface_provider=None,
     stun_provider=None,
 ) -> list:
@@ -2473,6 +2568,8 @@ async def discover_local_candidates(
     `_default_route_iface_v4` / `get_public_ipv4_all`.
     """
     iface_addrs_provider = iface_addrs_provider or _enumerate_iface_addrs_v4
+    iface_addrs_v6_provider = (iface_addrs_v6_provider
+                               or _enumerate_iface_addrs_v6)
     default_iface_provider = default_iface_provider or _default_route_iface_v4
     # Default to the dual-stack helper.  It returns
     # `[(family, ip), …]`; the loop below also accepts the legacy
@@ -2492,6 +2589,7 @@ async def discover_local_candidates(
         stun_provider(global_config.stun_servers, global_config),
         iface_addrs_provider(),
         default_iface_provider(),
+        iface_addrs_v6_provider(),
         return_exceptions=True,
     )
     def _unwrap(entry, default, label):
@@ -2502,9 +2600,10 @@ async def discover_local_candidates(
                       level=logging.WARNING)
             return default
         return entry
-    stun_ips      = _unwrap(raw[0], [],   "stun")
-    iface_addrs   = _unwrap(raw[1], [],   "iface-enum")
-    default_iface = _unwrap(raw[2], None, "default-route")
+    stun_ips        = _unwrap(raw[0], [],   "stun")
+    iface_addrs     = _unwrap(raw[1], [],   "iface-enum")
+    default_iface   = _unwrap(raw[2], None, "default-route")
+    iface_addrs_v6  = _unwrap(raw[3], [],   "iface-enum-v6")
 
     candidates: list = []
     seen_ips: set = set()
@@ -2579,6 +2678,44 @@ async def discover_local_candidates(
         rank, kind = cls
         decisions.append(f"{iface}:{ip_str}=keep(rank={rank},kind={kind})")
         _add(ip_str, kind, rank)
+
+    # V6 iface enumeration.  The v6-specific classifier reuses the
+    # v4 advertise/suppress/own-wg gates but routes through
+    # _is_candidate_eligible_v6 (drops link-local, loopback, mcast,
+    # v4-mapped).  No private/global split — admins running ULA
+    # meshes legitimately rank them with the others; the eligibility
+    # filter kept ULA so it lands here.  Rank=55 puts v6 LAN
+    # candidates just below v4 LAN (rank=50) — small bias toward
+    # legacy v4 in mixed environments while ensuring v6 candidates
+    # still get listed.  Adjust later if happy-eyeballs ordering
+    # turns out to prefer v6 in practice.
+    for iface, ip_str in iface_addrs_v6:
+        if ip_str in seen_ips:
+            decisions.append(f"{iface}:{ip_str}=dup")
+            continue
+        if iface in own_wg:
+            decisions.append(f"{iface}:{ip_str}=drop(own-wg)")
+            continue
+        if iface in suppress_set:
+            decisions.append(f"{iface}:{ip_str}=drop(suppress)")
+            continue
+        if (_is_tunnel_iface_name(iface)
+                and iface not in advertise_set):
+            decisions.append(
+                f"{iface}:{ip_str}=drop(tunnel-not-advertised)")
+            continue
+        if not _is_candidate_eligible_v6(ip_str):
+            decisions.append(f"{iface}:{ip_str}=drop(ineligible-v6)")
+            continue
+        # Explicit advertise overrides rank to mesh (rank 60).
+        if iface in advertise_set:
+            decisions.append(
+                f"{iface}:{ip_str}=keep(rank=60,kind=mesh)")
+            _add(ip_str, "mesh", 60)
+            continue
+        decisions.append(f"{iface}:{ip_str}=keep(rank=55,kind=lan)")
+        _add(ip_str, "lan", 55)
+
     if logging.getLogger().isEnabledFor(logging.DEBUG):
         decisions_str = ",".join(decisions) or "<empty>"
         LOG.event("candidates", "iface-enum-decisions", decisions_str,
