@@ -69,6 +69,25 @@ hole punching for NAT — and we package them so the result is a Debian
 | **Linux daemon** | [`daemon/`](daemon/) | Python 3 asyncio service that interrogates `wg show`, exchanges endpoint envelopes through a signaling broker, and punches NATs open with raw UDP.  Ships as a `.deb`. |
 | **Android app**  | [`android/`](android/) | A WireGuard tunnel manager.  Joins tunnels hosted by daemons, joins tunnels hosted by other phones, or hosts a tunnel itself (full userspace WireGuard).  Distributed as a signed APK on this repository's [Releases](../../releases) page. |
 
+### Reference documentation
+
+The authoritative documentation lives in the shipped manual pages —
+read them on a system that has the daemon installed with `man
+wireguardrtc`, or browse the auto-generated Markdown mirrors here:
+
+- [`docs/wireguardrtc.8.md`](docs/wireguardrtc.8.md) — daemon manual,
+  config file format, peer modes, security model.
+- [`docs/provision-scripts.md`](docs/provision-scripts.md) — how to
+  write a custom `ProvisionScript` that integrates the daemon's
+  enrolment + wormhole-pairing flows with your peer-management
+  system (Ansible inventory, `wg-quick` configs, an IPAM, an
+  `add-peer`/`del-peer` script family, …).
+
+The Markdown files are regenerated from the source `.8` man page with
+`python3 daemon/build_man_md.py --all` — they're checked in so GitHub
+renders them, but the man page is the source of truth.  Don't edit
+the `.md` by hand.
+
 ### Use whichever side(s) you need
 
 Both components speak the same encrypted-envelope wire format, so any side
