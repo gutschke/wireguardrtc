@@ -200,7 +200,10 @@ of base64 keys.
      type the 6-letter code on the joiner (`sudo wireguardrtc
      --use-wormhole ABCDEF` on a Linux client, or the app's wormhole
      input on a phone), confirm the 4-word SAS phrase matches on
-     both sides.
+     both sides.  Cross-impl interop is verified end-to-end —
+     daemon's pure-Python Ristretto255 + SPAKE2 produces the
+     identical SAS phrase as the app's libsodium-backed Kotlin
+     implementation, byte-for-byte.
 
 3. **The tunnel appears in the list, idle.**  Tap to bring it up:
 
