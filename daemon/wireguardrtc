@@ -112,6 +112,58 @@ DEFAULT_STUN_SERVERS = [
 ]
 
 
+# ─── STUN XOR-MAPPED-ADDRESS parser ────────────────────────────────────
+# Pure function — no I/O, no sockets, testable with synthetic vectors.
+# Handles both family=0x01 (IPv4) and family=0x02 (IPv6) per RFC 5389
+# §15.2.  v6 addresses are XORed with magic_cookie ‖ transaction_id.
+# Returns (ext_ip_str, ext_port) on a valid response, or None otherwise.
+# Used by `cmd_check_nat`; the live daemon loop still has its own
+# inline v4-only parser in `stun_query` (raw-inject hole-punching is
+# v4-only so it never needs v6 here).
+
+def _parse_stun_xor_mapped(data, txid):
+    if len(data) < 20:
+        return None
+    msg_type, msg_len, magic, resp_txid = struct.unpack(
+        "!HHL12s", data[:20])
+    if msg_type != 0x0101:
+        return None
+    if magic != STUN_MAGIC_COOKIE:
+        return None
+    if resp_txid != txid:
+        return None
+    end = 20 + msg_len
+    if len(data) < end:
+        return None
+    offset = 20
+    while offset + 4 <= end:
+        atype, alen = struct.unpack("!HH", data[offset:offset + 4])
+        offset += 4
+        if atype == 0x0020 and alen >= 8 and offset + alen <= end:
+            family = data[offset + 1]
+            xport = struct.unpack("!H", data[offset + 2:offset + 4])[0]
+            ext_port = xport ^ (STUN_MAGIC_COOKIE >> 16)
+            if family == 0x01:
+                xip = struct.unpack(
+                    "!L", data[offset + 4:offset + 8])[0]
+                ext_ip = socket.inet_ntoa(
+                    struct.pack("!L", xip ^ STUN_MAGIC_COOKIE))
+                return ext_ip, ext_port
+            if family == 0x02 and alen >= 20:
+                raw = data[offset + 4:offset + 20]
+                mask = struct.pack("!L", STUN_MAGIC_COOKIE) + txid
+                ip_bytes = bytes(a ^ b for a, b in zip(raw, mask))
+                ext_ip = socket.inet_ntop(socket.AF_INET6, ip_bytes)
+                return ext_ip, ext_port
+        offset += alen + ((4 - (alen % 4)) % 4)
+    return None
+
+
+# STUN_MAGIC_COOKIE is referenced above; the actual value is defined
+# further down with the other wire-format constants.  The parser's
+# lookup happens at call time, so the forward reference is fine.
+
+
 # ─── NAT-type classifier (used by --check-nat + tests/01_stun_nat.py) ────
 
 class NatVerdict:
@@ -3914,79 +3966,80 @@ def cmd_enroll_token(args):
     )
 
 
-def cmd_check_nat(args):
-    """Run STUN probes from 3 source ports to each configured STUN server,
-    classify the NAT, print a verdict, exit 0 if wgrtc is viable else 1."""
-    import struct as _struct
-    import socket as _socket
-    import time as _time
+def _discover_local_ip(family):
+    """Ask the kernel which local address it would route outbound traffic
+    over for the given family.  Returns the address as a string, or None
+    if the family isn't reachable at all (no v4 stack, no v6 stack)."""
+    # Use a public anycast address — no traffic is actually sent for
+    # a connect() on an unbound UDP socket; the kernel only performs
+    # a route lookup.
+    sample = ("8.8.8.8", 80) if family == socket.AF_INET \
+             else ("2001:4860:4860::8888", 80)
+    try:
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            s.connect(sample)
+            ip = s.getsockname()[0]
+            return ip
+        finally:
+            s.close()
+    except OSError:
+        return None
 
-    servers = args.stun_servers or DEFAULT_STUN_SERVERS
 
-    # Pick three distinct ephemeral source ports — ask the kernel for
-    # one, read it back, close, repeat.  Avoids accidentally landing on
-    # an in-use port.
-    src_ports = []
-    for _ in range(3):
-        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-        s.bind(("0.0.0.0", 0))
-        src_ports.append(s.getsockname()[1])
-        s.close()
-        _time.sleep(0.05)
-
-    print(f"Source ports: {src_ports}")
-    print(f"STUN servers: {', '.join(servers)}")
-    print()
-
+def _check_nat_family(family, servers, src_ports):
+    """Probe every (server, src_port) combo over the given family.
+    Returns (probes, failures, label) suitable for classify_nat_result()
+    and pretty printing."""
+    family_label = "IPv4" if family == socket.AF_INET else "IPv6"
+    bind_addr = "0.0.0.0" if family == socket.AF_INET else "::"
     probes = []
     failures = []
     magic = 0x2112A442
     for server in servers:
         host, port_str = server.rsplit(":", 1)
         port = int(port_str)
+        try:
+            infos = socket.getaddrinfo(
+                host, port, family=family, type=socket.SOCK_DGRAM)
+        except socket.gaierror as e:
+            for src_port in src_ports:
+                failures.append((server, src_port, f"DNS: {e}"))
+                print(f"  {server:32s}  src={src_port:>5d}  "
+                      f"->  FAILED: DNS ({family_label})")
+            continue
+        if not infos:
+            for src_port in src_ports:
+                failures.append((server, src_port, "no address records"))
+                print(f"  {server:32s}  src={src_port:>5d}  "
+                      f"->  FAILED: no {family_label} record")
+            continue
+        server_ip = infos[0][4][0]
         for src_port in src_ports:
-            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            if family == socket.AF_INET6:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6,
+                                    socket.IPV6_V6ONLY, 1)
+                except OSError:
+                    pass
             try:
-                sock.bind(("0.0.0.0", src_port))
+                sock.bind((bind_addr, src_port))
                 local_port = sock.getsockname()[1]
-                ip = _socket.gethostbyname(host)
                 txid = os.urandom(12)
-                request = _struct.pack("!HHL12s", 0x0001, 0, magic, txid)
+                request = struct.pack("!HHL12s", 0x0001, 0, magic, txid)
                 sock.settimeout(2.0)
-                sock.sendto(request, (ip, port))
-                deadline = _time.time() + 2.0
-                ext_ip = None
-                ext_port = None
-                while _time.time() < deadline:
+                sock.sendto(request, (server_ip, port))
+                deadline = time.time() + 2.0
+                parsed = None
+                while time.time() < deadline:
                     data, _ = sock.recvfrom(2048)
-                    if len(data) < 20:
-                        continue
-                    msg_type, msg_len, magic_resp, resp_txid = \
-                        _struct.unpack("!HHL12s", data[:20])
-                    if (msg_type != 0x0101 or magic_resp != magic
-                            or resp_txid != txid):
-                        continue
-                    offset = 20
-                    end = 20 + msg_len
-                    while offset + 4 <= end:
-                        attr_type, attr_len = _struct.unpack(
-                            "!HH", data[offset:offset + 4])
-                        offset += 4
-                        if attr_type == 0x0020 and attr_len >= 8:
-                            family = data[offset + 1]
-                            if family == 0x01:
-                                xport = _struct.unpack(
-                                    "!H", data[offset + 2:offset + 4])[0]
-                                xip = _struct.unpack(
-                                    "!L", data[offset + 4:offset + 8])[0]
-                                ext_port = xport ^ (magic >> 16)
-                                ext_ip = _socket.inet_ntoa(
-                                    _struct.pack("!L", xip ^ magic))
-                                break
-                        offset += attr_len + ((4 - (attr_len % 4)) % 4)
-                    break
-                if ext_ip is None:
+                    parsed = _parse_stun_xor_mapped(data, txid)
+                    if parsed is not None:
+                        break
+                if parsed is None:
                     raise RuntimeError("XOR-MAPPED-ADDRESS not in response")
+                ext_ip, ext_port = parsed
                 probes.append((server, local_port, ext_ip, ext_port))
                 tag = "preserved" if ext_port == local_port else "remapped"
                 print(f"  {server:32s}  src={local_port:>5d}  "
@@ -3996,19 +4049,83 @@ def cmd_check_nat(args):
                 print(f"  {server:32s}  src={src_port:>5d}  ->  FAILED: {e}")
             finally:
                 sock.close()
+    return probes, failures, family_label
 
+
+def _print_family_verdict(family, servers, src_ports):
+    """Run a single-family probe and print its section.  Returns True if
+    the family is viable for wgrtc (port-preserving cone or single
+    no-NAT path), False otherwise."""
+    family_label = "IPv4" if family == socket.AF_INET else "IPv6"
+    local_ip = _discover_local_ip(family)
+    print(f"━━ {family_label} ━━")
+    print(f"Local address: {local_ip or '(no route)'}")
+    if local_ip is None:
+        print(f"No {family_label} route on this host — skipping STUN probe.")
+        print()
+        return None
+    print(f"Source ports:  {src_ports}")
+    print()
+    probes, failures, _ = _check_nat_family(family, servers, src_ports)
     verdict = classify_nat_result(probes)
     print()
-    print(f"External IPs: {verdict.external_ips or '(none)'}")
-    print(f"Verdict:      {verdict.kind}")
+    ext_ips = verdict.external_ips or ["(none)"]
+    print(f"External {family_label}: {', '.join(ext_ips)}")
+    print(f"Verdict:       {verdict.kind}")
     print(f"  cone:             {verdict.cone}")
     print(f"  port-preserving:  {verdict.port_preserving}")
     print()
     print(verdict.summary)
-    if failures:
-        print()
+    if family == socket.AF_INET6 and not probes and not failures:
+        print("(No IPv6 STUN servers responded — likely v6-disabled "
+              "upstream or v6-only-locally.)")
+    elif failures:
         print(f"({len(failures)} probe(s) failed; verdict based on the rest)")
-    sys.exit(0 if verdict.wgrtc_viable else 1)
+    print()
+    return verdict.wgrtc_viable
+
+
+def cmd_check_nat(args):
+    """Run STUN probes from 3 source ports across the chosen address
+    families, classify each family independently, print verdicts, and
+    exit 0 only if at least one family is viable.
+
+    IPv4 and IPv6 are routed independently — even if your v4 path is
+    behind symmetric NAT, your v6 path may be NAT-free.  The two
+    verdicts together describe the network honestly."""
+    servers = args.stun_servers or DEFAULT_STUN_SERVERS
+
+    family = (args.family or "auto").lower()
+    families = []
+    if family in ("auto", "4", "ipv4", "v4"):
+        families.append(socket.AF_INET)
+    if family in ("auto", "6", "ipv6", "v6"):
+        families.append(socket.AF_INET6)
+    if not families:
+        sys.stderr.write(f"Unrecognised --family value: {args.family!r}\n")
+        sys.exit(2)
+
+    # Pick three distinct ephemeral source ports up front — these are
+    # reused across families.  Ports are family-agnostic; the same port
+    # number is fine on both stacks.
+    src_ports = []
+    for _ in range(3):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 0))
+        src_ports.append(s.getsockname()[1])
+        s.close()
+        time.sleep(0.05)
+
+    print(f"STUN servers:  {', '.join(servers)}")
+    print()
+
+    viable = []
+    for fam in families:
+        v = _print_family_verdict(fam, servers, src_ports)
+        viable.append(v)
+
+    any_viable = any(v is True for v in viable)
+    sys.exit(0 if any_viable else 1)
 
 
 def main():
@@ -4033,8 +4150,13 @@ def main():
                     help=f"with --enroll-token: token validity window "
                          f"(default {int(TOKEN_DEFAULT_EXPIRY)}s, range 60..604800)")
     ap.add_argument("--check-nat", action="store_true",
-                    help="probe STUN servers and classify this network's NAT; "
-                         "exit 0 if wgrtc is viable, non-zero otherwise")
+                    help="probe STUN servers and classify this network's NAT "
+                         "for each address family available; exit 0 if at "
+                         "least one family is viable")
+    ap.add_argument("--family", choices=("auto", "4", "6"), default="auto",
+                    help="with --check-nat: restrict probing to a single "
+                         "address family (default: auto = both v4 and v6 "
+                         "where available)")
     ap.add_argument("--stun-servers", metavar="HOST:PORT", nargs="+",
                     default=None,
                     help="with --check-nat: STUN servers to probe "

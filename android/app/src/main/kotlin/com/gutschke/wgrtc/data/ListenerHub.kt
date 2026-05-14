@@ -246,7 +246,7 @@ class ListenerHub internal constructor(
         scope.launch {
             try {
                 val r = classifyNat(DEFAULT_STUN_SERVERS,
-                    StunClient(timeoutMs = 2000))
+                    client = StunClient(timeoutMs = 2000))
                 Log.i(TAG,
                     "host-mode NAT classification for ${tunnel.id}: " +
                     "type=${r.natType} ip=${r.externalIp}; ${r.note}")

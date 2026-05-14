@@ -46,6 +46,7 @@ import com.gutschke.wgrtc.data.SettingsStore
 import com.gutschke.wgrtc.data.WormholeDefaults
 import com.gutschke.wgrtc.data.decideEgress
 import com.gutschke.wgrtc.data.EgressDecision
+import com.gutschke.wgrtc.signalling.IpFamily
 import com.gutschke.wgrtc.signalling.NatClassification
 import com.gutschke.wgrtc.signalling.NatType
 import com.gutschke.wgrtc.signalling.classifyNat
@@ -320,17 +321,19 @@ private fun NotificationSection(settings: SettingsStore) {
 @Composable
 private fun NetworkCheckSection() {
     var inFlight by remember { mutableStateOf(false) }
-    var result by remember { mutableStateOf<NatClassification?>(null) }
+    var v4 by remember { mutableStateOf<NatClassification?>(null) }
+    var v6 by remember { mutableStateOf<NatClassification?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     Text("Network check", style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(4.dp))
     Text(
-        "Probe your current network's NAT so you know whether wgrtc " +
-            "will work here before you set anything up.  Sends a handful " +
-            "of small UDP packets to public STUN servers; takes a few " +
-            "seconds.  No data leaves the device.",
+        "Probe your current network's NAT independently for IPv4 and " +
+            "IPv6 — they're often routed differently and IPv6 frequently " +
+            "has no NAT at all.  Sends a handful of small UDP packets to " +
+            "public STUN servers; takes a few seconds.  No data leaves " +
+            "the device.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -339,14 +342,20 @@ private fun NetworkCheckSection() {
         enabled = !inFlight,
         onClick = {
             inFlight = true
-            result = null
+            v4 = null
+            v6 = null
             error = null
             scope.launch {
                 try {
-                    val r = withContext(Dispatchers.IO) {
-                        classifyNat(NETWORK_CHECK_STUN_SERVERS)
+                    val (rv4, rv6) = withContext(Dispatchers.IO) {
+                        val a = classifyNat(NETWORK_CHECK_STUN_SERVERS,
+                            family = IpFamily.V4)
+                        val b = classifyNat(NETWORK_CHECK_STUN_SERVERS,
+                            family = IpFamily.V6)
+                        a to b
                     }
-                    result = r
+                    v4 = rv4
+                    v6 = rv6
                 } catch (t: Throwable) {
                     error = "Network check failed: ${t.message}"
                 } finally {
@@ -357,10 +366,19 @@ private fun NetworkCheckSection() {
         modifier = Modifier.fillMaxWidth(),
     ) { Text(if (inFlight) "Checking…" else "Run NAT test") }
 
-    val current = result
-    if (current != null) {
+    val rv4 = v4
+    val rv6 = v6
+    if (rv4 != null || rv6 != null) {
         Spacer(Modifier.height(12.dp))
-        NetworkCheckVerdict(current)
+        if (rv4 != null) {
+            NetworkCheckVerdict(rv4)
+        }
+        if (rv4 != null && rv6 != null) {
+            Spacer(Modifier.height(12.dp))
+        }
+        if (rv6 != null) {
+            NetworkCheckVerdict(rv6)
+        }
     }
     val currentError = error
     if (currentError != null) {
@@ -375,33 +393,44 @@ private fun NetworkCheckSection() {
 
 @Composable
 private fun NetworkCheckVerdict(r: NatClassification) {
+    val familyLabel = if (r.family == IpFamily.V4) "IPv4" else "IPv6"
     val headline: String
     val detail: String
     val viable: Boolean
-    when (r.natType) {
-        NatType.CONE_PRESERVING -> {
-            headline = "Port-preserving cone NAT (or no NAT)"
-            detail = "wgrtc's hole-punch should work as designed."
+    val noRoute = r.natType == NatType.UNKNOWN && r.localIp == null
+    when {
+        noRoute -> {
+            headline = "$familyLabel: no route on this device"
+            detail = "Skipping STUN probe — this device has no " +
+                "$familyLabel connectivity right now."
+            viable = false
+        }
+        r.natType == NatType.CONE_PRESERVING -> {
+            headline = "$familyLabel: port-preserving" +
+                (if (r.family == IpFamily.V6) " (no NAT typical)"
+                 else " cone NAT (or none)")
+            detail = "wgrtc's hole-punch should work as designed " +
+                "over $familyLabel."
             viable = true
         }
-        NatType.CONE_REMAPPED -> {
-            headline = "Cone NAT, not port-preserving"
+        r.natType == NatType.CONE_REMAPPED -> {
+            headline = "$familyLabel: cone NAT, not port-preserving"
             detail = "The router rewrites your source port.  wgrtc will " +
                 "publish the wrong port; enable UPnP / NAT-PMP / PCP on " +
                 "the router, or use a static port forward."
             viable = false
         }
-        NatType.SYMMETRIC -> {
-            headline = "Symmetric NAT"
+        r.natType == NatType.SYMMETRIC -> {
+            headline = "$familyLabel: symmetric NAT"
             detail = "The router picks a different external port for " +
-                "every destination.  Direct hole-punching is " +
-                "infeasible on this network — wgrtc would need a relay " +
-                "(which this project doesn't ship).  Mobile data or a " +
-                "different Wi-Fi network usually works."
+                "every destination.  Direct hole-punching is infeasible " +
+                "on $familyLabel here — wgrtc would need a relay (which " +
+                "this project doesn't ship).  Mobile data or a different " +
+                "Wi-Fi network usually works."
             viable = false
         }
-        NatType.UNKNOWN -> {
-            headline = "Couldn't classify"
+        else -> {
+            headline = "$familyLabel: couldn't classify"
             detail = if (r.note.isNotBlank()) r.note
                      else "No STUN responses.  Check outbound UDP is " +
                           "allowed, then retry."
@@ -416,11 +445,19 @@ private fun NetworkCheckVerdict(r: NatClassification) {
     )
     Spacer(Modifier.height(4.dp))
     Text(detail, style = MaterialTheme.typography.bodyMedium)
+    val localIp = r.localIp
     val externalIp = r.externalIp
-    if (externalIp != null) {
+    if (localIp != null) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "External IP seen: $externalIp",
+            "Local $familyLabel: $localIp",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    if (externalIp != null) {
+        Text(
+            "External $familyLabel: $externalIp",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

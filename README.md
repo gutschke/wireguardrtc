@@ -342,13 +342,18 @@ behind symmetric NATs you'll need a relay solution outside this
 project's scope.
 
 **Check your network before you set anything up.**  Both surfaces
-expose a no-installation NAT probe:
+expose a no-installation NAT probe that runs **IPv4 and IPv6
+independently** — they're often routed differently, and IPv6
+frequently has no NAT at all even when your IPv4 path is behind
+CGNAT:
 
-- Linux daemon: `wireguardrtc --check-nat` prints the verdict and
-  exits.  No root needed; sends a handful of small UDP packets to
-  three public STUN servers.
+- Linux daemon: `wireguardrtc --check-nat` prints a verdict for each
+  available family and exits.  No root needed; sends a handful of
+  small UDP packets to three public STUN servers.  Restrict with
+  `--family 4` or `--family 6` if you want a single family.
 - Android app: Settings → *Network check* → *Run NAT test*.  Same
-  three-server probe, same verdict.
+  three-server probe per family; shows local address, external
+  address, and verdict side-by-side.
 
 ---
 

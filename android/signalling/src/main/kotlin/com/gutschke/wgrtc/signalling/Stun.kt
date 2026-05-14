@@ -2,6 +2,8 @@ package com.gutschke.wgrtc.signalling
 
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
@@ -44,6 +46,15 @@ private const val XOR_MAPPED_ADDRESS: Short = 0x0020
 /** Result of a single STUN probe — how this peer was seen externally. */
 data class StunMapping(val externalIp: String, val externalPort: Int)
 
+/**
+ * Which address family to probe.  IPv4 and IPv6 are routed
+ * independently — even on dual-stack hosts you may have NAT-free v6
+ * and CGNAT v4 (or vice versa).  Callers that want a complete picture
+ * of the network should classify both families and present them
+ * side-by-side rather than collapsing into a single verdict.
+ */
+enum class IpFamily { V4, V6 }
+
 /** Coarse NAT classification used to gate inbound-reachability claims. */
 enum class NatType {
     /** STUN external port equals the source port we used.
@@ -68,6 +79,14 @@ enum class NatType {
 data class NatClassification(
     val natType: NatType,
     val externalIp: String?,
+    /** The local address the kernel picked for outbound traffic in
+     * the family that was probed, when known.  Useful for the user to
+     * understand which interface is in play (e.g. WiFi vs cellular,
+     * SLAAC GUA vs ULA, CGNAT 100.64/10 vs RFC1918). */
+    val localIp: String?,
+    /** Address family this classification applies to.  Two passes
+     * (v4 + v6) on dual-stack networks may yield different verdicts. */
+    val family: IpFamily,
     /** All distinct (externalIp, externalPort) we observed; useful for
      * diagnostics when multiple STUN servers disagree. */
     val observations: List<StunMapping>,
@@ -217,17 +236,33 @@ class StunClient(
      * Send a single BINDING REQUEST to [server] (host:port string)
      * and parse the response. Returns null on timeout, network
      * error, or malformed response. Does not throw.
+     *
+     * If [family] is non-null, the server name is resolved to that
+     * family explicitly and the local socket is bound to that family's
+     * wildcard address. Returns null if no address of the requested
+     * family exists for the server.
      */
-    fun probe(server: String, sourcePort: Int = 0): StunMapping? {
+    fun probe(
+        server: String,
+        sourcePort: Int = 0,
+        family: IpFamily? = null,
+    ): StunMapping? {
         val (host, port) = parseHostPort(server) ?: return null
-        val sock = try { DatagramSocket(sourcePort) } catch (_: Exception) { return null }
+        val dst = try { resolveForFamily(host, port, family) } catch (_: Exception) { null }
+            ?: return null
+        val bindAddr: InetAddress? = when (family) {
+            IpFamily.V4 -> InetAddress.getByName("0.0.0.0")
+            IpFamily.V6 -> InetAddress.getByName("::")
+            null -> null
+        }
+        val sock = try {
+            if (bindAddr != null) DatagramSocket(InetSocketAddress(bindAddr, sourcePort))
+            else DatagramSocket(sourcePort)
+        } catch (_: Exception) { return null }
         try {
             sock.soTimeout = timeoutMs.toInt()
             val txid = randomTxid(rng)
             val req = buildStunBindingRequest(txid)
-            val dst = try {
-                InetSocketAddress(InetAddress.getByName(host), port)
-            } catch (_: Exception) { return null }
             sock.send(DatagramPacket(req, req.size, dst))
 
             val deadline = System.currentTimeMillis() + timeoutMs
@@ -249,6 +284,24 @@ class StunClient(
         }
     }
 
+    private fun resolveForFamily(
+        host: String,
+        port: Int,
+        family: IpFamily?,
+    ): InetSocketAddress? {
+        if (family == null) {
+            return InetSocketAddress(InetAddress.getByName(host), port)
+        }
+        val all = InetAddress.getAllByName(host)
+        val pick = all.firstOrNull {
+            when (family) {
+                IpFamily.V4 -> it is Inet4Address
+                IpFamily.V6 -> it is Inet6Address
+            }
+        } ?: return null
+        return InetSocketAddress(pick, port)
+    }
+
     private fun parseHostPort(s: String): Pair<String, Int>? {
         val i = s.lastIndexOf(':')
         if (i <= 0) return null
@@ -259,27 +312,76 @@ class StunClient(
     }
 }
 
+/**
+ * Ask the kernel which local address it would use for outbound traffic
+ * in the given family.  Returns the local IP as a string, or null if
+ * the family has no route (no v4 stack, no v6 stack, or no default
+ * route).  Connecting a UDP socket performs the route lookup without
+ * actually sending anything on the wire.
+ */
+fun discoverLocalAddress(family: IpFamily): String? {
+    val (wildcard, sample) = when (family) {
+        IpFamily.V4 -> "0.0.0.0" to "8.8.8.8"
+        IpFamily.V6 -> "::" to "2001:4860:4860::8888"
+    }
+    return try {
+        DatagramSocket(InetSocketAddress(InetAddress.getByName(wildcard), 0)).use { s ->
+            s.connect(InetAddress.getByName(sample), 80)
+            val local = s.localAddress
+            // After connect on a wildcard-bound UDP socket the kernel
+            // picks a concrete source.  But if no v6 default route
+            // exists, connect() may still succeed and localAddress
+            // returns the unspecified address — treat that as no
+            // route rather than reporting "::".
+            val text = local?.hostAddress?.substringBefore('%')
+            if (text == null) return@use null
+            if (text == "0.0.0.0" || text == "::") return@use null
+            text
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
 // ─── Classification ──────────────────────────────────────────────────────
 
 /**
- * Probe each STUN server, observe the mappings, and classify.
+ * Probe each STUN server in the given address family, observe the
+ * mappings, and classify.
  *
  * - All servers see the same external (ip, port) → CONE_PRESERVING
- * if external port equals the local source port we used, else
- * CONE_REMAPPED.
- * - Servers see different external ports for the same source → SYMMETRIC.
+ *   if external port equals the local source port we used, else
+ *   CONE_REMAPPED.
+ * - Servers see different external ports for the same source →
+ *   SYMMETRIC.
  * - No server responded → UNKNOWN.
  *
- * Reuses one source port across all probes to keep the comparison
- * apples-to-apples (matches test 01's behavior).
+ * Reuses one source port across all probes within the family to keep
+ * the comparison apples-to-apples (matches the daemon's
+ * tests/01_stun_nat.py behaviour).
+ *
+ * v4 and v6 are routed independently — callers that want a complete
+ * picture of the network should call this twice with different
+ * families and present both verdicts.  IPv6 frequently has no NAT at
+ * all even when IPv4 is behind CGNAT, so collapsing into one verdict
+ * hides useful information.
  */
 fun classifyNat(
     servers: List<String>,
+    family: IpFamily = IpFamily.V4,
     client: StunClient = StunClient(),
 ): NatClassification {
+    val localIp = discoverLocalAddress(family)
     if (servers.isEmpty()) {
         return NatClassification(
-            NatType.UNKNOWN, null, emptyList(), "no servers supplied")
+            NatType.UNKNOWN, null, localIp, family, emptyList(),
+            "no servers supplied")
+    }
+    if (localIp == null) {
+        val familyName = if (family == IpFamily.V4) "IPv4" else "IPv6"
+        return NatClassification(
+            NatType.UNKNOWN, null, null, family, emptyList(),
+            "no $familyName route on this device")
     }
 
     // Pick a single source port up front so every probe goes from the
@@ -292,19 +394,19 @@ fun classifyNat(
         }
     } catch (_: Exception) {
         return NatClassification(
-            NatType.UNKNOWN, null, emptyList(),
+            NatType.UNKNOWN, null, localIp, family, emptyList(),
             "could not allocate a source port")
     }
 
     val obs = mutableListOf<StunMapping>()
     for (srv in servers) {
-        val m = client.probe(srv, sourcePort = sourcePort)
+        val m = client.probe(srv, sourcePort = sourcePort, family = family)
         if (m != null) obs += m
     }
 
     if (obs.isEmpty()) {
         return NatClassification(
-            NatType.UNKNOWN, null, emptyList(),
+            NatType.UNKNOWN, null, localIp, family, emptyList(),
             "no STUN responses received")
     }
 
@@ -316,13 +418,13 @@ fun classifyNat(
 
     return when {
         ports.size > 1 -> NatClassification(
-            NatType.SYMMETRIC, externalIp, obs,
+            NatType.SYMMETRIC, externalIp, localIp, family, obs,
             "external port differs per server${ipNote} — symmetric NAT")
         ports.first() == sourcePort -> NatClassification(
-            NatType.CONE_PRESERVING, externalIp, obs,
+            NatType.CONE_PRESERVING, externalIp, localIp, family, obs,
             "external port == source port${ipNote} — port-preserving cone NAT (or none)")
         else -> NatClassification(
-            NatType.CONE_REMAPPED, externalIp, obs,
+            NatType.CONE_REMAPPED, externalIp, localIp, family, obs,
             "external port consistent but != source${ipNote} — cone but not preserving")
     }
 }

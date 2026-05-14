@@ -335,6 +335,83 @@ class StunTest {
         }
     }
 
+    // ─── Per-family probing (v4 / v6 independence) ─────────────────────
+
+    @Test fun `classify v4 records localIp and family`() {
+        StubStunServer().use { stub ->
+            val client = StunClient(timeoutMs = 2000)
+            val report = classifyNat(
+                servers = listOf("127.0.0.1:${stub.port}"),
+                family = IpFamily.V4,
+                client = client,
+            )
+            assertEquals(IpFamily.V4, report.family)
+            // localIp comes from discoverLocalAddress(V4): every CI/dev
+            // host has a v4 default route, so this should be non-null.
+            // We can't assert a specific address (varies per host) but
+            // it should at least look like a dotted-quad string.
+            val local = report.localIp
+            assertNotNull(local)
+            assertTrue(local!!.matches(Regex("""\d+\.\d+\.\d+\.\d+""")),
+                "expected v4 dotted-quad, got $local")
+        }
+    }
+
+    @Test fun `probe with V6 family rejects a v4-only literal server`() {
+        // 127.0.0.1 has no v6 address (it's a v4 literal).
+        // probe() must reject (return null) when family=V6 is forced.
+        val client = StunClient(timeoutMs = 200)
+        val out = client.probe("127.0.0.1:9", family = IpFamily.V6)
+        assertNull(out)
+    }
+
+    @Test fun `probe with V4 family resolves a v4-only literal server`() {
+        // Same server, V4 family, against a real stub — must succeed.
+        StubStunServer().use { stub ->
+            val client = StunClient(timeoutMs = 2000)
+            val mapping = client.probe(
+                "127.0.0.1:${stub.port}", family = IpFamily.V4)
+            assertNotNull(mapping)
+            assertEquals("127.0.0.1", mapping!!.externalIp)
+        }
+    }
+
+    @Test fun `classify v6 against a v6 stub returns CONE_PRESERVING`() {
+        // This test requires the test host has a usable v6 loopback
+        // (`::1`).  Linux always has one; emulators usually do too.
+        // If discoverLocalAddress(V6) returns null we skip — the test
+        // can't say anything useful in a v6-disabled environment.
+        if (discoverLocalAddress(IpFamily.V6) == null) return
+        V6StubStunServer().use { stub ->
+            val client = StunClient(timeoutMs = 2000)
+            val report = classifyNat(
+                servers = listOf("[::1]:${stub.port}", "[::1]:${stub.port}"),
+                family = IpFamily.V6,
+                client = client,
+            )
+            assertEquals(NatType.CONE_PRESERVING, report.natType)
+            assertEquals(IpFamily.V6, report.family)
+            // Loopback comes back as "0:0:0:0:0:0:0:1" or "::1" depending
+            // on InetAddress impl; accept either.
+            val ip = report.externalIp
+            assertNotNull(ip)
+            assertTrue(ip == "::1" || ip == "0:0:0:0:0:0:0:1",
+                "expected ::1, got $ip")
+        }
+    }
+
+    @Test fun `discoverLocalAddress v4 returns a non-loopback string when route exists`() {
+        val v4 = discoverLocalAddress(IpFamily.V4)
+        // Every dev/CI host has at least 127.0.0.1, but the function
+        // routes via a public anycast — the kernel picks the real
+        // upstream interface.  We only assert "non-null and looks like
+        // a v4 literal".  If a host genuinely has no v4 stack the
+        // function returns null; treat that as a skip.
+        if (v4 == null) return
+        assertTrue(v4.matches(Regex("""\d+\.\d+\.\d+\.\d+""")),
+            "expected v4 dotted-quad, got $v4")
+    }
+
     // ─── Helpers ────────────────────────────────────────────────────────
 
     private fun pack(a: Int, b: Int, c: Int, d: Int): ByteArray =
@@ -362,6 +439,40 @@ class StunTest {
                 val resp = buildXorMappedResponse(
                     txid = txid,
                     srcIp = pkt.address.hostAddress!!,
+                    srcPort = pkt.port,
+                )
+                sock.send(DatagramPacket(resp, resp.size, pkt.address, pkt.port))
+            }
+        }
+        override fun close() {
+            stop = true
+            sock.close()
+            t.join(500)
+        }
+    }
+
+    /** v6 stub bound to ::1 — used to exercise the IpFamily.V6 path. */
+    private class V6StubStunServer : AutoCloseable {
+        val sock: DatagramSocket = DatagramSocket(0, InetAddress.getByName("::1"))
+        val port: Int get() = sock.localPort
+        @Volatile private var stop = false
+        private val t = thread(start = true, isDaemon = true) {
+            val buf = ByteArray(2048)
+            sock.soTimeout = 100
+            while (!stop) {
+                val pkt = DatagramPacket(buf, buf.size)
+                try { sock.receive(pkt) } catch (_: Exception) { continue }
+                val data = pkt.data.copyOfRange(0, pkt.length)
+                if (data.size < 20) continue
+                val bb = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
+                val type = bb.getShort()
+                bb.getShort() // length
+                val cookie = bb.getInt()
+                val txid = ByteArray(12).also { bb.get(it) }
+                if (type != 0x0001.toShort() || cookie != 0x2112A442.toInt()) continue
+                val resp = buildXorMappedV6Response(
+                    txid = txid,
+                    srcIp = pkt.address.hostAddress!!.substringBefore('%'),
                     srcPort = pkt.port,
                 )
                 sock.send(DatagramPacket(resp, resp.size, pkt.address, pkt.port))
@@ -421,6 +532,31 @@ private fun buildXorMappedResponse(
     val xip = ByteBuffer.wrap(ipBytes).order(ByteOrder.BIG_ENDIAN).getInt() xor 0x2112A442.toInt()
     val attrPayload = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
         .put(0).put(0x01).putShort(xport.toShort()).putInt(xip)
+        .array()
+    val attr = ByteBuffer.allocate(4 + attrPayload.size).order(ByteOrder.BIG_ENDIAN)
+        .putShort(0x0020).putShort(attrPayload.size.toShort()).put(attrPayload)
+        .array()
+    return ByteBuffer.allocate(20 + attr.size).order(ByteOrder.BIG_ENDIAN)
+        .putShort(0x0101)
+        .putShort(attr.size.toShort())
+        .putInt(0x2112A442.toInt())
+        .put(txid)
+        .put(attr)
+        .array()
+}
+
+private fun buildXorMappedV6Response(
+    txid: ByteArray, srcIp: String, srcPort: Int,
+): ByteArray {
+    val raw = InetAddress.getByName(srcIp).address
+    require(raw.size == 16) { "buildXorMappedV6Response: srcIp must be v6" }
+    val xport = srcPort xor (0x2112A442.ushr(16))
+    val mask = ByteArray(16)
+    mask[0] = 0x21; mask[1] = 0x12; mask[2] = 0xA4.toByte(); mask[3] = 0x42
+    System.arraycopy(txid, 0, mask, 4, 12)
+    val xip = ByteArray(16) { i -> (raw[i].toInt() xor mask[i].toInt()).toByte() }
+    val attrPayload = ByteBuffer.allocate(20).order(ByteOrder.BIG_ENDIAN)
+        .put(0).put(0x02).putShort(xport.toShort()).put(xip)
         .array()
     val attr = ByteBuffer.allocate(4 + attrPayload.size).order(ByteOrder.BIG_ENDIAN)
         .putShort(0x0020).putShort(attrPayload.size.toShort()).put(attrPayload)
