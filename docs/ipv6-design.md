@@ -296,6 +296,29 @@ Files: `android/signalling/src/main/kotlin/.../CandidatePicker.kt` (helper + cla
 
 **Not yet addressed:** the listener-driven roam path uses `EndpointUpdate` (which has no `kind` field) for per-message candidate dispatch.  Adding family-preference there is a follow-up — the roam mechanism re-races candidates and will land on whatever works, so the bias is less urgent.  Worth a tracked task once V6.A2/A3 are done.
 
-### V6.A2 — (next)
+### V6.A2 — 2026-05-13
 
-Android joiner VpnService route table: when `AllowedIPs` contains `::/0`, ensure `VpnService.Builder.addRoute(IPv6.ANY, 0)` is called.  Without it, v6 traffic destined for the tunnel falls off the route table and goes via the underlying network (or fails entirely).
+Android joiner VpnService route table: when `AllowedIPs` contains `::/0`, ensure `VpnService.Builder.addRoute("::", 0)` is called.  Without it, v6 traffic destined for the tunnel falls off the route table and goes via the underlying network (or fails entirely).
+
+**Status: already correct in production code — V6.A2 is a regression-pin pass.**
+
+Investigation:
+
+- `JoinerVpnConfig.parse(wgQuickText)` (`android/app/src/main/kotlin/com/gutschke/wgrtc/data/JoinerVpnConfig.kt`) walks each `[Peer] AllowedIPs = …` line, splits on commas, and feeds each entry to `parseCidr`.  `parseCidr` checks for `'/'` first; for a slash-present entry it preserves the prefix verbatim.  For bare entries it inspects the address for `':'` (`isV6 = s.contains(':')`) and defaults to `/128` for v6, `/32` for v4.  Both branches honour both families, so `AllowedIPs = 0.0.0.0/0, ::/0` becomes `[Cidr("0.0.0.0", 0), Cidr("::", 0)]` and `AllowedIPs = fd00::1` becomes `[Cidr("fd00::1", 128)]`.
+- `JoinerVpnService.start(config, …)` (`android/app/src/main/kotlin/com/gutschke/wgrtc/service/JoinerVpnService.kt:85`) iterates `for (r in config.routes) builder.addRoute(r.address, r.prefixLen)` once.  The single loop is family-agnostic — `VpnService.Builder.addRoute(String, Int)` calls `InetAddress.parseNumericAddress` internally, which accepts both dotted-quad v4 and colon-hex v6.  The same call site at `:184` handles the test-only `establishTunForTest` path identically.
+- `[Interface] Address = fd00::2/128` already round-trips through `parse` (the `bare IP without prefix defaults to 32 (v4) or 128 (v6)` test pinned the bare-address branch; V6.A2 adds an explicit-prefix v6 case).
+
+What V6.A2 adds: six new tests in `JoinerVpnConfigTest.kt` documenting the v6-route contract so a future refactor of `parseCidr` (e.g. splitting on `':'` to extract the port, or collapsing the two families into one branch) can't silently regress the dual-stack default:
+
+1. `V6_A2 dual-stack full tunnel produces both v4 and v6 default routes` — the canonical `0.0.0.0/0, ::/0` case, asserts exact `[Cidr("0.0.0.0", 0), Cidr("::", 0)]` and preserved order.
+2. `V6_A2 v6-only catchall produces single colon-colon route` — `::/0` alone yields exactly one route, no synthetic v4 entry.
+3. `V6_A2 bare v6 host address defaults to slash-128` — `AllowedIPs = fd00::1` (no prefix) → `/128` host-route.
+4. `V6_A2 mixed v4 v6 sub-CIDR list preserves order and family` — real-world phone-host mix of `10.99.0.0/24, fd00:dead:beef::/48, 192.168.42.0/24, 2001:db8::/32`; order matters because `Builder.addRoute` honours insertion order.
+5. `V6_A2 v6 with zero prefix is preserved verbatim` — defensive: an explicit `/0` doesn't get promoted to `/128` (the bare-address branch must not run when the slash is present).
+6. `V6_A2 v6 Address line on Interface section survives parse` — companion to AllowedIPs; pins that `[Interface] Address = fd00::2/128` round-trips, so a joiner can bring up a TUN with a v6 local address.
+
+11/11 JoinerVpnConfigTest cases pass (5 pre-existing + 6 V6.A2).  No instrumented test added — the `Builder.addRoute` String/Int overload is a stable Android API contract documented at https://developer.android.com/reference/android/net/VpnService.Builder#addRoute(java.lang.String,%20int), and exercising it would require an emulator round-trip per family per Android version.  If a future Android version were to regress, the joiner would fail at `Builder.establish()` time and the user would see a connect-failed banner — non-silent.
+
+Files: `android/app/src/test/kotlin/com/gutschke/wgrtc/data/JoinerVpnConfigTest.kt` (regression pins).  Production code untouched.
+
+**Followup if instrumented coverage becomes warranted:** add `V6JoinerVpnRoutingTest.kt` under `androidTest/` that calls `JoinerVpnService.establishTunForTest` with a synthetic v6 config and asserts the returned PFD points at a tun whose `ip -6 route` includes `::/0` — but that needs the seccomp `ip(8)` workaround (the SIGSYS-killed-iproute2 memory entry) and a dedicated emulator harness, which isn't paying its way until we hit a real v6-route bug.

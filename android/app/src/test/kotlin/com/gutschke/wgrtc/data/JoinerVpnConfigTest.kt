@@ -235,4 +235,137 @@ class JoinerVpnConfigTest {
         val parsed = JoinerVpnConfig.parse(cfg)
         assertEquals(listOf("8.8.8.8"), parsed.dnsServers)
     }
+
+    // V6.A2 — joiner VpnService route table for IPv6.
+    //
+    // When the host advertises `AllowedIPs = 0.0.0.0/0, ::/0` (the
+    // dual-stack full-tunnel default), the parser MUST emit a Cidr
+    // entry per family. JoinerVpnService loops over `config.routes`
+    // and calls `Builder.addRoute(addr, prefixLen)` — the String/Int
+    // overload accepts both v4 dotted-quads and v6 colon-hex, so the
+    // joiner's TUN gets a v6 default route automatically.
+    //
+    // Without these tests, a future refactor of `parseCidr` could
+    // accidentally drop v6 entries (split on ":" instead of "/",
+    // assume bare addresses are always v4, etc.) and the regression
+    // would only surface on a dual-stack handshake. The parser is
+    // the single source of truth for joiner route tables.
+
+    @Test fun `V6_A2 dual-stack full tunnel produces both v4 and v6 default routes`() {
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.2/32
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 0.0.0.0/0, ::/0
+            Endpoint = 192.0.2.1:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(
+            listOf(Cidr("0.0.0.0", 0), Cidr("::", 0)),
+            parsed.routes,
+            "AllowedIPs dual-stack must expand to two routes (preserved order)",
+        )
+    }
+
+    @Test fun `V6_A2 v6-only catchall produces single colon-colon route`() {
+        // v6-only joiner network: host advertises only ::/0 in
+        // AllowedIPs.  Parser must produce exactly one Cidr("::", 0)
+        // — no synthetic v4 entry, no dropped entry.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = ::/0
+            Endpoint = [2001:db8::1]:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(listOf(Cidr("::", 0)), parsed.routes)
+    }
+
+    @Test fun `V6_A2 bare v6 host address defaults to slash-128`() {
+        // The existing v4 test (`bare IP without prefix defaults to
+        // 32 (v4) or 128 (v6)`) covers /128 for [Interface] Address;
+        // this test pins the same behaviour for [Peer] AllowedIPs so
+        // a refactor that touches one branch can't desync the other.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = fd00::1
+            Endpoint = [2001:db8::1]:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(listOf(Cidr("fd00::1", 128)), parsed.routes)
+    }
+
+    @Test fun `V6_A2 mixed v4 v6 sub-CIDR list preserves order and family`() {
+        // Real-world phone-host advertising one tunnel-local subnet
+        // per family plus a v6 ULA range.  Order must be preserved
+        // — Builder.addRoute is order-sensitive (later wider routes
+        // override earlier narrower ones in some pathological cases,
+        // and we want to honor the host's intent verbatim).
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.2/32
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 10.99.0.0/24, fd00:dead:beef::/48, 192.168.42.0/24, 2001:db8::/32
+            Endpoint = 192.0.2.1:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(4, parsed.routes.size)
+        assertEquals(Cidr("10.99.0.0", 24), parsed.routes[0])
+        assertEquals(Cidr("fd00:dead:beef::", 48), parsed.routes[1])
+        assertEquals(Cidr("192.168.42.0", 24), parsed.routes[2])
+        assertEquals(Cidr("2001:db8::", 32), parsed.routes[3])
+    }
+
+    @Test fun `V6_A2 v6 with zero prefix is preserved verbatim (not promoted to slash-128)`() {
+        // Defensive: an explicit `/0` must stay `/0`. The parseCidr
+        // branch that defaults bare addresses to /128 must not run
+        // when the slash is present.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = ::/0
+            Endpoint = [2001:db8::1]:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(0, parsed.routes.single().prefixLen)
+        assertEquals("::", parsed.routes.single().address)
+    }
+
+    @Test fun `V6_A2 v6 Address line on Interface section survives parse`() {
+        // Companion to the AllowedIPs tests: the joiner needs a v6
+        // local address on its TUN before any v6 route is useful.
+        // Pin that the [Interface] Address branch handles v6
+        // identically to v4.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = ::/0
+            Endpoint = [2001:db8::1]:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(listOf(Cidr("fd00::2", 128)), parsed.addresses)
+    }
 }
