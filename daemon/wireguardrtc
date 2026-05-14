@@ -112,6 +112,554 @@ DEFAULT_STUN_SERVERS = [
 ]
 
 
+# ─── Ristretto255 (RFC 9496) — pure-Python implementation ─────────────
+#
+# Why vendored: pynacl 1.5.0 exposes Ed25519 but not Ristretto255 (the
+# wrappers were never written) and pynacl's bundled libsodium has the
+# Ristretto symbols stripped from its cffi-visible surface.  Adding a
+# pypi package adds an unmaintained transitive dep; binding to system
+# libsodium via ctypes adds a Debian dep on a specific libsodium ABI.
+# ~250 LoC of well-specified curve math is auditable in one place
+# and tested against RFC 9496 Appendix A vectors plus the Android
+# side's M/N constants for protocol-level interop.
+#
+# The wormhole-code SPAKE2 + SAS path needs eight operations:
+#   r255_scalar_random()          random scalar mod L
+#   r255_scalar_reduce(64-byte)   reduce 64-byte LE → 32-byte scalar
+#   r255_scalarmult_base(scalar)  scalar * G
+#   r255_scalarmult(scalar, pt)   scalar * P
+#   r255_add(P, Q)                P + Q
+#   r255_sub(P, Q)                P - Q
+#   r255_is_valid_point(bytes)    canonical-encoding check
+#   r255_from_hash(64-byte)       uniform-random point from hash
+# plus encode/decode/identity used internally.
+#
+# Internal point representation: extended Edwards coordinates
+# (X, Y, Z, T) on edwards25519, as Python int tuples.  Encoding/
+# decoding follows RFC 9496 §4.3.  Not constant-time — Python's int
+# arithmetic isn't anyway, and the threat model for SPAKE2 here is
+# online attacks defended by rate-limit + manual SAS, not local
+# timing side-channels.
+
+_R255_P = (1 << 255) - 19
+_R255_L = (1 << 252) + 27742317777372353535851937790883648493
+_R255_D = (-121665 * pow(121666, -1, _R255_P)) % _R255_P
+# Constants from RFC 9496 §A — the spec pins these by value, not by
+# derivation, so we hard-code them to avoid a chicken-and-egg with
+# the test vectors.
+_R255_SQRT_M1 = 19681161376707505956807079304988542015446066515923890162744021073123829784752
+_R255_INVSQRT_A_MINUS_D = 54469307008909316920995813868745141605393597292927456921205312896311721017578
+_R255_SQRT_AD_MINUS_ONE = 25063068953384623474111414158702152701244531502492656460079210482610430750235
+_R255_ONE_MINUS_D_SQ = 1159843021668779879193775521855586647937357759715417654439879720876111806838
+_R255_D_MINUS_ONE_SQ = 40440834346308536858101042469323190826248399146238708352240133220865137265952
+
+
+def _r255_is_negative(x):
+    """LSB convention from RFC 9496: x is 'negative' if odd."""
+    return (x & 1) == 1
+
+
+def _r255_abs(x):
+    return (-x) % _R255_P if _r255_is_negative(x) else x % _R255_P
+
+
+def _r255_sqrt_ratio_m1(u, v):
+    """Compute (was_square, r) where r is sqrt(u/v) when (u/v) is a
+    square (was_square=True), else sqrt(SQRT_M1 * u/v) (was_square=False).
+    Output r is always non-negative (low bit zero).  Algorithm from
+    RFC 9496 §4.3.5.
+    """
+    p = _R255_P
+    v3 = pow(v, 3, p)
+    v7 = pow(v, 7, p)
+    # r = uv^3 * (uv^7)^((p-5)/8)
+    uv3 = (u * v3) % p
+    uv7 = (u * v7) % p
+    r = (uv3 * pow(uv7, (p - 5) // 8, p)) % p
+    check = (v * r * r) % p
+    correct_sign_sqrt = (check == u % p)
+    flipped_sign_sqrt = (check == (-u) % p)
+    flipped_sign_sqrt_i = (check == ((-u) * _R255_SQRT_M1) % p)
+    r_prime = (_R255_SQRT_M1 * r) % p
+    if flipped_sign_sqrt or flipped_sign_sqrt_i:
+        r = r_prime
+    if _r255_is_negative(r):
+        r = (-r) % p
+    return (correct_sign_sqrt or flipped_sign_sqrt, r)
+
+
+def _r255_decode_internal(s_bytes):
+    """RFC 9496 §4.3.1 — return extended Edwards (X, Y, Z, T) or None."""
+    if len(s_bytes) != 32:
+        return None
+    # s must be canonical: little-endian < p, and non-negative
+    # (high bit of last byte must be 0, then s must be even).
+    if s_bytes[31] & 0x80:
+        return None
+    s = int.from_bytes(s_bytes, 'little')
+    # Canonical: re-encoding s must yield same bytes — guaranteed by
+    # high-bit check + s < p check.
+    if s >= _R255_P:
+        return None
+    # Negative s rejected.
+    if _r255_is_negative(s):
+        return None
+    p = _R255_P
+    ss = (s * s) % p
+    u1 = (1 - ss) % p           # 1 - s^2
+    u2 = (1 + ss) % p           # 1 + s^2
+    u2_sqr = (u2 * u2) % p
+    # v = -d * u1^2 - u2^2
+    v = ((-_R255_D * u1 * u1) - u2_sqr) % p
+    was_square, I = _r255_sqrt_ratio_m1(1, (v * u2_sqr) % p)
+    Dx = (I * u2) % p
+    Dy = (I * Dx * v) % p
+    x = _r255_abs((2 * s * Dx) % p)
+    y = (u1 * Dy) % p
+    t = (x * y) % p
+    if (not was_square) or _r255_is_negative(t) or y == 0:
+        return None
+    return (x, y, 1, t)
+
+
+def _r255_encode_internal(P):
+    """RFC 9496 §4.3.2 — given (X, Y, Z, T) return 32 bytes."""
+    p = _R255_P
+    X, Y, Z, T = P
+    u1 = ((Z + Y) * (Z - Y)) % p
+    u2 = (X * Y) % p
+    _, invsqrt = _r255_sqrt_ratio_m1(1, (u1 * u2 * u2) % p)
+    D1 = (invsqrt * u1) % p
+    D2 = (invsqrt * u2) % p
+    Zinv = (D1 * D2 * T) % p
+    if _r255_is_negative((T * Zinv) % p):
+        # rotate
+        x_ = (Y * _R255_SQRT_M1) % p
+        y_ = (X * _R255_SQRT_M1) % p
+        D = (D1 * _R255_INVSQRT_A_MINUS_D) % p
+    else:
+        x_, y_, D = X, Y, D2
+    if _r255_is_negative((x_ * Zinv) % p):
+        y_ = (-y_) % p
+    s = _r255_abs(((Z - y_) * D) % p)
+    return s.to_bytes(32, 'little')
+
+
+def _r255_identity():
+    """The neutral element (X=0, Y=1, Z=1, T=0)."""
+    return (0, 1, 1, 0)
+
+
+def _r255_add_internal(P1, P2):
+    """edwards25519 extended-coords addition (RFC 8032 §5.1.4)."""
+    p = _R255_P
+    X1, Y1, Z1, T1 = P1
+    X2, Y2, Z2, T2 = P2
+    A = ((Y1 - X1) * (Y2 - X2)) % p
+    B = ((Y1 + X1) * (Y2 + X2)) % p
+    C = (T1 * 2 * _R255_D * T2) % p
+    D = (Z1 * 2 * Z2) % p
+    E = B - A
+    F = D - C
+    G = D + C
+    H = B + A
+    X3 = (E * F) % p
+    Y3 = (G * H) % p
+    T3 = (E * H) % p
+    Z3 = (F * G) % p
+    return (X3, Y3, Z3, T3)
+
+
+def _r255_neg(P):
+    p = _R255_P
+    X, Y, Z, T = P
+    return ((-X) % p, Y, Z, (-T) % p)
+
+
+def _r255_scalarmult_internal(scalar_bytes, P):
+    """Plain double-and-add — sufficient for one-shot SPAKE2 use."""
+    n = int.from_bytes(scalar_bytes, 'little')
+    Q = _r255_identity()
+    R = P
+    while n > 0:
+        if n & 1:
+            Q = _r255_add_internal(Q, R)
+        R = _r255_add_internal(R, R)
+        n >>= 1
+    return Q
+
+
+# Standard edwards25519 base point.  RFC 8032 §5.1: y = 4/5 mod p, x
+# the smaller of the two square roots that satisfy the curve eq.  We
+# pin from the well-known constants.
+_R255_BASE_Y = (4 * pow(5, -1, _R255_P)) % _R255_P
+
+
+def _r255_recover_x(y, sign):
+    """Recover x given y on edwards25519, with the requested low bit."""
+    p = _R255_P
+    yy = (y * y) % p
+    u = (yy - 1) % p
+    v = (_R255_D * yy + 1) % p
+    was_sq, x = _r255_sqrt_ratio_m1(u, v)
+    # was_sq must be True for a valid y-coord on the curve.
+    if not was_sq:
+        return None
+    if (x & 1) != sign:
+        x = (-x) % p
+    return x
+
+
+_R255_BASE_X = _r255_recover_x(_R255_BASE_Y, 0)
+_R255_BASE = (_R255_BASE_X, _R255_BASE_Y, 1,
+              (_R255_BASE_X * _R255_BASE_Y) % _R255_P)
+
+
+def _r255_map(t):
+    """Elligator2-like one-way map (RFC 9496 §4.3.4) — input is one
+    255-bit field element, output is a Ristretto255 point in extended
+    Edwards coords.  Used twice by `from_hash`."""
+    p = _R255_P
+    r = (_R255_SQRT_M1 * t * t) % p
+    u = ((r + 1) * _R255_ONE_MINUS_D_SQ) % p
+    v = ((-1 - r * _R255_D) * ((r + _R255_D) % p)) % p
+    was_square, s = _r255_sqrt_ratio_m1(u, v)
+    s_prime = (s * t) % p
+    if not _r255_is_negative(s_prime):
+        s_prime = (-s_prime) % p
+    if not was_square:
+        s = s_prime
+    # Per RFC 9496 §4.3.4: c = -1 if was_square else r.
+    c = (-1) % p if was_square else r
+    N = (c * (r - 1) * _R255_D_MINUS_ONE_SQ - v) % p
+    w0 = (2 * s * v) % p
+    w1 = (N * _R255_SQRT_AD_MINUS_ONE) % p
+    w2 = (1 - s * s) % p
+    w3 = (1 + s * s) % p
+    return ((w0 * w3) % p, (w2 * w1) % p, (w1 * w3) % p, (w0 * w2) % p)
+
+
+# ─── Ristretto255 public surface ────────────────────────────────────
+
+def r255_identity():
+    return _r255_identity()
+
+
+def r255_encode(P):
+    return _r255_encode_internal(P)
+
+
+def r255_decode(s_bytes):
+    return _r255_decode_internal(s_bytes)
+
+
+def r255_is_valid_point(s_bytes):
+    return _r255_decode_internal(s_bytes) is not None
+
+
+def r255_add(P, Q):
+    return _r255_add_internal(P, Q)
+
+
+def r255_sub(P, Q):
+    return _r255_add_internal(P, _r255_neg(Q))
+
+
+def r255_scalarmult_base(scalar_bytes):
+    return _r255_scalarmult_internal(scalar_bytes, _R255_BASE)
+
+
+def r255_scalarmult(scalar_bytes, point_bytes_or_internal):
+    if isinstance(point_bytes_or_internal, (bytes, bytearray)):
+        P = _r255_decode_internal(bytes(point_bytes_or_internal))
+        if P is None:
+            raise ValueError("r255_scalarmult: invalid point encoding")
+    else:
+        P = point_bytes_or_internal
+    return _r255_scalarmult_internal(scalar_bytes, P)
+
+
+def r255_scalar_random():
+    # 64 random bytes reduced mod L.  Same construction as libsodium's
+    # crypto_core_ristretto255_scalar_random.
+    return r255_scalar_reduce(secrets.token_bytes(64))
+
+
+def r255_scalar_reduce(buf64):
+    if len(buf64) != 64:
+        raise ValueError("r255_scalar_reduce: input must be 64 bytes")
+    n = int.from_bytes(buf64, 'little') % _R255_L
+    return n.to_bytes(32, 'little')
+
+
+def r255_from_hash(buf64):
+    if len(buf64) != 64:
+        raise ValueError("r255_from_hash: input must be 64 bytes")
+    p = _R255_P
+    # Two 32-byte halves, each parsed as a field element (mask off
+    # the high bit per RFC 9496 §4.3.4).
+    r0_bytes = bytearray(buf64[:32])
+    r1_bytes = bytearray(buf64[32:])
+    r0_bytes[31] &= 0x7F
+    r1_bytes[31] &= 0x7F
+    r0 = int.from_bytes(r0_bytes, 'little') % p
+    r1 = int.from_bytes(r1_bytes, 'little') % p
+    P0 = _r255_map(r0)
+    P1 = _r255_map(r1)
+    return _r255_add_internal(P0, P1)
+
+
+# ─── SPAKE2 (RFC 9382 over Ristretto255) — wormhole-code PAKE ─────────
+#
+# Mirrors signalling/Spake2.kt + Spake2Constants.kt on the Android side.
+# Both ends know a low-entropy wormhole code (6 letters, ~30 bits); the
+# protocol upgrades that into a 256-bit shared key without leaking the
+# code on the wire.  An attacker who relays one half but not the other
+# completes PAKE on each side with different shared keys, which the
+# user-confirmed SAS step catches.  Wire-format constants (labels, M/N)
+# are protocol commitments — bumping any of them is wire-incompatible
+# with peers built against the old values.
+
+SPAKE2_LABEL_PW = b"wgrtc/spake2/pw-2026"
+SPAKE2_LABEL_KEY = b"wgrtc/spake2/key-2026"
+SPAKE2_LABEL_SAS = b"wgrtc/spake2/sas-2026"
+
+_SPAKE2_M_LABEL = b"wgrtc/spake2/M-2026"
+_SPAKE2_N_LABEL = b"wgrtc/spake2/N-2026"
+
+
+def _derive_spake2_point(label):
+    """blake2b(label, 64 bytes, unkeyed) → ristretto from_hash → 32 bytes."""
+    h64 = hashlib.blake2b(label, digest_size=64).digest()
+    pt = r255_from_hash(h64)
+    enc = r255_encode(pt)
+    assert r255_is_valid_point(enc), \
+        f"derived SPAKE2 constant for {label!r} is not a valid point"
+    return enc
+
+
+SPAKE2_M = _derive_spake2_point(_SPAKE2_M_LABEL)
+SPAKE2_N = _derive_spake2_point(_SPAKE2_N_LABEL)
+
+
+class Spake2:
+    """Single-shot SPAKE2 session over Ristretto255.
+
+    Usage:
+        s = Spake2(role="alice", password=b"WORMHOLE")
+        my_msg = s.start()              # send to peer
+        key = s.finish(peer_msg)        # 32-byte shared secret
+
+    The roles are complementary: one side passes role="alice", the
+    other role="bob".  Both-alice or both-bob yields divergent keys
+    (the SAS step rejects this).  Optional id_a/id_b are mixed into
+    the transcript and must match on both sides; useful when binding
+    a session to specific identifiers (e.g. tunnel name, broker id).
+
+    [_test_priv_scalar] is a test seam that pins the ephemeral
+    private scalar.  Production code never sets it.
+    """
+
+    __slots__ = ("_role", "_id_a", "_id_b", "_priv_scalar", "_pw_scalar",
+                 "_sent_message", "_started")
+
+    def __init__(self, role, password, id_a=b"", id_b=b"",
+                 _test_priv_scalar=None):
+        role = role.lower()
+        if role not in ("alice", "bob"):
+            raise ValueError(f"role must be 'alice' or 'bob', got {role!r}")
+        self._role = role
+        self._id_a = id_a
+        self._id_b = id_b
+        # Ephemeral per-session scalar.  The test seam injects a
+        # deterministic value when set; otherwise draw from
+        # crypto_core_ristretto255_scalar_random equivalent.
+        if _test_priv_scalar is not None:
+            if len(_test_priv_scalar) != 32:
+                raise ValueError("test priv scalar must be 32 bytes")
+            self._priv_scalar = bytes(_test_priv_scalar)
+        else:
+            self._priv_scalar = r255_scalar_random()
+        # Map the password into the scalar field via 64-byte BLAKE2b
+        # keyed with our domain-separation label, then mod L.
+        h64 = hashlib.blake2b(password, digest_size=64,
+                              key=SPAKE2_LABEL_PW).digest()
+        self._pw_scalar = r255_scalar_reduce(h64)
+        self._sent_message = None
+        self._started = False
+
+    def start(self):
+        """Generate our outgoing 32-byte message.  Call once."""
+        if self._started:
+            raise RuntimeError("start() may only be called once")
+        self._started = True
+        # priv_part = priv_scalar * G
+        priv_part = r255_scalarmult_base(self._priv_scalar)
+        # pw_part = pw_scalar * blinding (M for alice, N for bob)
+        blinding = SPAKE2_M if self._role == "alice" else SPAKE2_N
+        pw_part = r255_scalarmult(self._pw_scalar, blinding)
+        msg_pt = r255_add(priv_part, pw_part)
+        msg = r255_encode(msg_pt)
+        self._sent_message = msg
+        return bytes(msg)
+
+    def finish(self, peer_message):
+        """Process the peer's message, return the 32-byte session key."""
+        if not self._started or self._sent_message is None:
+            raise RuntimeError("call start() before finish()")
+        if not isinstance(peer_message, (bytes, bytearray)) or \
+                len(peer_message) != 32:
+            raise ValueError(
+                f"peer message must be 32 bytes (got "
+                f"{len(peer_message) if hasattr(peer_message, '__len__') else 'non-bytes'})")
+        peer_message = bytes(peer_message)
+        if not r255_is_valid_point(peer_message):
+            raise ValueError("peer message is not a valid Ristretto255 point")
+        # peer_blinding: complementary to our role.
+        peer_blinding = SPAKE2_N if self._role == "alice" else SPAKE2_M
+        peer_pw_part = r255_scalarmult(self._pw_scalar, peer_blinding)
+        # unmasked = peer_message - peer_pw_part
+        unmasked = r255_sub(r255_decode(peer_message), peer_pw_part)
+        # K = priv_scalar * unmasked.  Shared point iff passwords match.
+        k_pt = r255_scalarmult(self._priv_scalar, unmasked)
+        k = r255_encode(k_pt)
+        # Transcript ordering is role-canonical so both sides hash the
+        # same bytes regardless of which side ran start() first.
+        if self._role == "alice":
+            msg_a = self._sent_message
+            msg_b = peer_message
+        else:
+            msg_a = peer_message
+            msg_b = self._sent_message
+        transcript = (self._id_a + self._id_b + msg_a + msg_b
+                      + self._pw_scalar + k)
+        return hashlib.blake2b(transcript, digest_size=32,
+                               key=SPAKE2_LABEL_KEY).digest()
+
+
+# ─── SAS derivation + wordlist ─────────────────────────────────────────
+#
+# After SPAKE2 both sides hold a 32-byte shared key — matching iff the
+# password (wormhole code) matched.  We hash that key with a labelled
+# BLAKE2b and slice it into N bytes; each byte indexes a word from
+# SAS_WORDLIST.  The user reads the resulting phrase out loud on both
+# devices; a relay-MITM that completed PAKE on each side independently
+# would produce DIFFERENT keys and thus different phrases, which the
+# user-confirmation step catches.
+#
+# Wordlist is byte-for-byte identical to Android signalling/
+# Spake2Sas.kt's PLACEHOLDER_SAS_WORDLIST — bumping it is a protocol
+# change (both ends must agree).  PGP-words / RFC 4880 phonetic
+# wordlist is a future swap.
+
+# 256 words, indexed 0..255.  Each is short, lowercase, distinct.
+SAS_WORDLIST = (
+    # 0..31
+    "apple", "bear", "cat", "deer", "eagle", "fish", "goat", "hawk",
+    "ink", "jay", "kite", "lion", "moose", "newt", "owl", "pear",
+    "quail", "rose", "snail", "tiger", "urn", "vase", "wolf", "yak",
+    "zebra", "ace", "bell", "crab", "dove", "elf", "fern", "gold",
+    # 32..63
+    "harp", "iris", "jade", "kelp", "lake", "moss", "nest", "oak",
+    "pine", "quark", "reed", "salt", "tide", "uvula", "vest", "wax",
+    "yarn", "zinc", "ant", "bat", "cape", "drum", "elm", "fox",
+    "gem", "hoop", "jam", "knot", "leaf", "mint", "nail", "onyx",
+    # 64..95
+    "pad", "rim", "sand", "tape", "ulm", "veil", "wave", "yew",
+    "arch", "barn", "coal", "duct", "egg", "flag", "grain", "hill",
+    "ivy", "jug", "keel", "log", "mast", "nook", "orb", "plum",
+    "rake", "silk", "tin", "ulna", "vine", "wisp", "yak2", "zen",
+    # 96..127
+    "amp", "boil", "comb", "dock", "ebb", "fjord", "gust", "halo",
+    "ire", "joke", "kiln", "lash", "mole", "nubs", "ooze", "puff",
+    "rust", "scab", "trim", "udder", "vex", "wend", "yore", "zest",
+    "abyss", "blip", "carp", "dawn", "eel", "fawn", "gauze", "hex",
+    # 128..159
+    "isle", "jolt", "knee", "lull", "mush", "nag", "ode", "perk",
+    "rave", "sloth", "trove", "user", "verb", "warp", "yam", "zest2",
+    "alms", "bunch", "cinch", "dwarf", "eke", "frog", "gear", "hum",
+    "imp", "jest", "kink", "lull2", "moil", "nymph", "oath", "perch",
+    # 160..191
+    "raze", "sect", "thaw", "ulm2", "vow", "wrest", "yeti", "zealot",
+    "atom", "barb", "creek", "dirge", "ember", "fawn2", "gobi", "hoist",
+    "iota", "jeer", "knack", "lurk", "muse", "node", "oust", "prow",
+    "quay", "rasp", "snipe", "thorn", "udon", "vamp", "wisp2", "yokel",
+    # 192..223
+    "aspen", "bog", "cusp", "dim", "ergot", "fjord2", "geode", "hark",
+    "ibex", "jolt2", "klutz", "luge", "moor", "nimbus", "ooze2", "pith",
+    "quirk", "ruby", "sift", "thrum", "ushak", "vex2", "wadi", "yurt",
+    "zephyr", "alley", "broth", "clove", "dingo", "ember2", "fern2", "gulch",
+    # 224..255
+    "henna", "ingot", "jolly", "kapok", "lapis", "manor", "nutty", "ochre",
+    "pixel", "quill", "raven", "sable", "tally", "umber", "viola", "wager",
+    "yarrow", "zilch", "amber", "blade", "cleft", "drift", "ember3", "frill",
+    "glaze", "haven", "iglu", "jolt3", "kismet", "lobby", "mango", "nudge",
+)
+assert len(SAS_WORDLIST) == 256, "SAS_WORDLIST must have exactly 256 entries"
+
+
+def derive_sas(shared_key, word_count=4):
+    """Derive a SAS phrase from a SPAKE2 shared key.
+
+    Parameters mirror Android's deriveSas: a 32-byte shared key (we
+    accept ≥16 for symmetry with the JVM tests), and a word_count
+    in [0, 32].  Each byte of the BLAKE2b-derived digest indexes a
+    word in SAS_WORDLIST.
+    """
+    if len(shared_key) < 16:
+        raise ValueError(
+            f"sharedKey too short for SAS derivation "
+            f"(got {len(shared_key)} bytes, need >= 16)")
+    if not (0 <= word_count <= 32):
+        raise ValueError(
+            f"wordCount out of range (got {word_count}; allowed 0..32)")
+    if word_count == 0:
+        return ""
+    digest = hashlib.blake2b(shared_key, digest_size=word_count,
+                             key=SPAKE2_LABEL_SAS).digest()
+    return " ".join(SAS_WORDLIST[b] for b in digest)
+
+
+# ─── Wormhole code (the SPAKE2 password) ────────────────────────────
+#
+# Format: 6 uppercase letters from a 24-letter alphabet (A-Z minus
+# 'I' and 'O', which look like 1 and 0).  Search space ~191 M; combined
+# with one-attempt-per-mint-cycle (user aborts on bad SAS), this is a
+# one-shot brute force not an offline one.  Format mirrors Android's
+# WormholeCode.kt — both sides MUST canonicalise to the same byte
+# string or SPAKE2 fails with a SAS mismatch.
+
+WORMHOLE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+WORMHOLE_DEFAULT_LENGTH = 6
+
+
+def wormhole_generate(length=WORMHOLE_DEFAULT_LENGTH):
+    """Uniformly-random code from WORMHOLE_ALPHABET."""
+    if not (1 <= length <= 32):
+        raise ValueError(
+            f"length out of range (got {length}, allowed 1..32)")
+    return "".join(
+        secrets.choice(WORMHOLE_ALPHABET) for _ in range(length))
+
+
+def wormhole_normalize(raw):
+    """Canonicalise user input: uppercase, drop any char not in the
+    alphabet.  Whitespace, dashes, digits, punctuation, the letters
+    I and O — all stripped."""
+    upper = raw.upper()
+    return "".join(c for c in upper if c in WORMHOLE_ALPHABET)
+
+
+def wormhole_is_valid(code, length=WORMHOLE_DEFAULT_LENGTH):
+    """True iff [code] normalises to exactly [length] letters."""
+    return len(wormhole_normalize(code)) == length
+
+
+def wormhole_to_bytes(code):
+    """SPAKE2-input bytes: UTF-8 of the canonical form."""
+    return wormhole_normalize(code).encode("utf-8")
+
+
 # ─── STUN XOR-MAPPED-ADDRESS parser ────────────────────────────────────
 # Pure function — no I/O, no sockets, testable with synthetic vectors.
 # Handles both family=0x01 (IPv4) and family=0x02 (IPv6) per RFC 5389
