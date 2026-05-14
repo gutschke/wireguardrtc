@@ -2620,6 +2620,7 @@ def write_provision_permit(token: bytes, name_hint: str,
 def run_provision_script(script_path: str, iface: str, name: str,
                          client_pub_b64: str,
                          token: bytes = b"",
+                         parameters: str = "",
                          timeout: float = 15.0) -> tuple:
     """Invoke the user-supplied provisioning hook.
 
@@ -2679,6 +2680,14 @@ def run_provision_script(script_path: str, iface: str, name: str,
         # the form filenames in the broker's permits dir take.
         env["WIREGUARDRTC_PROVISION_TOKEN"] = (
             base64.urlsafe_b64encode(token).rstrip(b"=").decode("ascii"))
+    # Wormhole-pair and other future code paths can attach a
+    # parameters string for the script to consume — same semantics as
+    # the site-deployment pending-token sidecars, but delivered
+    # in-band so the script doesn't have to depend on a particular
+    # sidecar layout.  Optional; absent for token-based ENROLL flows
+    # where parameters come from the admin's pre-staged sidecar.
+    if parameters:
+        env["WIREGUARDRTC_PROVISION_PARAMETERS"] = parameters
     try:
         res = subprocess.run(
             [str(script), iface, name, client_pub_b64],
@@ -5637,6 +5646,7 @@ def cmd_mint_wormhole(args):
                 iface=iface,
                 name=label,
                 client_pub_b64=joiner_info["wg_pubkey"],
+                parameters=args.parameters or "",
             )
             if ok:
                 sys.stdout.write(
@@ -5725,6 +5735,13 @@ def main():
                     help="with --mint-wormhole: PersistentKeepalive "
                          "(seconds) to advertise to the joiner.  "
                          "0 disables.  Default: 25.")
+    ap.add_argument("--parameters", default=None,
+                    help="with --mint-wormhole: parameter string "
+                         "passed to the ProvisionScript via the "
+                         "WIREGUARDRTC_PROVISION_PARAMETERS env var.  "
+                         "Format is site-specific (typically a "
+                         "comma-separated list of key=value pairs "
+                         "such as `target=lan, reverse=yes`).")
     ap.add_argument("--device-name", default=None,
                     help="with --use-wormhole: friendly name for "
                          "this device sent to the host.  Defaults to "

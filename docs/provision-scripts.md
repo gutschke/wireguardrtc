@@ -32,6 +32,7 @@ enrollment path:
 | Env | Meaning |
 |---|---|
 | `WIREGUARDRTC_PROVISION_TOKEN` | URL-safe-base64 (no padding) of the 32-byte enrollment token the daemon just claimed.  Present for `--enroll-token` flows, absent for `--mint-wormhole` flows (the wormhole code is one-shot in a different way). |
+| `WIREGUARDRTC_PROVISION_PARAMETERS` | Site-specific parameter string the admin attached when minting.  Present when the wormhole-pair admin used `--parameters STR` (or, in token-based flows, when a script-managed wrapper stashed parameters elsewhere — convention is up to the operator).  Absent when no parameters were supplied.  Format is a string the script defines; a common convention is `key=value, key=value, …`. |
 
 The script must:
 
