@@ -194,9 +194,13 @@ of base64 keys.
      the QR.  Done.
    - **Paste a config** — if you SSH'd in from elsewhere and only
      have the `wgrtc-enroll://…` text, paste it into the phone here.
-   - **Type a wormhole code** works phone-to-phone today, but the
-     daemon doesn't speak wormhole pairing yet (tracked as task D1).
-     Use Scan QR or Paste config against a daemon for now.
+   - **Type a wormhole code** — works phone-to-phone and, since
+     v0.2.4, also phone-to-daemon and daemon-to-daemon.  Mint with
+     `sudo wireguardrtc --mint-wormhole --iface wg0` on the server,
+     type the 6-letter code on the joiner (`sudo wireguardrtc
+     --use-wormhole ABCDEF` on a Linux client, or the app's wormhole
+     input on a phone), confirm the 4-word SAS phrase matches on
+     both sides.
 
 3. **The tunnel appears in the list, idle.**  Tap to bring it up:
 

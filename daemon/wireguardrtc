@@ -5236,6 +5236,297 @@ def cmd_check_nat(args):
     sys.exit(0 if any_viable else 1)
 
 
+def _read_broker_config(global_config_path):
+    """Read [Signaling] Server / Key from the global config file.
+    Falls back to defaults if the file doesn't exist or doesn't
+    specify these values.  Used by the wormhole CLI subcommands."""
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    try:
+        cp.read(global_config_path)
+    except Exception:
+        pass
+    server = cp.get("Signaling", "Server",
+                     fallback=DEFAULT_PEERJS_SERVER)
+    key = cp.get("Signaling", "Key", fallback=DEFAULT_PEERJS_KEY)
+    return server, key
+
+
+class WormholeBrokerTransport:
+    """Minimal async WSS transport for wormhole-pairing CLI subcommands.
+
+    Connects to the broker, subscribes under [routing_id], runs a
+    HEARTBEAT loop while open, exposes async send / recv / close
+    matching WormholeFlow's transport contract.  Separate from the
+    daemon's long-lived PeerJSClient because the wormhole flow is
+    one-shot (no reconnect needed) and the daemon may not even be
+    running on the joiner side.
+    """
+
+    def __init__(self, server, key, our_routing_id):
+        self._server = server
+        self._key = key
+        self._our_id = our_routing_id
+        self._ws = None
+        self._inbound = asyncio.Queue()
+        self._stop = asyncio.Event()
+        self._tasks = []
+
+    async def open(self, open_timeout=15.0):
+        sep = "&" if "?" in self._server else "?"
+        token = secrets.token_hex(8)
+        uri = (f"{self._server}{sep}key={self._key}&id={self._our_id}"
+               f"&token={token}&version=1.5.2")
+        self._ws = await websockets.connect(uri)
+        # Wait for the broker's OPEN frame before allowing send().
+        raw = await asyncio.wait_for(self._ws.recv(),
+                                      timeout=open_timeout)
+        msg = json.loads(raw)
+        if msg.get("type") != "OPEN":
+            raise WormholeFailed(
+                f"broker did not OPEN (got {msg!r})")
+        # Inbound + heartbeat loops live for the session lifetime.
+        self._tasks.append(asyncio.create_task(self._recv_loop()))
+        self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
+
+    async def _recv_loop(self):
+        try:
+            while not self._stop.is_set():
+                raw = await self._ws.recv()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                await self._inbound.put(msg)
+        except Exception:
+            # Connection closed or torn down — signal recv() callers
+            # by leaving the queue empty.  The wait_for at the call
+            # site bounds blocking.
+            return
+
+    async def _heartbeat_loop(self):
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(),
+                                        timeout=PEERJS_HEARTBEAT)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._ws.send('{"type":"HEARTBEAT"}')
+            except Exception:
+                return
+
+    async def send(self, envelope):
+        if self._ws is None or self._stop.is_set():
+            return False
+        try:
+            await self._ws.send(json.dumps(envelope))
+            return True
+        except Exception:
+            return False
+
+    async def recv(self):
+        return await self._inbound.get()
+
+    async def close(self):
+        self._stop.set()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        for t in self._tasks:
+            t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def _confirm_sas_interactive(phrase):
+    """Default SAS-confirm callback: print + read y/n from stdin.
+
+    Returns True iff the user typed 'y' (case-insensitive).  Anything
+    else, including EOF, treats as a NO — better fail-closed than
+    silently accept on a hung prompt.
+    """
+    sys.stdout.write(f"\nSAS phrase: {phrase}\n")
+    sys.stdout.write("Confirm match on the other device.\n")
+    sys.stdout.write("Match? [y/N]: ")
+    sys.stdout.flush()
+    try:
+        ans = sys.stdin.readline().strip().lower()
+    except EOFError:
+        return False
+    return ans == "y"
+
+
+def cmd_use_wormhole(args):
+    """Joiner side: type a wormhole code, exchange enrollment info,
+    print a wg-quick config the user can persist."""
+    code = wormhole_normalize(args.use_wormhole)
+    if not wormhole_is_valid(code):
+        sys.stderr.write(
+            f"Invalid wormhole code: {args.use_wormhole!r} "
+            f"(after normalization: {code!r}, "
+            f"expected {WORMHOLE_DEFAULT_LENGTH} letters from {WORMHOLE_ALPHABET})\n")
+        sys.exit(2)
+    code_bytes = wormhole_to_bytes(code)
+    broker_server, broker_key = _read_broker_config(args.config)
+
+    # Generate a fresh joiner WG keypair so the user can copy the
+    # private key into wg-quick.  We don't write it to disk — the
+    # user pastes both halves themselves.
+    import subprocess
+    try:
+        priv = subprocess.check_output(["wg", "genkey"]).strip()
+        pub = subprocess.check_output(["wg", "pubkey"], input=priv).strip()
+    except (OSError, subprocess.CalledProcessError) as e:
+        sys.stderr.write(f"failed to generate WG keypair via wg(8): {e}\n"
+                          "Install wireguard-tools or pass --my-pubkey.\n")
+        sys.exit(2)
+    joiner_pub_b64 = pub.decode("ascii")
+    joiner_priv_b64 = priv.decode("ascii")
+    device_name = args.device_name
+
+    async def _run():
+        transport = WormholeBrokerTransport(
+            broker_server, broker_key,
+            sas_routing_id_initiator(code_bytes))
+        await transport.open()
+        try:
+            flow = WormholeFlow(role="initiator",
+                                 code_bytes=code_bytes,
+                                 transport=transport)
+            try:
+                sas, host_info = await flow.run_joiner(
+                    joiner_pubkey_b64=joiner_pub_b64,
+                    device_name=device_name,
+                    confirm_sas=_confirm_sas_interactive,
+                )
+            except SasAborted:
+                sys.stderr.write("\nAborted: SAS did not match.\n")
+                sys.exit(3)
+            return sas, host_info
+        finally:
+            await transport.close()
+
+    sys.stdout.write(f"Connecting to broker {broker_server} ...\n")
+    sys.stdout.write(f"Typed code: {code}\n")
+    sys.stdout.write("Waiting for the host to mint this code...\n")
+    sys.stdout.flush()
+    try:
+        sas, host_info = asyncio.run(_run())
+    except WormholeFailed as e:
+        sys.stderr.write(f"\nWormhole pairing failed: {e}\n")
+        sys.exit(4)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        sys.exit(130)
+
+    sys.stdout.write("\nEnrollment received.  Suggested wg-quick config:\n")
+    sys.stdout.write("=" * 60 + "\n")
+    sys.stdout.write(f"[Interface]\nPrivateKey = {joiner_priv_b64}\n")
+    sys.stdout.write(f"Address = {host_info['assigned_address']}\n")
+    if host_info.get("dns"):
+        sys.stdout.write(f"DNS = {host_info['dns']}\n")
+        if host_info.get("mtu"):
+            sys.stdout.write(f"MTU = {host_info['mtu']}\n")
+    sys.stdout.write(f"\n[Peer]\nPublicKey = {host_info['wg_pubkey']}\n")
+    sys.stdout.write(f"Endpoint = {host_info['wg_endpoint']}\n")
+    sys.stdout.write(f"AllowedIPs = {host_info['allowed_ips']}\n")
+    if host_info.get("keepalive"):
+        sys.stdout.write(f"PersistentKeepalive = {host_info['keepalive']}\n")
+    sys.stdout.write("=" * 60 + "\n")
+    if host_info.get("host_name"):
+        sys.stdout.write(f"\nPaired with: {host_info['host_name']}\n")
+
+
+def cmd_mint_wormhole(args):
+    """Host side: generate a wormhole code, advertise it, await a
+    joiner, and on success print the peer drop-in for the daemon."""
+    code = wormhole_generate(length=WORMHOLE_DEFAULT_LENGTH)
+    code_bytes = wormhole_to_bytes(code)
+    broker_server, broker_key = _read_broker_config(args.config)
+
+    iface = args.iface
+    if iface is None:
+        sys.stderr.write(
+            "--mint-wormhole requires --iface <wg-interface> so we know "
+            "which WG identity to advertise to the joiner.\n")
+        sys.exit(2)
+
+    # Read host's WG pubkey + listen-port.  The daemon's existing
+    # _wg_show_field helper handles the wg(8) call.
+    try:
+        host_pub = _wg_show_field(iface, "public-key")
+        listen_port = _wg_show_field(iface, "listen-port")
+    except Exception as e:
+        sys.stderr.write(f"failed to read WG state for {iface!r}: {e}\n")
+        sys.exit(2)
+    if not host_pub or not listen_port:
+        sys.stderr.write(f"interface {iface!r} did not return pubkey/port.\n")
+        sys.exit(2)
+
+    wg_endpoint = args.endpoint or f"0.0.0.0:{listen_port.strip()}"
+    assigned_address = args.assigned_address
+    allowed_ips = args.allowed_ips or assigned_address
+
+    async def _run():
+        transport = WormholeBrokerTransport(
+            broker_server, broker_key,
+            sas_routing_id_responder(code_bytes))
+        await transport.open()
+        try:
+            flow = WormholeFlow(role="responder",
+                                 code_bytes=code_bytes,
+                                 transport=transport)
+            try:
+                sas, joiner_info = await flow.run_host(
+                    host_info=dict(
+                        wg_pubkey_b64=host_pub.strip(),
+                        wg_endpoint=wg_endpoint,
+                        assigned_address=assigned_address,
+                        allowed_ips=allowed_ips,
+                        host_name=args.host_name or socket.gethostname(),
+                        keepalive=args.keepalive,
+                    ),
+                    confirm_sas=_confirm_sas_interactive,
+                )
+            except SasAborted:
+                sys.stderr.write("\nAborted: SAS did not match.\n")
+                sys.exit(3)
+            return sas, joiner_info
+        finally:
+            await transport.close()
+
+    sys.stdout.write(f"Wormhole code: {code}\n")
+    sys.stdout.write(f"Broker: {broker_server}\n")
+    sys.stdout.write("Tell the joiner: run\n")
+    sys.stdout.write(f"  sudo wireguardrtc --use-wormhole {code}\n")
+    sys.stdout.write("Waiting for joiner to connect...\n")
+    sys.stdout.flush()
+    try:
+        sas, joiner_info = asyncio.run(_run())
+    except WormholeFailed as e:
+        sys.stderr.write(f"\nWormhole pairing failed: {e}\n")
+        sys.exit(4)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        sys.exit(130)
+
+    label = args.label or (joiner_info.get("device_name") or "wormhole-peer")
+    sys.stdout.write("\nEnrollment received.  Add this peer to the daemon:\n")
+    sys.stdout.write("=" * 60 + "\n")
+    sys.stdout.write(f"# /etc/wireguardrtc/peers.d/{label}.conf\n")
+    sys.stdout.write("[Peer]\n")
+    sys.stdout.write(f"PublicKey = {joiner_info['wg_pubkey']}\n")
+    sys.stdout.write("Mode = active\n")
+    sys.stdout.write("=" * 60 + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -5270,6 +5561,42 @@ def main():
                     help="with --check-nat: STUN servers to probe "
                          "(default: stun.l.google.com, stun.cloudflare.com, "
                          "stun.nextcloud.com)")
+    ap.add_argument("--mint-wormhole", action="store_true",
+                    help="mint a wormhole code (host side), wait for "
+                         "a joiner to type it, run SPAKE2+SAS, and "
+                         "print the peer drop-in needed to authorize "
+                         "them.  Requires --iface.")
+    ap.add_argument("--use-wormhole", metavar="CODE", default=None,
+                    help="join a tunnel using a wormhole code (joiner "
+                         "side).  Runs SPAKE2+SAS against the host who "
+                         "minted the same code, then prints a wg-quick "
+                         "config the user can save.")
+    ap.add_argument("--label", default=None,
+                    help="with --mint-wormhole: label for the peer "
+                         "drop-in file.  Defaults to the joiner's "
+                         "device name (or 'wormhole-peer').")
+    ap.add_argument("--endpoint", default=None,
+                    help="with --mint-wormhole: host's external "
+                         "endpoint (ip:port) to advertise to the "
+                         "joiner.  Defaults to 0.0.0.0:<listen-port>.")
+    ap.add_argument("--assigned-address", default="10.99.0.2/32",
+                    help="with --mint-wormhole: address to advertise "
+                         "to the joiner for [Interface] Address.")
+    ap.add_argument("--allowed-ips", default=None,
+                    help="with --mint-wormhole: AllowedIPs to advertise "
+                         "to the joiner.  Defaults to the assigned "
+                         "address as a /32.")
+    ap.add_argument("--host-name", default=None,
+                    help="with --mint-wormhole: friendly host name "
+                         "shown to the joiner.  Defaults to hostname.")
+    ap.add_argument("--keepalive", type=int, default=25,
+                    help="with --mint-wormhole: PersistentKeepalive "
+                         "(seconds) to advertise to the joiner.  "
+                         "0 disables.  Default: 25.")
+    ap.add_argument("--device-name", default=None,
+                    help="with --use-wormhole: friendly name for "
+                         "this device sent to the host.  Defaults to "
+                         "this machine's hostname.")
     args = ap.parse_args()
 
     if args.show_config:
@@ -5280,6 +5607,12 @@ def main():
         return
     if args.check_nat:
         cmd_check_nat(args)
+        return
+    if args.mint_wormhole:
+        cmd_mint_wormhole(args)
+        return
+    if args.use_wormhole:
+        cmd_use_wormhole(args)
         return
 
     logging.basicConfig(
