@@ -14,6 +14,7 @@ import com.gutschke.wgrtc.data.TunFdProvider
 import com.gutschke.wgrtc.data.WgBridgeNative
 import com.gutschke.wgrtc.data.WgFdProtector
 import com.gutschke.wgrtc.data.VpnServiceFdProtector
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -100,20 +101,20 @@ class JoinerNVpnService : VpnService() {
         // the socket binds, else the encrypted UDP gets caught by
         // the VPN's own AllowedIPs route (the classic PS11 storm).
         WgBridgeNative.installProtector(makeFdProtector())
-        runBlocking { controller.addJoiner(cfg) }
+        runBlocking(Dispatchers.IO) { controller.addJoiner(cfg) }
     }
 
     /** Remove a joiner. Triggers a rebuild on the surviving set,
      *  or full teardown when the set becomes empty. */
     @Throws(Exception::class)
     fun removeJoiner(tunnelId: String) {
-        runBlocking { controller.removeJoiner(tunnelId) }
+        runBlocking(Dispatchers.IO) { controller.removeJoiner(tunnelId) }
     }
 
     /** Push fresh UAPI for one joiner without rebuilding. Used by
      *  the endpoint-roam path. */
     fun reconfigure(tunnelId: String, wgQuickUapi: String) {
-        runBlocking { controller.reconfigure(tunnelId, wgQuickUapi) }
+        runBlocking(Dispatchers.IO) { controller.reconfigure(tunnelId, wgQuickUapi) }
     }
 
     /** Snapshot wireguard-go's current state for one joiner.  Null
@@ -123,11 +124,19 @@ class JoinerNVpnService : VpnService() {
     /** Full teardown — close every joiner, close the shared stack,
      *  detach the kernel TUN. Idempotent. */
     fun stopAll() {
-        runBlocking { controller.closeAll() }
+        runBlocking(Dispatchers.IO) { controller.closeAll() }
         pfd?.let {
             try { it.close() } catch (_: Throwable) {}
         }
         pfd = null
+        // Clear the process-global protector callback so a stale
+        // lambda doesn't survive the service instance.  This isn't
+        // a correctness issue today (the lambda just captures `this`
+        // and the destroyed service's `protect()` is a no-op), but
+        // leaving a dangling reference around a `VpnService` after
+        // its `onDestroy` is the kind of bug review #3 flagged
+        // pre-emptively.
+        WgBridgeNative.installProtector(null)
     }
 
     override fun onDestroy() {

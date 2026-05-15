@@ -43,8 +43,11 @@ import (
 )
 
 // sharedStackState owns one gvisor stack with N+1 channel-endpoint
-// NICs. NIC0 is reserved for the kernel-TUN side (attached later
-// via `D4.J2`); NIC1..NICk hold wireguard-go joiner bridges.
+// NICs. NIC 1 (`reservedKernelTunNicID`) is reserved for the
+// kernel-TUN side (attached via `attachKernelTunNic` / `D4.J2`);
+// NIC 2..k (`firstJoinerNicID` and up) hold wireguard-go joiner
+// bridges. gvisor reserves NIC ID 0 as invalid, so the first
+// usable ID is 1.
 //
 // All exported methods are safe for concurrent calls. Internal
 // `endpoints` map is guarded by `mu`; the gvisor `Stack` itself
@@ -77,10 +80,11 @@ type sharedStackState struct {
 }
 
 const (
-	// reservedKernelTunNicID — NIC 0 is reserved for the kernel-TUN
-	// side. Allocated by `D4.J2`; we just declare the constant here
-	// so route-installation in this file and pump-installation in
-	// the next file refer to the same value.
+	// reservedKernelTunNicID — NIC 1 is reserved for the kernel-TUN
+	// side (gvisor reserves NIC ID 0 as invalid; 1 is the first
+	// usable). Allocated by `attachKernelTunNic` in this file +
+	// pump in `joiner_n_pump.go`; we just declare the constant
+	// here so every reference uses the same value.
 	reservedKernelTunNicID tcpip.NICID = 1
 
 	// firstJoinerNicID — joiner NICs start at 2 so NIC 1 stays
@@ -230,6 +234,61 @@ func nicMarker(id tcpip.NICID) netip.Addr {
 	return netip.AddrFrom4([4]byte{169, 254, 0, byte(id)})
 }
 
+// nicMarkerV6 mirrors [nicMarker] for IPv6.  gvisor's strong-host
+// model applies per-family — without a v6 local address on every
+// potential outgoing NIC, `FindRoute` rejects forwarded v6 packets
+// the same way it does v4 (P1 finding, generalized).  Production
+// joiners with v6 AllowedIPs would otherwise see silent drops on
+// the inbound (joiner → app) path.
+//
+// Address scheme: `fe80::wgrtc:<id>` in the link-local ULA range,
+// guaranteed not to collide with any global v6 prefix a joiner
+// could legitimately advertise.
+func nicMarkerV6(id tcpip.NICID) netip.Addr {
+	var b [16]byte
+	b[0] = 0xfe
+	b[1] = 0x80
+	// "wgrtc" → 0x77 0x67 0x72 0x74 0x63 at bytes [8..12], NIC ID
+	// big-endian at [12..16].  Keeps every NIC's marker unique +
+	// recognisable in a packet capture.
+	b[8] = 'w'
+	b[9] = 'g'
+	b[10] = 'r'
+	b[11] = 't'
+	b[12] = 'c'
+	b[13] = 0
+	b[14] = byte(int32(id) >> 8)
+	b[15] = byte(int32(id))
+	return netip.AddrFrom16(b)
+}
+
+// bindStrongHostMarkers binds [nicID]'s synthetic v4+v6 markers
+// via gvisor's AddProtocolAddress.  Called by both [attachNic] and
+// [attachKernelTunNic] so every NIC gets both families.  Returns
+// an error mirroring the gvisor stack error verbatim; the caller
+// is responsible for the rollback (RemoveNIC + ep.Close).
+func bindStrongHostMarkers(s *stack.Stack, nicID tcpip.NICID) error {
+	v4 := nicMarker(nicID)
+	v4Pa := tcpip.ProtocolAddress{
+		Protocol: ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFromSlice(
+			v4.AsSlice()).WithPrefix(),
+	}
+	if err := s.AddProtocolAddress(nicID, v4Pa, stack.AddressProperties{}); err != nil {
+		return fmt.Errorf("AddProtocolAddress(v4 marker on NIC %d): %s", nicID, err)
+	}
+	v6 := nicMarkerV6(nicID)
+	v6Pa := tcpip.ProtocolAddress{
+		Protocol: ipv6.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFromSlice(
+			v6.AsSlice()).WithPrefix(),
+	}
+	if err := s.AddProtocolAddress(nicID, v6Pa, stack.AddressProperties{}); err != nil {
+		return fmt.Errorf("AddProtocolAddress(v6 marker on NIC %d): %s", nicID, err)
+	}
+	return nil
+}
+
 // attachNic creates a fresh channel endpoint, registers it as a
 // new NIC on the gvisor stack, binds the NIC's synthetic marker
 // address, and returns the (nicID, endpoint) pair so the caller
@@ -249,19 +308,13 @@ func (ss *sharedStackState) attachNic() (tcpip.NICID, *channel.Endpoint, error) 
 		ep.Close()
 		return 0, nil, fmt.Errorf("CreateNIC(%d): %s", nicID, err)
 	}
-	// Bind the synthetic marker so gvisor's strong-host model is
-	// satisfied — without this, forwarded packets whose route
-	// selects this NIC get dropped as Unrouteable (P1 lesson).
-	marker := nicMarker(nicID)
-	pa := tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddrFromSlice(
-			marker.AsSlice()).WithPrefix(),
-	}
-	if err := ss.stack.AddProtocolAddress(nicID, pa, stack.AddressProperties{}); err != nil {
+	// Bind v4 + v6 strong-host markers so gvisor's `FindRoute`
+	// will pick this NIC for forwarded traffic of either family.
+	// (P1 lesson + dual-stack-correctness review.)
+	if err := bindStrongHostMarkers(ss.stack, nicID); err != nil {
 		ss.stack.RemoveNIC(nicID)
 		ep.Close()
-		return 0, nil, fmt.Errorf("AddProtocolAddress(%d, %v): %s", nicID, marker, err)
+		return 0, nil, err
 	}
 	ss.endpoints[nicID] = ep
 	return nicID, ep, nil
@@ -290,17 +343,12 @@ func (ss *sharedStackState) attachKernelTunNic() (tcpip.NICID, *channel.Endpoint
 		ep.Close()
 		return 0, nil, fmt.Errorf("CreateNIC(%d): %s", reservedKernelTunNicID, err)
 	}
-	// Strong-host marker, as for every other NIC.
-	marker := nicMarker(reservedKernelTunNicID)
-	pa := tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddrFromSlice(
-			marker.AsSlice()).WithPrefix(),
-	}
-	if err := ss.stack.AddProtocolAddress(reservedKernelTunNicID, pa, stack.AddressProperties{}); err != nil {
+	// Bind v4 + v6 strong-host markers — same rationale as
+	// [attachNic].
+	if err := bindStrongHostMarkers(ss.stack, reservedKernelTunNicID); err != nil {
 		ss.stack.RemoveNIC(reservedKernelTunNicID)
 		ep.Close()
-		return 0, nil, fmt.Errorf("AddProtocolAddress(%d, %v): %s", reservedKernelTunNicID, marker, err)
+		return 0, nil, err
 	}
 	ss.endpoints[reservedKernelTunNicID] = ep
 	return reservedKernelTunNicID, ep, nil

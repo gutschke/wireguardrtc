@@ -191,8 +191,18 @@ func attachKernelTunPump(ss *sharedStackState, fd int, mtu int) (*kernelTunPumpH
 	// any pending poll-wait on close.  Wireguard-go's
 	// `CreateUnmonitoredTUNFromFD` does the same thing for the
 	// same reason.
+	//
+	// **Fd ownership on error**: until we've successfully wrapped
+	// `fd` in `os.NewFile`, the fd is still the caller's, and the
+	// Kotlin contract (`WgBridgeNative.kt`) says ownership transfers
+	// only on a 0-return-code from `nativeSharedStackAttachKernelTun`.
+	// Close on every pre-wrap failure path so a failed attach
+	// doesn't permanently leak a TUN fd that the JVM thinks the
+	// stack owns.  Post-wrap failures rely on `file.Close()`
+	// instead.
 	if err := unix.SetNonblock(fd, true); err != nil {
 		_ = ss.detachNic(reservedKernelTunNicID)
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("attachKernelTunPump: SetNonblock(%d): %w", fd, err)
 	}
 	// Wrap the fd. `os.NewFile` is the canonical way; it doesn't
@@ -201,8 +211,10 @@ func attachKernelTunPump(ss *sharedStackState, fd int, mtu int) (*kernelTunPumpH
 	file := os.NewFile(uintptr(fd), "wgrtc-joiner-n-kernel-tun")
 	if file == nil {
 		// `NewFile` returns nil for invalid descriptors — most
-		// likely closed already.
+		// likely closed already.  We can't construct an `os.File`
+		// to close it; fall back to the raw syscall.
 		_ = ss.detachNic(reservedKernelTunNicID)
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("attachKernelTunPump: os.NewFile returned nil for fd %d", fd)
 	}
 
@@ -213,6 +225,25 @@ func attachKernelTunPump(ss *sharedStackState, fd int, mtu int) (*kernelTunPumpH
 		done:   done,
 		file:   file,
 	}
+
+	// **Install the pump handle on the stack BEFORE spawning the
+	// goroutines** (fix for the install-vs-close race uncovered
+	// in review).  If a concurrent `close()` runs between
+	// goroutine launch and the field write, `close` skips
+	// pumpHandle.Stop() because `ss.pumpHandle` is still nil,
+	// then closes the channel endpoint underneath the live
+	// goroutines.  Setting the handle first AND re-checking
+	// `ss.endpoints != nil` under the same lock makes the
+	// startup atomic with respect to `close`.
+	ss.mu.Lock()
+	if ss.endpoints == nil {
+		ss.mu.Unlock()
+		// Stack closed concurrently — undo what we built.
+		_ = file.Close()
+		return nil, fmt.Errorf("attachKernelTunPump: shared stack closed during attach")
+	}
+	ss.pumpHandle = handle
+	ss.mu.Unlock()
 
 	// Run both pumps; signal completion when BOTH have returned.
 	var wg sync.WaitGroup
@@ -229,13 +260,6 @@ func attachKernelTunPump(ss *sharedStackState, fd int, mtu int) (*kernelTunPumpH
 		wg.Wait()
 		close(done)
 	}()
-
-	// Stash the pump handle on the stack so `sharedStackState.close`
-	// shuts it down as part of the unified teardown. The JNI surface
-	// only exchanges stack handles, not per-pump handles.
-	ss.mu.Lock()
-	ss.pumpHandle = handle
-	ss.mu.Unlock()
 
 	return handle, nil
 }

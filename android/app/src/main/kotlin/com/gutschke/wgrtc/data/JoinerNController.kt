@@ -132,17 +132,24 @@ class JoinerNController(
 
     /** Re-issue UAPI for one joiner without a full rebuild.  Used
      *  by the candidate-race / endpoint-roam path that pushes a
-     *  new `[Peer] Endpoint = ...` without changing routes. */
+     *  new `[Peer] Endpoint = ...` without changing routes.
+     *
+     *  Serialised through [mu] so that a `closeJoiner` /
+     *  `closeAll` racing against the JNI configureUapi call can't
+     *  free the bridge handle out from under us.  An earlier
+     *  draft skipped the lock to allow concurrent roams during
+     *  a rebuild, but review #4 caught the handle-reuse hazard.
+     */
     suspend fun reconfigure(tunnelId: String, wgQuickUapi: String) {
-        // No mu.withLock here — the underlying backend's
-        // reconfigure is internally synchronised, and we want to
-        // allow concurrent endpoint roams while a rebuild is in
-        // flight on a different joiner.
-        backend.reconfigure(tunnelId, wgQuickUapi)
-        // Update the cached UAPI so the next rebuild uses it.
-        synchronized(active) {
-            val existing = active[tunnelId] ?: return
-            active[tunnelId] = existing.copy(wgQuickUapi = wgQuickUapi)
+        mu.withLock {
+            val existing = synchronized(active) { active[tunnelId] } ?: return
+            backend.reconfigure(tunnelId, wgQuickUapi)
+            // Update the cached UAPI so the next rebuild uses it.
+            synchronized(active) {
+                if (active.containsKey(tunnelId)) {
+                    active[tunnelId] = existing.copy(wgQuickUapi = wgQuickUapi)
+                }
+            }
         }
     }
 
