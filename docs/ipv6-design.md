@@ -410,3 +410,32 @@ Test additions:
 - The catchall handler bridges any inbound packet of the right transport protocol REGARDLESS of network family, so once V6.H1 + V6.H2 are in place, a v6 TCP SYN from a joiner WILL fire the same `tcp.NewForwarder` handler and bracket the addresses correctly.  The forwarder's downstream — `TcpForwarderHandler.run()` opening an OS socket via `SocketFactory.createSocket(host, port)` — handles `host` as either v4 or v6 string fine; Java's `InetSocketAddress(host, port)` resolves both.  So the END-TO-END v6 TCP+UDP path through the host should work once V6.H1 + V6.H2 are deployed AND the host has a v6 `[Interface] Address`.
 
 Files: `android/wgbridge_native/listeners.go`, `android/wgbridge_native/format_endpoint_test.go`.
+
+### V6.H3 — 2026-05-13
+
+DNS proxy on v6 upstream.  **Status: already correct in production code — V6.H3 is a regression-pin pass.**
+
+Investigation:
+
+- `DnsProxy.handle()` (`android/app/src/main/kotlin/com/gutschke/wgrtc/data/DnsProxy.kt:85`) already accepts both `TYPE_A` (1) and `TYPE_AAAA` (28) qtypes.  Anything else returns `RCODE_NOTIMP`.
+- The resolver returns `List<InetAddress>` — `InetAddress.getAllByName(name)` is already dual-stack by definition (returns whichever families DNS resolves for the name).
+- Filtering: `addrs.filter { addr -> qtype == TYPE_A && addr is Inet4Address ‖ qtype == TYPE_AAAA && addr is Inet6Address }`.  NODATA (RFC 6147 §5.1.6) when the resolver knew the name but had no matching family.
+- Wire-format `buildResponse` calls `System.arraycopy(rdata, 0, out, p, rdata.size)` with the right `RDLENGTH` set dynamically as `rdata.size` — 4 B for v4, 16 B for v6.  No hard-coded `4` anywhere.
+
+V6.H1 + V6.H2 together carry inbound joiner UDP/53 (regardless of network family) through the gvisor netstack into the catchall UDP forwarder, which then dispatches into JVM-side `UdpForwarderHandler`.  The handler's downstream resolver — typically `DnsProxy` itself when the host is configured as the joiner's DNS — completes the round-trip.  No code change needed for v6 DNS to work end-to-end.
+
+What V6.H3 adds: two regression-pin tests in `DnsProxyTest.kt` so a future refactor of `buildResponse` can't silently regress the dual-stack contract:
+
+1. `V6_H3 AAAA RDATA contains the full 16-byte v6 address` — locates the answer record via offset math, asserts RDLENGTH = 16 and that the 16 RDATA bytes match the resolver's input byte-for-byte.  Defends against a copy that truncates to 4 (the A-record length).
+2. `V6_H3 NODATA when only v4 known but AAAA requested` — RFC 6147 §5.1.6: NOERROR + zero answers when the resolver has the name but only in the other family.  This is the signal happy-eyeballs joiners use to fall through to v4.
+
+3/3 V6.H3 tests pass (1 pre-existing AAAA test + 2 new).  Full DnsProxyTest green.
+
+**Audit finding (not fixed here):** `DnsProxy.buildResponse` over-allocates 2 zero bytes per answer record.  `ansBaseSize = 12` in `DnsProxy.kt:181` — but the actual bytes written (type 2 + class 2 + ttl 4 + rdlen 2) sum to 10.  The response is RFC-1035-compliant (trailing data past ANCOUNT records is ignored) but wastes 2 B per record.  Minor bandwidth bug; could be cleaned up to `ansBaseSize = 10` with no functional change — left as a separate cleanup task to keep V6.H3 scope tight.
+
+Files: `android/app/src/test/kotlin/com/gutschke/wgrtc/data/DnsProxyTest.kt` (regression pins).  Production code untouched.
+
+**Not addressed in V6.H3:**
+
+- The joiner has to actually USE the host's v6 address as DNS in its wg-quick `DNS = …` line for the v6 path to fire.  Today host enrolment renders `DNS = <host's v4 WG-side address>` (`buildHostTunnelSnapshot` derives one address).  When V6.2 lands v6 host addresses, the enrolment payload should emit `DNS = <v4-host>, <v6-host>` so the joiner has both.  V6.2 / V6.3 territory.
+- ICMPv6 from joiner → host's gvisor stack (e.g. `ping6 fd00::1`) — still v4-only via `host_forwarder.go`'s ICMP path.  Same H2-deferred work.

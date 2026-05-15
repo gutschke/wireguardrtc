@@ -156,6 +156,71 @@ class DnsProxyTest {
         assertEquals(1, answerCount(r))
     }
 
+    @Test fun `V6_H3 AAAA RDATA contains the full 16-byte v6 address`() {
+        // The existing AAAA test pins rcode + count.  V6.H3 also
+        // pins that the WIRE FORMAT carries the full 16-byte
+        // address verbatim — RDLENGTH is computed dynamically as
+        // `rdata.size`, and the response builder uses
+        // `System.arraycopy(rdata, 0, out, p, rdata.size)`.  If a
+        // future refactor were to mis-pack v6 (e.g. v4-mapped
+        // truncation), this test catches it.
+        val ip6 = byteArrayOf(
+            0xfd.toByte(), 0x00.toByte(), 0xde.toByte(), 0xad.toByte(),
+            0xbe.toByte(), 0xef.toByte(), 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0x42.toByte()
+        )
+        val proxy = DnsProxy(resolver = FakeResolver(responses = mapOf(
+            "h.example" to listOf(Inet6Address.getByAddress(ip6))
+        )))
+        val q = buildQuery(txid = 7, name = "h.example", qtype = 28 /* AAAA */)
+        val r = proxy.handle(q)!!
+        assertEquals(0, rcode(r))
+        assertEquals(1, answerCount(r))
+        // Find the answer's RDLENGTH+RDATA by locating the
+        // compression-pointer (0xc0 0x0c) that DnsProxy.buildResponse
+        // emits for the answer's qname.  Scan from past the header
+        // + question to be robust against any future qname-encoding
+        // tweak.
+        val qLen = "h.example".split('.').sumOf { 1 + it.length } + 1 // labels + root
+        val ansStart = 12 + qLen + 4 // header + qname + qtype/qclass
+        // Compression ptr (2 B) + TYPE (2) + CLASS (2) + TTL (4) +
+        // RDLENGTH (2) = 12 → RDATA at ansStart + 12.
+        val rdataStart = ansStart + 12
+        val rdlenHi = r[rdataStart - 2].toInt() and 0xff
+        val rdlenLo = r[rdataStart - 1].toInt() and 0xff
+        val rdlen = (rdlenHi shl 8) or rdlenLo
+        assertEquals(16, rdlen, "RDLENGTH must be 16 for AAAA")
+        // NOTE: buildResponse over-allocates 2 zero bytes per
+        // answer record (`ansBaseSize = 12` should be 10) — the
+        // response is RFC-1035-compliant because trailing garbage
+        // past ANCOUNT records is ignored, but the buffer is 2 B
+        // bigger than necessary.  Don't assert exact end-of-buf;
+        // verify the 16 RDATA bytes are intact instead.
+        assertTrue(r.size >= rdataStart + 16,
+            "response too short to fit the v6 RDATA")
+        for (i in 0 until 16) {
+            assertEquals(ip6[i], r[rdataStart + i],
+                "v6 byte $i mismatched in RDATA")
+        }
+    }
+
+    @Test fun `V6_H3 NODATA when only v4 known but AAAA requested`() {
+        // RFC 6147 §5.1.6: when the resolver knows the name but
+        // has no matching family, we return NOERROR + zero answers
+        // (a.k.a. NODATA).  This is the standard signal an
+        // application uses to fall through to v4.  Pinned so the
+        // happy-eyeballs joiner-side V6.A1 ranking still works
+        // when the host resolves a v4-only target.
+        val proxy = DnsProxy(resolver = FakeResolver(responses = mapOf(
+            "v4only.example" to listOf(
+                Inet4Address.getByAddress(byteArrayOf(10, 0, 0, 1)))
+        )))
+        val q = buildQuery(txid = 8, name = "v4only.example", qtype = 28 /* AAAA */)
+        val r = proxy.handle(q)!!
+        assertEquals(0, rcode(r), "NOERROR for known-v4-only + AAAA query")
+        assertEquals(0, answerCount(r), "answer count must be 0 (NODATA)")
+    }
+
     @Test fun `truncated response sets TC flag when above 512 byte UDP cap`() {
         // Construct a query whose response would exceed 512 B.
         // 60 IPv4 addrs × ~16 B per A RR = ~960 B body;
