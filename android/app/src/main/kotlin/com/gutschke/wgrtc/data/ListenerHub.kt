@@ -128,6 +128,28 @@ class ListenerHub internal constructor(
     val activeCountFlow: StateFlow<Int> = _activeCountFlow.asStateFlow()
     val activeCount: Int get() = _activeCountFlow.value
 
+    /**
+     * D4.H3 — snapshot of tunnel names currently being tracked by an
+     * active listener.  Used by [com.gutschke.wgrtc.OfferListenerService]
+     * to enrich the FGS notification body with the per-tunnel list so
+     * the host-N user can tell at a glance *which* tunnels are running
+     * without opening the app.
+     *
+     * Reads the on-disk store synchronously — file I/O on the caller's
+     * thread, which is the service's `onStartCommand` (background but
+     * not the main thread).  Returns an empty list if the listener map
+     * is empty (no FGS body enumeration to render) or the store load
+     * fails (caller falls back to a count-only body).
+     */
+    fun activeTunnelNames(): List<String> {
+        val ids = synchronized(listeners) { listeners.keys.toSet() }
+        if (ids.isEmpty()) return emptyList()
+        return store.load()
+            .filter { it.id in ids }
+            .map { it.name }
+            .filter { it.isNotBlank() }
+    }
+
     /** Each successful endpoint update fires here so observers (the
      * ViewModel) can refresh their UI state without re-reading the
      * whole tunnels.json. */

@@ -161,7 +161,15 @@ class OfferListenerService : Service() {
 
     private fun buildNotification(count: Int): Notification {
         val hidden = WgrtcApp.instance.settings.hideListenerNotification
-        return buildNotificationFor(this, count, hidden)
+        val names = try {
+            WgrtcApp.instance.listenerHub.activeTunnelNames()
+        } catch (_: Throwable) {
+            // Defensive: TunnelStore.load() may fail on a corrupt
+            // store.  Fall back to a count-only body rather than
+            // breaking the FGS-must-post-a-notification contract.
+            emptyList()
+        }
+        return buildNotificationFor(this, count, hidden, names)
     }
 
     private fun ensureChannel() {
@@ -253,13 +261,21 @@ class OfferListenerService : Service() {
 
         /**
          * Build the FGS notification.  Pure-ish factory that takes
-         * the [hidden] choice as a parameter so tests don't have to
-         * wire up [WgrtcApp] / [SettingsStore] to exercise it.
+         * the [hidden] choice and tunnel-name list as parameters so
+         * tests don't have to wire up [WgrtcApp] / [SettingsStore] /
+         * [com.gutschke.wgrtc.data.TunnelStore] to exercise it.
+         *
+         * [tunnelNames] is rendered into the BigText expanded body
+         * for the host-N case (D4.H3) — collapsed line still shows
+         * the count.  Pass an empty list when names aren't available
+         * (e.g. before the store has loaded); the expanded body then
+         * matches the collapsed contentText.
          */
         fun buildNotificationFor(
             context: Context,
             count: Int,
             hidden: Boolean,
+            tunnelNames: List<String> = emptyList(),
         ): Notification {
             val openApp = PendingIntent.getActivity(
                 context, REQ_OPEN_APP,
@@ -275,13 +291,11 @@ class OfferListenerService : Service() {
                     or PendingIntent.FLAG_UPDATE_CURRENT,
             )
             val channel = if (hidden) CHANNEL_ID_HIDDEN else CHANNEL_ID
-            val text = if (count == 0)
-                "wgrtc — listening for endpoint updates"
-            else
-                "wgrtc — tracking $count tunnel${if (count == 1) "" else "s"}"
-            return NotificationCompat.Builder(context, channel)
+            val collapsedText = collapsedBodyText(count)
+            val expandedText = expandedBodyText(count, tunnelNames)
+            val builder = NotificationCompat.Builder(context, channel)
                 .setContentTitle("wgrtc")
-                .setContentText(text)
+                .setContentText(collapsedText)
                 // stat_sys_vpn_ic is not in the public android.R;
                 // use a stable system fallback that always renders.
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
@@ -300,7 +314,47 @@ class OfferListenerService : Service() {
                     ACTION_DISMISS_LABEL,
                     dismiss,
                 )
-                .build()
+            // BigText only adds value when expanded text differs from
+            // the collapsed line.  Skip the style when there's nothing
+            // extra to show (count == 0 or names is empty) so we don't
+            // inflate the inflated-shade footprint for no reason.
+            if (expandedText != collapsedText) {
+                builder.setStyle(
+                    NotificationCompat.BigTextStyle().bigText(expandedText)
+                )
+            }
+            return builder.build()
+        }
+
+        /** Single-line body text shown when the notification is
+         * collapsed in the shade.  Counts tunnels but doesn't enumerate
+         * them — the count is the load-bearing signal at a glance. */
+        internal fun collapsedBodyText(count: Int): String =
+            if (count == 0)
+                "wgrtc — listening for endpoint updates"
+            else
+                "wgrtc — tracking $count tunnel${if (count == 1) "" else "s"}"
+
+        /** Expanded BigText body that adds the tunnel-name list under
+         * the count header — useful in the host-N case where the user
+         * wants to see *which* tunnels are tracked without opening the
+         * app.  Returns the same string as [collapsedBodyText] when
+         * there's nothing extra to render so callers can skip the
+         * BigText style. */
+        internal fun expandedBodyText(count: Int, tunnelNames: List<String>): String {
+            val header = collapsedBodyText(count)
+            if (count == 0 || tunnelNames.isEmpty()) return header
+            // Cap at five so very-large-N users don't blow out the
+            // expanded body; the trailing "+K more" preserves the
+            // total count signal.
+            val cap = 5
+            val shown = tunnelNames.take(cap)
+            val remainder = tunnelNames.size - shown.size
+            val list = if (remainder > 0)
+                shown.joinToString(", ") + ", +$remainder more"
+            else
+                shown.joinToString(", ")
+            return "$header\n$list"
         }
     }
 }
