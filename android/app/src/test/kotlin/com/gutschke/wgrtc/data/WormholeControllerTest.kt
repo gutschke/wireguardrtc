@@ -5,26 +5,16 @@ import com.goterl.lazysodium.SodiumJava
 import com.gutschke.wgrtc.signalling.Sodium
 import com.gutschke.wgrtc.signalling.WormholeTransport
 import com.gutschke.wgrtc.signalling.buildSasConfirmEnvelope
-import com.gutschke.wgrtc.signalling.buildSasConfirmMac
-import com.gutschke.wgrtc.signalling.SasConfirmRole
 import com.gutschke.wgrtc.signalling.SAS_CONFIRM_MAC_LEN
-import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterAll
-import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
@@ -34,12 +24,13 @@ import org.junit.jupiter.api.TestInstance
 /**
  * End-to-end controller tests with paired in-memory transports.
  *
- * The two paired transports route messages between an
- * [WormholeJoinController] (initiator) and a
- * [WormholeHostController] (responder) the same way the real broker
- * would: subscribe by routing-id, deliver inbound payloads tagged
- * with `src`, send-side puts envelopes into a shared in-memory
- * "broker" that demuxes by `dst`.
+ * Uses [runTest] with virtual time and a shared [backgroundScope]
+ * per test — the controllers' `parentScope` ties their launched
+ * coroutines into the test scheduler, so the test thread isn't
+ * racing wall-clock against `Dispatchers.Default` waiting for the
+ * broker subscription to register.  The previous wall-clock
+ * polling under [withTimeout] flaked when host CPU was saturated;
+ * virtual time eliminates that class of failure entirely.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class WormholeControllerTest {
@@ -49,56 +40,41 @@ class WormholeControllerTest {
     }
     @AfterAll fun restoreSodium() { Sodium.setForTest(null) }
 
-    // Recreated per test — the class is @TestInstance(PER_CLASS) so
-    // class-level vals share state; once a test cancels the rootJob,
-    // subsequent tests can't launch new coroutines on it. Wrap as
-    // lateinit + @BeforeEach to get a fresh scope each test.
-    private lateinit var rootJob: CompletableJob
-    private lateinit var rootScope: CoroutineScope
-
-    @BeforeEach fun setUp() {
-        rootJob = SupervisorJob()
-        rootScope = CoroutineScope(Dispatchers.Default + rootJob)
-    }
-    @AfterEach fun tearDown() { rootJob.cancel() }
-
-    @Test fun `happy path - joiner submits, host shows code, both confirm`() = runBlocking<Unit> {
+    @Test fun `happy path - joiner submits, host shows code, both confirm`() = runTest {
         val broker = InMemoryBroker()
         val code = "AB-CD-EF"
 
         val host = WormholeHostController(
             brokerWss = "wss://test", brokerKey = "k",
-            parentScope = rootScope,
+            parentScope = backgroundScope,
             code = code,
             transportFactory = { broker.transport(it) },
         )
         val join = WormholeJoinController(
             brokerWss = "wss://test", brokerKey = "k",
-            parentScope = rootScope,
+            parentScope = backgroundScope,
             transportFactory = { broker.transport(it) },
         )
 
         // Host subscribes immediately (UI does this from LaunchedEffect).
-        // start() dispatches the subscribe on a coroutine; wait for
-        // it to land in the broker before the joiner sends step-1.
-        // In production the network round-trip and human-typing
-        // latency hide this race; in-process they don't.
+        // start() dispatches the subscribe on a coroutine; flush the
+        // test scheduler so it lands in the broker before the joiner
+        // sends step-1.
         host.start()
-        withTimeout(2_000) {
-            while (broker.subscribers.size < 1) delay(20)
-        }
+        runCurrent()
+        assertEquals(1, broker.subscribers.size)
 
         // Joiner types code + submits. This kicks off PAKE step-1.
         join.onTyped(code)
         join.submit()
 
         // Wait for both sides to reach ConfirmingSas.
-        val joinSas = withTimeout(5_000) {
+        val joinSas =
             awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
-        } as WormholeJoinUiState.ConfirmingSas
-        val hostSas = withTimeout(5_000) {
+                as WormholeJoinUiState.ConfirmingSas
+        val hostSas =
             awaitState(host.state) { it is WormholeHostUiState.ConfirmingSas }
-        } as WormholeHostUiState.ConfirmingSas
+                as WormholeHostUiState.ConfirmingSas
 
         // Same SAS on both sides.
         assertEquals(joinSas.sas, hostSas.sas)
@@ -108,34 +84,30 @@ class WormholeControllerTest {
         host.userConfirm()
 
         // Both sides reach Succeeded.
-        withTimeout(5_000) { awaitState(join.state) { it == WormholeJoinUiState.Succeeded } }
-        withTimeout(5_000) { awaitState(host.state) { it == WormholeHostUiState.Succeeded } }
+        awaitState(join.state) { it == WormholeJoinUiState.Succeeded }
+        awaitState(host.state) { it == WormholeHostUiState.Succeeded }
     }
 
-    @Test fun `mismatched code - joiner gets a different SAS, MAC verify fails`() = runBlocking<Unit> {
+    @Test fun `mismatched code - joiner gets a different SAS, MAC verify fails`() = runTest {
         val broker = InMemoryBroker()
         val host = WormholeHostController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             code = "ABCDEF",
             transportFactory = { broker.transport(it) },
         )
         val join = WormholeJoinController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             transportFactory = { broker.transport(it) },
         )
         host.start()
-        withTimeout(2_000) {
-            while (broker.subscribers.size < 1) delay(20)
-        }
+        runCurrent()
         // Drive both sides to ConfirmingSas with the same code, then
         // have an attacker inject a corrupted MAC. The host should
         // surface MAC verification failure as a Failed state.
         join.onTyped("ABCDEF"); join.submit()
 
-        withTimeout(5_000) {
-            awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
-            awaitState(host.state) { it is WormholeHostUiState.ConfirmingSas }
-        }
+        awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
+        awaitState(host.state) { it is WormholeHostUiState.ConfirmingSas }
 
         // Inject a corrupted Confirm envelope to the host: same
         // routing-id but wrong MAC bytes. The host should fail.
@@ -152,49 +124,56 @@ class WormholeControllerTest {
             dstRoutingId = com.gutschke.wgrtc.signalling.sasRoutingIdResponder("ABCDEF".toByteArray()),
         )
 
-        // Host transitions to Failed.
-        withTimeout(5_000) {
-            awaitState(host.state) { it is WormholeHostUiState.Failed }
-        }
+        awaitState(host.state) { it is WormholeHostUiState.Failed }
     }
 
-    @Test fun `cancel from any state moves to Failed and tears down`() = runBlocking<Unit> {
+    @Test fun `cancel from any state moves to Failed and tears down`() = runTest {
         val broker = InMemoryBroker()
-        val join = WormholeJoinController(
-            "wss://test", "k", rootScope,
+        // Pair a host so the joiner's sendStep1 succeeds and the
+        // joiner reaches a non-terminal state.  Without a peer, the
+        // joiner's submit launch fails sendStep1 immediately and
+        // transitions to Failed on its own, making subsequent
+        // cancel() a no-op — that wouldn't exercise the "cancel
+        // moves to Failed" path the test name promises.
+        val host = WormholeHostController(
+            "wss://test", "k", backgroundScope,
+            code = "ABCDEF",
             transportFactory = { broker.transport(it) },
         )
+        val join = WormholeJoinController(
+            "wss://test", "k", backgroundScope,
+            transportFactory = { broker.transport(it) },
+        )
+        host.start()
         join.onTyped("ABCDEF")
         join.submit()
-        // Wait for the controller to register at the broker.
-        withTimeout(2_000) {
-            // poll
-            while (broker.subscribers.size < 1) delay(20)
-        }
+        // Run all currently-queued backgroundScope work — both
+        // controllers subscribe to the broker and the joiner's
+        // protocol kicks off.  Both should be in a non-terminal
+        // state (Confirming SAS or earlier).
+        runCurrent()
+        assertEquals(2, broker.subscribers.size)
+        assertTrue(join.state.value !is WormholeJoinUiState.Failed)
         join.cancel()
         assertTrue(join.state.value is WormholeJoinUiState.Failed)
     }
 
-    @Test fun `host dispose closes the broker session`() = runBlocking<Unit> {
+    @Test fun `host dispose closes the broker session`() = runTest {
         val broker = InMemoryBroker()
         val host = WormholeHostController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             code = "ABCDEF",
             transportFactory = { broker.transport(it) },
         )
         host.start()
-        // Wait for the subscription to register.
-        withTimeout(2_000) {
-            while (broker.subscribers.size < 1) delay(20)
-        }
+        runCurrent()
+        assertEquals(1, broker.subscribers.size)
         host.dispose()
-        // Subscription removed.
-        withTimeout(2_000) {
-            while (broker.subscribers.size > 0) delay(20)
-        }
+        runCurrent()
+        assertEquals(0, broker.subscribers.size)
     }
 
-    @Test fun ` happy path - both sides exchange enrollment info and persist results`() = runBlocking<Unit> {
+    @Test fun ` happy path - both sides exchange enrollment info and persist results`() = runTest {
         val broker = InMemoryBroker()
         val code = "ABCDEF"
         val snapshot = HostTunnelSnapshot(
@@ -215,34 +194,30 @@ class WormholeControllerTest {
             java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 44 })
 
         val host = WormholeHostController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             code = code,
             tunnelSnapshot = snapshot,
             transportFactory = { broker.transport(it) },
         )
         val join = WormholeJoinController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             deviceName = "Android phone",
             keypairOverride = joinerKp,
             transportFactory = { broker.transport(it) },
         )
 
         host.start()
-        withTimeout(2_000) {
-            while (broker.subscribers.size < 1) delay(20)
-        }
+        runCurrent()
         join.onTyped(code); join.submit()
 
-        withTimeout(5_000) {
-            awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
-            awaitState(host.state) { it is WormholeHostUiState.ConfirmingSas }
-        }
+        awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
+        awaitState(host.state) { it is WormholeHostUiState.ConfirmingSas }
 
         join.userConfirm()
         host.userConfirm()
 
-        withTimeout(5_000) { awaitState(join.state) { it == WormholeJoinUiState.Succeeded } }
-        withTimeout(5_000) { awaitState(host.state) { it == WormholeHostUiState.Succeeded } }
+        awaitState(join.state) { it == WormholeJoinUiState.Succeeded }
+        awaitState(host.state) { it == WormholeHostUiState.Succeeded }
 
         // Joiner's resultingTunnel reflects the host's payload.
         val tunnel = join.resultingTunnel.value
@@ -266,32 +241,28 @@ class WormholeControllerTest {
         assertEquals("Android phone", result.joinerNameHint)
     }
 
-    @Test fun ` host without snapshot still completes (legacy mac-only)`() = runBlocking<Unit> {
+    @Test fun ` host without snapshot still completes (legacy mac-only)`() = runTest {
         // Host configured without a snapshot → sends mac-only confirm.
         // Joiner without keypairOverride (so it generates a real one)
         // should reach Succeeded with no resultingTunnel, not fail.
         val broker = InMemoryBroker()
         val host = WormholeHostController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             code = "ABCDEF",
             tunnelSnapshot = null,
             transportFactory = { broker.transport(it) },
         )
         val join = WormholeJoinController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             transportFactory = { broker.transport(it) },
         )
         host.start()
-        withTimeout(2_000) {
-            while (broker.subscribers.size < 1) delay(20)
-        }
+        runCurrent()
         join.onTyped("ABCDEF"); join.submit()
-        withTimeout(5_000) {
-            awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
-        }
+        awaitState(join.state) { it is WormholeJoinUiState.ConfirmingSas }
         join.userConfirm()
         host.userConfirm()
-        withTimeout(5_000) { awaitState(join.state) { it == WormholeJoinUiState.Succeeded } }
+        awaitState(join.state) { it == WormholeJoinUiState.Succeeded }
         // Joiner has no tunnel because host didn't send info.
         // That's the legacy contract — Succeeded is reachable, but
         // resultingTunnel stays null. In production, host always
@@ -299,17 +270,17 @@ class WormholeControllerTest {
         assertEquals(null, join.resultingTunnel.value)
     }
 
-    @Test fun `submit with malformed code is a no-op`() = runBlocking<Unit> {
+    @Test fun `submit with malformed code is a no-op`() = runTest {
         val broker = InMemoryBroker()
         val join = WormholeJoinController(
-            "wss://test", "k", rootScope,
+            "wss://test", "k", backgroundScope,
             transportFactory = { broker.transport(it) },
         )
         join.onTyped("AB") // 2 letters — too short
         join.submit()
         // State remains EnteringCode; no broker subscription opened.
         assertTrue(join.state.value is WormholeJoinUiState.EnteringCode)
-        delay(100)
+        runCurrent()
         assertEquals(0, broker.subscribers.size)
     }
 
@@ -325,12 +296,11 @@ class WormholeControllerTest {
      * transport is subscribed under that routing-id. Drives both
      * sides of a wormhole exchange in a single test process.
      *
-     * ConcurrentHashMap is load-bearing: the broker is mutated from
-     * controller-launched coroutines on Dispatchers.Default and read
-     * from the runBlocking thread's polling loops. A plain HashMap
-     * + `synchronized` block doesn't establish a happens-before
-     * edge for the unsynchronized `subscribers.size` read in the
-     * polling loop. */
+     * Under virtual time all coroutines run on a single test thread,
+     * so a plain HashMap would technically be sufficient.  Kept as
+     * a ConcurrentHashMap for defensive consistency — the broker
+     * fake might be reused in tests that DO involve real threads
+     * (instrumented suite). */
     private class InMemoryBroker {
         val subscribers: java.util.concurrent.ConcurrentMap<String, (JsonElement) -> Unit> =
             java.util.concurrent.ConcurrentHashMap()

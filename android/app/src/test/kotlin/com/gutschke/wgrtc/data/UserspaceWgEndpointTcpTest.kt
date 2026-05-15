@@ -1,14 +1,8 @@
 package com.gutschke.wgrtc.data
 
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
-import org.junit.jupiter.api.AfterEach
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -21,34 +15,40 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * Tests for [UserspaceWgEndpoint.listenTcp] wiring.
  *
- * Each test runs the listener in a child [CoroutineScope] backed by
- * a [SupervisorJob] so we can cancel it cleanly in [tearDown]
- * without nuking the runBlocking root.
+ * Uses [runTest] with virtual time so the test scheduler controls
+ * dispatch — no real wall clock, no [kotlinx.coroutines.Dispatchers.Default].  The
+ * listener scope is `backgroundScope`, which is auto-cancelled
+ * when the test finishes, so there's no need for a manual
+ * `SupervisorJob` + `tearDown`.  Bullet-proofs the suite against
+ * host-CPU starvation that previously caused intermittent
+ * `TimeoutCancellationException` failures (FLAKE task).
  */
 class UserspaceWgEndpointTcpTest {
-
-    private val listenerJob = SupervisorJob()
-    private val listenerScope = CoroutineScope(Dispatchers.Default + listenerJob)
-
-    @AfterEach
-    fun tearDown() { listenerJob.cancel() }
 
     @Test
     fun `listenTcp registers with backend at the right port`() {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
-        endpoint.listenTcp(8080, listenerScope, { _, _ -> InetSocketAddress("9.9.9.9", 80) }) {}
-        assertEquals(listOf(8080), backend.tcpPorts)
+        // No coroutine launches here, so this test doesn't need
+        // runTest — but use the same backgroundScope shape as the
+        // other tests for consistency.
+        runTest {
+            endpoint.listenTcp(
+                8080, backgroundScope,
+                { _, _ -> InetSocketAddress("9.9.9.9", 80) },
+            ) {}
+            assertEquals(listOf(8080), backend.tcpPorts)
+        }
     }
 
     @Test
-    fun `accepted connection is wrapped and onConnection invoked`() = runBlocking<Unit> {
+    fun `accepted connection is wrapped and onConnection invoked`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         val seen = CompletableDeferred<WgTcpConnection>()
         endpoint.listenTcp(
             port = 8080,
-            scope = listenerScope,
+            scope = backgroundScope,
             targetResolver = { _, _ -> InetSocketAddress("9.9.9.9", 80) },
             onConnection = { conn -> seen.complete(conn) },
         )
@@ -57,39 +57,38 @@ class UserspaceWgEndpointTcpTest {
             listen = "10.99.0.1:8080",
             handle = ScriptedHandle(),
         )
-        val conn = withTimeout(2_000) { seen.await() }
+        val conn = seen.await()
         assertEquals("10.99.0.2", conn.peerAddress.hostString)
         assertEquals(54321, conn.peerAddress.port)
         assertEquals(InetSocketAddress("9.9.9.9", 80), conn.targetAddress)
     }
 
     @Test
-    fun `null target closes the handle and skips onConnection`() = runBlocking<Unit> {
+    fun `null target closes the handle and skips onConnection`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         val handle = ScriptedHandle()
         val invoked = AtomicInteger(0)
         endpoint.listenTcp(
             port = 8080,
-            scope = listenerScope,
+            scope = backgroundScope,
             targetResolver = { _, _ -> null },
             onConnection = { invoked.incrementAndGet() },
         )
         backend.fireTcpAccept("10.99.0.2:1", "10.99.0.1:8080", handle)
-        // Give any spurious onConnection a chance to fire (it shouldn't).
-        delay(50)
+        runCurrent() // flush any spurious onConnection launch
         assertTrue(handle.closed)
         assertEquals(0, invoked.get())
     }
 
     @Test
-    fun `target resolver receives the peer and listen addresses verbatim`() = runBlocking<Unit> {
+    fun `target resolver receives the peer and listen addresses verbatim`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         val resolverArgs = CompletableDeferred<Pair<String, String>>()
         endpoint.listenTcp(
             port = 8080,
-            scope = listenerScope,
+            scope = backgroundScope,
             targetResolver = { peer, listen ->
                 resolverArgs.complete(peer to listen)
                 InetSocketAddress("9.9.9.9", 80)
@@ -101,20 +100,20 @@ class UserspaceWgEndpointTcpTest {
             listen = "10.99.0.1:8080",
             handle = ScriptedHandle(),
         )
-        val (peer, listen) = withTimeout(2_000) { resolverArgs.await() }
+        val (peer, listen) = resolverArgs.await()
         assertEquals("10.99.0.2:54321", peer)
         assertEquals("10.99.0.1:8080", listen)
     }
 
     @Test
-    fun `forwarder errors are caught and don't kill the listener`() = runBlocking<Unit> {
+    fun `forwarder errors are caught and don't kill the listener`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         val secondCallSeen = CompletableDeferred<Unit>()
         var first = true
         endpoint.listenTcp(
             port = 8080,
-            scope = listenerScope,
+            scope = backgroundScope,
             targetResolver = { _, _ -> InetSocketAddress("9.9.9.9", 80) },
             onConnection = {
                 if (first) { first = false; throw IOException("forwarder boom") }
@@ -125,38 +124,34 @@ class UserspaceWgEndpointTcpTest {
         // Second accept after the first one's onConnection threw —
         // proves the listener is still routing.
         backend.fireTcpAccept("10.99.0.3:1", "10.99.0.1:8080", ScriptedHandle())
-        withTimeout(2_000) { secondCallSeen.await() }
-        // No assertion — withTimeout above is the assertion.
+        secondCallSeen.await()
     }
 
     @Test
-    fun `connection is closed after onConnection completes`() = runBlocking<Unit> {
+    fun `connection is closed after onConnection completes`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         val handle = ScriptedHandle()
         endpoint.listenTcp(
             port = 8080,
-            scope = listenerScope,
+            scope = backgroundScope,
             targetResolver = { _, _ -> InetSocketAddress("9.9.9.9", 80) },
             onConnection = { /* finishes immediately */ },
         )
         backend.fireTcpAccept("10.99.0.2:1", "10.99.0.1:8080", handle)
-        for (i in 0 until 50) {
-            if (handle.closed) break
-            delay(20)
-        }
+        runCurrent()
         assertTrue(handle.closed)
     }
 
     @Test
-    fun `listenTcp after close throws IllegalStateException`() {
+    fun `listenTcp after close throws IllegalStateException`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         endpoint.close()
         assertThrows(IllegalStateException::class.java) {
             endpoint.listenTcp(
                 port = 8080,
-                scope = listenerScope,
+                scope = backgroundScope,
                 targetResolver = { _, _ -> null },
                 onConnection = { },
             )
@@ -164,7 +159,7 @@ class UserspaceWgEndpointTcpTest {
     }
 
     @Test
-    fun `wrapped connection round-trips bytes via the underlying handle`() = runBlocking<Unit> {
+    fun `wrapped connection round-trips bytes via the underlying handle`() = runTest {
         val backend = TcpFakeBackend()
         val endpoint = UserspaceWgEndpoint(backend)
         val handle = ScriptedHandle().apply {
@@ -174,7 +169,7 @@ class UserspaceWgEndpointTcpTest {
         val readBack = CompletableDeferred<String?>()
         endpoint.listenTcp(
             port = 8080,
-            scope = listenerScope,
+            scope = backgroundScope,
             targetResolver = { _, _ -> InetSocketAddress("9.9.9.9", 80) },
             onConnection = { conn ->
                 val buf = ByteArray(8)
@@ -185,7 +180,7 @@ class UserspaceWgEndpointTcpTest {
             },
         )
         backend.fireTcpAccept("10.99.0.2:1", "10.99.0.1:8080", handle)
-        val v = withTimeout(2_000) { readBack.await() }
+        val v = readBack.await()
         assertEquals("hi", v)
         assertArrayEquals("ack".toByteArray(), handle.takeWrite())
     }
