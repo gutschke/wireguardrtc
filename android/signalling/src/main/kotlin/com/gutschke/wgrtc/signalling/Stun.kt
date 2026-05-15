@@ -31,7 +31,7 @@ import java.security.SecureRandom
  * (ARC), where Java's [java.net.InetAddress.getByName] resolves a
  * dual-stack STUN server's AAAA before its A record; a v4-only parser
  * silently drops every reply and the host appears to have no NAT
- * classification at all. See PS19. Daemon-side STUN is still v4-only
+ * classification at all. See. Daemon-side STUN is still v4-only
  * (raw-inject hole-punching is v4-only); the v6 path here exists
  * because v6 doesn't need raw injection — it's end-to-end with no
  * NAT.

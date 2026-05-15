@@ -130,7 +130,7 @@ internal fun parseInterfaceField(configText: String, key: String): String? {
 }
 
 /**
- * V6.H1 — return every bare IP literal from the `[Interface]
+ * return every bare IP literal from the `[Interface]
  * Address = …` lines, with `/prefix` stripped.  Accepts both
  * multi-line entries and comma-separated single-line entries,
  * mirroring wg-quick syntax.  Lines outside `[Interface]` are

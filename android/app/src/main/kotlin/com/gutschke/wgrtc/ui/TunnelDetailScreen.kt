@@ -105,7 +105,7 @@ fun TunnelDetailScreen(
     val tunnels by vm.tunnels.collectAsState()
     val isUp by vm.isActive(tunnelId).collectAsState()
     val connectingId by vm.connectingTunnelId.collectAsState()
-    // D4.H2: TunnelDetailScreen used to read vm.liveState (a
+    // TunnelDetailScreen used to read vm.liveState (a
     // legacy single-tunnel global) to derive its ConnectionState.
     // With N concurrent tunnels that's wrong — tunnel A's UP
     // would paint tunnel B's screen as Connected.  isActive(id)

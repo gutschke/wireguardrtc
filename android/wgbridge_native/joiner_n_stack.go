@@ -3,7 +3,7 @@
 // See `docs/cascade-n-design.md` §Primary architecture for the
 // packet flow.
 //
-// This file delivers the Go-side scaffolding (D4.J1): the
+// This file delivers the Go-side scaffolding: the
 // `sharedStackState` data structure, a handle map keyed off the
 // same int32 space the existing `bridges` map uses, and the
 // internal Go API for creating / closing the stack and attaching /
@@ -178,7 +178,7 @@ func newSharedStack(mtu uint32) (*sharedStackState, error) {
 		mtu:       mtu,
 	}
 	// Seed nextNicID at firstJoinerNicID; NIC `reservedKernelTunNicID`
-	// is allocated separately by [attachKernelTunNic] in D4.J2.
+	// is allocated separately by [attachKernelTunNic] in.
 	ss.nextNicID.Store(int32(firstJoinerNicID))
 	return ss, nil
 }

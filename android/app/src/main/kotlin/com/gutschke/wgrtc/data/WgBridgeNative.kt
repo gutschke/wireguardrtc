@@ -132,7 +132,7 @@ object WgBridgeNative {
     @JvmStatic external fun nativeClose(handle: Int)
 
     // ─────────────────────────────────────────────────────────
-    // D4.J3 — joiner-N shared-netstack surface.
+    // joiner-N shared-netstack surface.
     //
     // Adapts the `wgbridgeSharedStack*` //export functions from
     // `wgbridge_native/joiner_n_exports.go`. The shared stack is

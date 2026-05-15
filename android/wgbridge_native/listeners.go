@@ -68,7 +68,7 @@ import (
 // segment as a v6 address; an unbracketed `::ffff:203.0.113.5:80`
 // would be split on the wrong colon.
 //
-// V6.H2 — without this helper, the catchall forwarders rendered
+// without this helper, the catchall forwarders rendered
 // v6 source/dest as e.g. `2001:db8::5:51820` which downstream
 // `splitHostPort` calls in Kotlin couldn't disambiguate from
 // hostnames containing colons.
@@ -401,7 +401,7 @@ func wgbridgeInstallTCPForwarder(handle C.int) C.int {
 			conn := gonet.NewTCPConn(&wq, ep)
 			cs := &tcpConnState{conn: conn, listenerID: id}
 			connID := allocateTCPConnHandle(cs)
-			// V6.H2: bracket v6 addresses so the joined
+			// bracket v6 addresses so the joined
 			// `host:port` form is unambiguously parseable
 			// by Kotlin's splitHostPort consumers.
 			peer := formatEndpointAddr(tid.RemoteAddress, tid.RemotePort)
@@ -475,7 +475,7 @@ func wgbridgeInstallUDPForwarder(handle C.int) C.int {
 		conn := gonet.NewUDPConn(&wq, ep)
 		fs := &udpFlowState{conn: conn, forwarderID: id}
 		flowID := allocateUDPFlowHandle(fs)
-		// V6.H2: bracket v6 addresses (mirrors the TCP catchall).
+		// bracket v6 addresses (mirrors the TCP catchall).
 		peer := formatEndpointAddr(tid.RemoteAddress, tid.RemotePort)
 		dest := formatEndpointAddr(tid.LocalAddress, tid.LocalPort)
 		// Read the first datagram from the netstack-side conn

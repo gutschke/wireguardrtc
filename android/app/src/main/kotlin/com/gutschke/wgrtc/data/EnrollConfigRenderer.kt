@@ -37,7 +37,7 @@ import java.util.Base64
  */
 fun renderEnrollConfig(uri: EnrollUri, ok: EnrollResult.Ok): String {
  val plain: EnrollOkPlain = ok.plaintext
- // V6.A1: within each kind tier of the candidates list, prefer
+ // within each kind tier of the candidates list, prefer
  // IPv6 (RFC 8305 happy-eyeballs).  The host's overall rank
  // ordering (stun before lan, etc.) is preserved; only the
  // within-tier family preference flips when both families are

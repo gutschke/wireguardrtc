@@ -1,7 +1,7 @@
 // Joiner-N's kernel-TUN pump — moves IP packets between the
 // kernel TUN fd (NIC 0 of the shared stack) and gvisor. Production
 // versions of the functions originally drafted in
-// `kernel_tun_pump_spike_test.go` (D4.P2).
+// `kernel_tun_pump_spike_test.go`.
 //
 // One goroutine per direction:
 //

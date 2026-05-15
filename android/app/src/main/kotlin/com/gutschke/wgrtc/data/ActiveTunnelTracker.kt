@@ -13,7 +13,7 @@ import kotlinx.coroutines.flow.map
  * Two slot groups exist on Android:
  *   * **Joiner** — at most one tunnel at a time (Android's VpnService
  *     is a process-wide singleton).  Modeled as `StateFlow<String?>`.
- *   * **Host** — N concurrent tunnels since D4.H1.  Modeled as
+ *   * **Host** — N concurrent tunnels.  Modeled as
  *     `StateFlow<Set<String>>` on `HostModeBackend.activeTunnelIds`.
  *
  * The UI wants one canonical answer to "is this tunnel up?", so this

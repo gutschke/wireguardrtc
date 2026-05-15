@@ -141,7 +141,7 @@ const wgGoVersion = "f333402bd9cb"
 // the whole list — partial application would silently drop
 // addresses the operator typed.
 //
-// V6.H1: introduced for dual-stack host bridges; `10.99.0.1` and
+// introduced for dual-stack host bridges; `10.99.0.1` and
 // `10.99.0.1,fd00::1` both work.  Pure function — exhaustively
 // unit-tested in parse_local_addrs_test.go.
 func parseLocalAddrs(s string) ([]netip.Addr, error) {
@@ -172,7 +172,7 @@ func parseLocalAddrs(s string) ([]netip.Addr, error) {
 // gvisor netstack. Used by (HOST_MODE tunnels).
 //
 // `localAddrStr` may be a single address or a comma-separated
-// dual-stack list (V6.H1) — e.g. `10.99.0.1` or
+// dual-stack list — e.g. `10.99.0.1` or
 // `10.99.0.1,fd00::1`.  `netstack.CreateNetTUN` already registers
 // both v4 and v6 protocols and accepts a mixed-family slice; we
 // just plumb the parsed list through.

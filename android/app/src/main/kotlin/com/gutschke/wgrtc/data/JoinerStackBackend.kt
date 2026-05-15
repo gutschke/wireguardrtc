@@ -10,7 +10,7 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * D4.J3 — Kotlin controller for joiner-N's shared netstack.
+ * Kotlin controller for joiner-N's shared netstack.
  *
  * Parallel to [HostModeBackend] but for joiner tunnels: owns one
  * `sharedStackState` on the Go side (NIC 1 = kernel TUN; NIC 2+ =
@@ -44,7 +44,7 @@ import java.util.concurrent.ConcurrentHashMap
  * **Reconfigure model** (per `cascade-n-design.md`):  callers
  * that need to change AllowedIPs (the route table) recreate the
  * joiner via [closeJoiner] + [openJoiner].  Kernel TCP sockets
- * survive the swap because the address binding stays put — D4.P3
+ * survive the swap because the address binding stays put
  * confirmed this empirically.
  */
 class JoinerStackBackend(

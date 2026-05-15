@@ -113,7 +113,7 @@ class HostModeBackend(
     suspend fun start(tunnel: Tunnel) {
         val cfg = tunnel.toRunnerConfig()
         startMutex.withLock {
-            // D4.H4 — refuse to bring a slot up on a listen port that
+            // refuse to bring a slot up on a listen port that
             // another live slot is already using.  Paused slots are
             // bound to listen_port=0 so they don't collide today; when
             // the user resumes them, the same check fires again on
@@ -196,7 +196,7 @@ class HostModeBackend(
      * slots sequentially via [teardown] — a slow JNI close on one
      * slot blocks the rest of the sweep. Acceptable on app exit
      * (the process is leaving anyway) but not for hot-path shutdown.
-     * D4.H3: revisit if any caller needs parallel teardown — wrap
+     * revisit if any caller needs parallel teardown — wrap
      * the loop body in `parentScope.async { teardown(id) }` and
      * `awaitAll()`.
      */
@@ -269,7 +269,7 @@ class HostModeBackend(
             ?.toIntOrNull()
             ?: error("[Interface] ListenPort missing or not an integer")
         val mtu = parseInterfaceField(configText, "MTU")?.toIntOrNull() ?: defaultMtu
-        // V6.H1 — pass every bare address from the [Interface]
+        // pass every bare address from the [Interface]
         // Address line(s) to wgbridgeNew, comma-joined.  The Go
         // side splits + parses + passes the slice through to
         // netstack.CreateNetTUN (already dual-stack-capable).
@@ -314,7 +314,7 @@ class HostModeBackend(
         // route — see host_forwarder.go. Null disables through-host
         // forwarding without breaking the local-dst path.
         //
-        // V6.H2b — when the tunnel has a v6 ULA, append it
+        // when the tunnel has a v6 ULA, append it
         // (comma-separated, canonical no-whitespace form per
         // WgAllowedIps).  The Go side's wgbridgeInstallHostForwarder
         // splits the comma form and installs dual-stack routes +

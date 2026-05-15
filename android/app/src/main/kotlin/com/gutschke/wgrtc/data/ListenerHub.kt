@@ -129,7 +129,7 @@ class ListenerHub internal constructor(
     val activeCount: Int get() = _activeCountFlow.value
 
     /**
-     * D4.H3 — snapshot of tunnel names currently being tracked by an
+     * snapshot of tunnel names currently being tracked by an
      * active listener.  Used by [com.gutschke.wgrtc.OfferListenerService]
      * to enrich the FGS notification body with the per-tunnel list so
      * the host-N user can tell at a glance *which* tunnels are running

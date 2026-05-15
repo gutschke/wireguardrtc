@@ -99,7 +99,7 @@ object MtuMath {
     const val DEFAULT_WG_MTU: Int = 1420
 
     /**
-     * V6.A3 — outer-family-aware default inner MTU for a 1500-byte
+     * outer-family-aware default inner MTU for a 1500-byte
      * physical path.  Returns the same as `safeWgMtu(1500, outer)`
      * but expressed as a one-place lookup so callers can pick the
      * right default at config-parse time without needing to know
@@ -115,7 +115,7 @@ object MtuMath {
     }
 
     /**
-     * V6.A3 — classify an endpoint string by family.  Accepts:
+     * classify an endpoint string by family.  Accepts:
      *
      *  - dotted-quad v4 with or without `:port` (`203.0.113.5`,
      *    `203.0.113.5:51820`),

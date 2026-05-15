@@ -4,7 +4,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * D4.J4 — high-level orchestrator that drives [JoinerStackBackend]
+ * high-level orchestrator that drives [JoinerStackBackend]
  * across the active joiner-tunnel set. Bridges the shared-stack
  * Kotlin layer to Android's `VpnService.Builder.establish()`
  * lifecycle.
@@ -20,7 +20,7 @@ import kotlinx.coroutines.sync.withLock
  *    for a fresh fd against the union, and reopens every joiner
  *    on the new stack.
  *  - Apps' kernel TCP sockets survive the swap as long as their
- *    source addresses + routes stay in the new union — D4.P3
+ *    source addresses + routes stay in the new union
  *    confirmed the kernel-level behavior. wg-go handshake state
  *    does NOT survive (each rebuild reopens all bridges); the
  *    next handshake retransmit cycles bring tunnels back up

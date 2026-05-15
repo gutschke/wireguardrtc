@@ -81,7 +81,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * Joiner tunnels are subject to Android's per-process VpnService
  * singleton — at most one can be active at a time.  Host tunnels
  * use a separate slot group ([HostModeBackend.activeTunnelIds])
- * that allows N concurrent entries since D4.H1.
+ * that allows N concurrent entries.
  *
  * UI should not read this directly — use [activeTunnelIds] for
  * the unified view, or [isActive] for a per-tunnel boolean. */
@@ -448,7 +448,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  val updated = _tunnels.value.filterNot { it.id == id }
  _tunnels.value = updated
  withContext(Dispatchers.IO) { hub.saveTunnels(updated) }
- // D4.H2: drop cached per-tunnel flows so a long-lived
+ // drop cached per-tunnel flows so a long-lived
  // process with many rename/delete cycles can't grow the
  // caches unboundedly.  Each StateFlow was rooted in
  // viewModelScope; without eviction those subscriptions
@@ -849,7 +849,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * AllowedIPs overlap gate.  Reads the unified [activeTunnelIds]
  * directly — it already encodes the union of the joiner slot
  * ([_activeJoinerTunnelId]) and the host slot map
- * ([HostModeBackend.activeTunnelIds], N entries since D4.H1).
+ * ([HostModeBackend.activeTunnelIds], N entries).
  */
  private fun activeTunnelsForOverlapGate(): List<Tunnel> {
  val byId = _tunnels.value.associateBy { it.id }
@@ -926,7 +926,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  Log.i("wgrtc-vm", "connect: host tunnel $id is up")
  } catch (e: com.gutschke.wgrtc.data.PortCollisionException) {
  Log.w("wgrtc-vm", "host start refused: port collision", e)
- // D4.H4 — resolve the other tunnel's id to its display
+ // resolve the other tunnel's id to its display
  // name so the snackbar is human-readable.  Falls back
  // to the raw id if the tunnel was deleted between the
  // collision check and the catch.
@@ -1020,7 +1020,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  Log.i("wgrtc-vm", "connect: joiner bound + started for $id")
  val controller: com.gutschke.wgrtc.signalling
  .TunnelEndpointController = WgBridgeTunnelEndpointController(recfg, hub)
- // PS25: the JoinerVpnService is now up, which means *this*
+ // the JoinerVpnService is now up, which means *this*
  // process's default network is the VPN tun. The tun has only
  // the joiner's v4 /32 address (from `[Interface] Address`),
  // so any v6 candidate probe fails source-address selection
@@ -1269,7 +1269,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // Host-side per-tunnel "pause not teardown" — leaves
  // the wireguard-go device alive so a subsequent
  // [connect] is a fast resume instead of a full
- // close+reopen JNI cycle (F16).  [disconnectAll]
+ // close+reopen JNI cycle.  [disconnectAll]
  // bypasses this path and calls
  // [HostModeBackend.teardownAll] instead.
  try { hostBackend.stop(tunnelId) }

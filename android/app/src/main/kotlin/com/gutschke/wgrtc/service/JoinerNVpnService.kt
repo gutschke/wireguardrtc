@@ -18,7 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 
 /**
- * D4.J4 — VpnService that lets N joiner tunnels share one kernel
+ * VpnService that lets N joiner tunnels share one kernel
  * TUN via the shared-stack architecture (`docs/cascade-n-design.md`).
  * Parallel to the legacy [JoinerVpnService] for the single-joiner
  * case; the two coexist while the production code path is gated
@@ -48,7 +48,7 @@ import kotlinx.coroutines.runBlocking
  *
  * **NOT registered in AndroidManifest yet** — D4.J4 only adds the
  * Kotlin class. The manifest entry + ViewModel wiring lands with
- * the feature-flag activation step (D4.J7).
+ * the feature-flag activation step.
  */
 class JoinerNVpnService : VpnService() {
 

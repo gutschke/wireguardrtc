@@ -76,7 +76,7 @@ fun TunnelListScreen(
     val tunnels by vm.tunnels.collectAsState()
     val activeIds by vm.activeTunnelIds.collectAsState()
     val connectingId by vm.connectingTunnelId.collectAsState()
-    // D4.H2: dropped vm.liveState — it's a singular legacy signal
+    // dropped vm.liveState — it's a singular legacy signal
     // that can't tell two concurrent tunnels apart.  Per-row state
     // is now (isActive contains id, connectingId == id) only.
     val error by vm.lastError.collectAsState()
@@ -208,7 +208,7 @@ private fun TunnelCard(
     } else {
         Icons.Outlined.Login to MaterialTheme.colorScheme.primary
     }
-    // D4.H2: state derives from per-tunnel signals only —
+    // state derives from per-tunnel signals only —
     // `isActive` from the unified active set, `isConnecting` from
     // the in-flight connect id.  No global liveState read here.
     val state = when {

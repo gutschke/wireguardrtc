@@ -55,7 +55,7 @@ class OfferListenerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // UX1: a user tapping the notification's "Stop tracking"
+        // a user tapping the notification's "Stop tracking"
         // action delivers an Intent with action ACTION_DISMISS back
         // to us.  We must still call startForeground() within the
         // 5-second window before bailing — Android enforces it for
@@ -185,7 +185,7 @@ class OfferListenerService : Service() {
         const val NOTIFICATION_ID = 1
         const val TAG = "wgrtc-svc"
 
-        // UX1: notification action that the user can tap to stop
+        // notification action that the user can tap to stop
         // the FGS without going to Settings.  Routed back to
         // [onStartCommand] which calls stopForeground(REMOVE) +
         // stopSelf().  Choosing a service-targeted intent (rather
@@ -266,7 +266,7 @@ class OfferListenerService : Service() {
          * [com.gutschke.wgrtc.data.TunnelStore] to exercise it.
          *
          * [tunnelNames] is rendered into the BigText expanded body
-         * for the host-N case (D4.H3) — collapsed line still shows
+         * for the host-N case — collapsed line still shows
          * the count.  Pass an empty list when names aren't available
          * (e.g. before the store has loaded); the expanded body then
          * matches the collapsed contentText.

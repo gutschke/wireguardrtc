@@ -1,4 +1,4 @@
-// JNI surface (D4.J3) — `//export`-marked C-callable wrappers for
+// JNI surface — `//export`-marked C-callable wrappers for
 // the joiner-N shared-stack API. Each function adapts the
 // internal Go types (`*sharedStackState`, `netip.Prefix`, ...) to
 // the (handle, char*, length) shapes the JNI C wrappers in

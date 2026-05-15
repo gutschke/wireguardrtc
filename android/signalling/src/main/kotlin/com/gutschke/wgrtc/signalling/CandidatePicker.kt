@@ -105,7 +105,7 @@ fun pickReceiverCandidates(
 }
 
 /**
- * V6.A1 — happy-eyeballs preference for the joiner's enrollment
+ * happy-eyeballs preference for the joiner's enrollment
  * config picker.  Within each [EndpointCandidate.kind] tier
  * (`"stun"` / `"lan"` / `"mesh"` / null), float v6 entries to the
  * front while preserving relative order between entries of the

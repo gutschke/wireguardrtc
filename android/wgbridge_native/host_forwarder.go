@@ -96,7 +96,7 @@ type hostForwarderState struct {
 	tcpRedirs atomic.Int64
 	udpRedirs atomic.Int64
 	tempAddrN atomic.Int64
-	// V6.H2b — counts packets dropped because the IP version or
+	// counts packets dropped because the IP version or
 	// next-header isn't one we handle (e.g. IPv6 Fragment).
 	// Exposed for diagnostic tests (`TestHandleOutboundDispatches…`)
 	// to actively assert the DROP branch fired rather than
@@ -119,9 +119,9 @@ func extractChannelEndpoint(n *netstack.Net) *gvchannel.Endpoint {
 // is the WG-side subnet(s) kept on NIC1; everything else gets
 // routed via NIC2 + the forwarder goroutine.
 //
-// V6.H2b: `peerSubnet` is now a comma-separated CIDR list
+// `peerSubnet` is now a comma-separated CIDR list
 // (e.g. `"10.99.0.0/24,fd00:dead:beef::/64"`) — same wire format
-// as `wgbridgeNew` (V6.H1).  Whitespace tolerated on input.  When
+// as `wgbridgeNew`.  Whitespace tolerated on input.  When
 // a v6 entry is present, the forwarder also installs a v6 route +
 // enables ipv6 forwarding + registers the ICMPv6 transport handler
 // so non-local v6 destinations route through the same forwarder
@@ -156,7 +156,7 @@ func wgbridgeInstallHostForwarder(handle C.int,
 		return -3
 	}
 	peerSubnetsGo := C.GoStringN(peerSubnetStr, C.int(peerSubnetLen))
-	// V6.H2b — split on comma + trim each entry (whitespace
+	// split on comma + trim each entry (whitespace
 	// tolerated on input but never emitted on output).  Sort
 	// entries by family so we have at most one v4 + at most one
 	// v6.  Extra entries of the same family are silently ignored;
@@ -269,7 +269,7 @@ func wgbridgeInstallHostForwarder(handle C.int,
 	stk.SetTransportProtocolHandler(header.ICMPv4ProtocolNumber,
 		state.handleLocalICMP)
 	if v6Net != nil {
-		// V6.H2b — same temp-local-addr ICMP gap exists for v6;
+		// same temp-local-addr ICMP gap exists for v6;
 		// install the sibling handler.
 		stk.SetTransportProtocolHandler(header.ICMPv6ProtocolNumber,
 			state.handleLocalICMPv6)
@@ -391,7 +391,7 @@ func (s *hostForwarderState) handleOutboundV4(raw []byte) {
 // the IPv6 fixed header, dispatches ICMPv6 echo via the v6 ping
 // helper, redirects TCP/UDP via temp-local v6 addresses on NIC1.
 //
-// V6.H2b: this is the entry point for through-host v6 forwarding.
+// this is the entry point for through-host v6 forwarding.
 // Non-local v6 dsts (anything outside the host's `subnetV6`) reach
 // NIC2 via the route table installed by `wgbridgeInstallHostForwarder`;
 // without this handler they'd be silently dropped by gvisor's IPv6
@@ -491,7 +491,7 @@ func (s *hostForwarderState) handleOutboundICMP(ip header.IPv4, raw []byte) {
 // `icmpx.ListenPacket("udp6", "::")`) and injecting the reply
 // back through NIC1's channel endpoint with `WritePackets`.
 //
-// V6.H2b: mirrors the v4 path's ident-preservation trick — the
+// mirrors the v4 path's ident-preservation trick — the
 // kernel rewrites the ident on outbound ICMPv6, so we cache the
 // joiner's original ident and re-stamp it on the synthesised
 // reply.
@@ -992,7 +992,7 @@ func (s *hostForwarderState) closeForwarder() {
 		return
 	}
 	s.stop()
-	// V6.H2b: the shared pingWg covers both v4 and v6 ping
+	// the shared pingWg covers both v4 and v6 ping
 	// goroutines (dispatchPing + dispatchPingV6 both call
 	// `s.pingWg.Add(1)/Done()`).  This Wait() therefore drains
 	// in-flight pings of either family before NIC tear-down.
