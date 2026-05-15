@@ -583,6 +583,29 @@ func TestHandleOutboundDispatchesByIPVersion(t *testing.T) {
 				state.unsupportedDrops.Load())
 		}
 	})
+	t.Run("v6-ICMP-non-echo-reaches-handler-without-side-effect", func(t *testing.T) {
+		// V6.H2b — proves dispatch reach into handleOutboundICMPv6
+		// without making a real network call.  NeighborSolicit
+		// (type 135) fails the EchoRequest filter at the top of
+		// handleOutboundICMPv6 and returns synchronously, so no
+		// goroutine spawns and no counter changes.  If a future
+		// edit moves the proto-58 case out of handleOutboundV6,
+		// the dispatch would land in the v6 default branch and
+		// bump unsupportedDrops — this test would then fail and
+		// flag the regression.
+		state := newDispatchTestState()
+		pkt := buildV6NeighborSolicit(t,
+			net.ParseIP("fd00::2"), net.ParseIP("ff02::1:ff00:1"))
+		state.handleOutbound(pkt)
+		if state.unsupportedDrops.Load() != 0 {
+			t.Fatalf("unexpected unsupportedDrops bump for v6 NS: got %d (regression — ICMPv6 dispatch broken)",
+				state.unsupportedDrops.Load())
+		}
+		if state.pingsSent.Load() != 0 {
+			t.Fatalf("NeighborSolicit must not trigger an outbound ping; got pingsSent=%d",
+				state.pingsSent.Load())
+		}
+	})
 }
 
 // newDispatchTestState builds a `hostForwarderState` minimal
@@ -673,6 +696,32 @@ func buildV6UDP(t *testing.T, src, dst net.IP, sport, dport uint16) *gvstack.Pac
 	udpHdr.SetSourcePort(sport)
 	udpHdr.SetDestinationPort(dport)
 	udpHdr.SetLength(uint16(header.UDPMinimumSize))
+	buf := buffer.MakeWithData(pktBytes)
+	return gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{Payload: buf})
+}
+
+// buildV6NeighborSolicit builds a v6 packet whose ICMPv6 type is
+// 135 (NeighborSolicit) — exercises the proto-58 dispatch in
+// handleOutboundV6 without spawning a real ping (the filter in
+// handleOutboundICMPv6 rejects anything that isn't EchoRequest).
+// Checksum is left zero; handleOutboundICMPv6 doesn't validate it.
+func buildV6NeighborSolicit(t *testing.T, src, dst net.IP) *gvstack.PacketBuffer {
+	t.Helper()
+	const nsBodyLen = 24 // 4 (reserved) + 16 (target addr) + 4 (option type+len padding)
+	totalLen := header.IPv6MinimumSize + header.ICMPv6MinimumSize + nsBodyLen
+	pktBytes := make([]byte, totalLen)
+	ip := header.IPv6(pktBytes[:header.IPv6MinimumSize])
+	ip.Encode(&header.IPv6Fields{
+		PayloadLength:     uint16(header.ICMPv6MinimumSize + nsBodyLen),
+		TransportProtocol: header.ICMPv6ProtocolNumber,
+		HopLimit:          255,
+		SrcAddr:           tcpip.AddrFromSlice(src.To16()),
+		DstAddr:           tcpip.AddrFromSlice(dst.To16()),
+	})
+	icmp := header.ICMPv6(pktBytes[header.IPv6MinimumSize:])
+	icmp.SetType(135) // NeighborSolicit
+	icmp.SetCode(0)
+	icmp.SetChecksum(0)
 	buf := buffer.MakeWithData(pktBytes)
 	return gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{Payload: buf})
 }
