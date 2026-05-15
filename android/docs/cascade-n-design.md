@@ -238,7 +238,7 @@ in. The Go side doesn't change for cascade.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Reconfigure on add/remove drops TCP across surviving joiners | **Low** | Kernel TCP is 4-tuple-keyed; survives the swap as long as source addrs + routes match (see analysis above). Validated by **D4.J5**. |
+| Reconfigure on add/remove drops TCP across surviving joiners | **Low** | Empirically validated at the Linux-kernel level by `docs/probes/d4p3_tcp_survives_tun_rebuild.sh`: a TUN device teardown + recreate with identical address+route preserves both LISTEN sockets and ESTABLISHED 4-tuples; `omega` flowed through a pre-existing connection across the swap. The kernel doesn't garbage-collect bound sockets when their address temporarily disappears. End-to-end Android validation through `Builder.establish()` still needs interactive consent + `D4.J5` instrumented run (the `appops` consent trick is documented as ineffective on Android 14+ per memory; user must tap the dialog). |
 | Shared gvisor NIC routing conflict on overlapping AllowedIPs | Medium | `TunnelOverlapGuard` already refuses overlap; **D4.J6** extends it to joiner-vs-joiner. |
 | `Builder.establish()` returns null (user revoked VPN consent) | Medium | Surface as a per-tunnel error; pause all joiners until consent restored. Already handled for the single-joiner path. |
 | Brief packet loss during TUN swap noticed by latency-sensitive apps | Low | TCP retransmits; UDP loses ≤ 1 datagram. Documented in UI banner. |
