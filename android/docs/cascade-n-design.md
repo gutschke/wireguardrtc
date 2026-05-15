@@ -1,8 +1,8 @@
-# Cascade-N Design — D4 phase 2
+# Joiner-N + Cascade-N Design — D4 phase 2
 
-> Status: **DRAFT — awaiting user confirmation on scope interpretation.**
+> Status: **DRAFT — Option 1 primary; ready for review.**
 > Author: agentic / supervised
-> Last touched: 2026-05-14
+> Last touched: 2026-05-15
 
 ## Background
 
@@ -10,271 +10,276 @@ D4 phase 1 (host-N) shipped in commits `eea8e00..6ef5949`:
 
 - `HostModeBackend` keeps a `ConcurrentHashMap<TunnelId, Slot>` of N
   independent wireguard-go bridges (`D4.H1`).
-- `WgrtcViewModel.activeTunnelIds` is a unified flow of the joiner
-  singleton plus the host set; per-tunnel `throughputFor(id)` /
-  `peerStatsFor(id)` / `isActive(id)` flows are `WhileSubscribed`-cached
-  (`D4.H2`).
-- FGS notification body enumerates active tunnel names via BigText
-  (`D4.H3`).
-- `PortCollisionException` fail-fast at `HostModeBackend.start()`
-  before wireguard-go's bind surfaces an opaque EADDRINUSE (`D4.H4`).
-- Instrumented coexistence + collision tests under real JNI on
-  x86_64 emulator and ARC ChromeOS (`D4.H5`).
+- `WgrtcViewModel.activeTunnelIds` is a unified flow; per-tunnel
+  `throughputFor(id)` / `peerStatsFor(id)` / `isActive(id)` flows
+  are `WhileSubscribed`-cached (`D4.H2`).
+- FGS notification body enumerates active tunnel names (`D4.H3`).
+- `PortCollisionException` fail-fast (`D4.H4`).
+- Instrumented coexistence + dual-stack inner-v6 tests under real
+  JNI on x86_64 emulator and ARC ChromeOS (`D4.H5`).
 
-The user signed off on phase 1 with the directive:
+Phase 2 generalises **joiner** tunnels to N concurrent, and layers
+**cascade** routing on top of that for host tunnels that want to
+egress via a joiner.
 
-> *"option 2 [cascade-N] as not going to be used as often, but would
->  be a very real distinguishing feature and probably isn't as hard
->  to implement after all, considering our unique architecture. i
->  think we should give it a try after completion of option 1. start
->  by a detailed plan, risk assessment and maybe some prototypes to
->  confirm our assumptions."*
+## Primary architecture — Joiner-N
 
-This doc is that plan.
+> N joiner-mode tunnels concurrently active. Phone connects to
+> multiple remote networks at once (home + work + hotel + …).
 
-## Scope interpretations — which "cascade-N" do we want?
+### The Android constraint, and why our existing stack absorbs it
 
-The user's prior message clusters several adjacent ideas under
-"cascade-N". I want to pick one before designing; the architectures
-diverge enough that a wrong pick wastes weeks.
+Android caps the device at one `VpnService` system-wide. That cap
+binds the *kernel TUN*, not our routing logic. We already have
+every other piece we need:
 
-### Interpretation 1 — Multiple joiner tunnels on one device ("Joiner-N")
+- `wgbridge_native` runs wireguard-go in userspace-netstack mode
+  (the existing `open(localAddr, mtu, listenPort)` path used by
+  every host tunnel).
+- gvisor handles IP routing inside our process today (host-side
+  catchall + through-host forwarder, V6.H1/H2/H2b).
+- N concurrent wireguard-go instances in one process is already
+  validated — `twoHostTunnelsCoexistUnderRealJni` proves it on
+  real JNI as of `6ef5949`.
 
-> N joiner-mode tunnels concurrently reachable. Phone connects to
-> multiple remote networks at once.
-
-- **Constraint**: Android caps the device at *one* `VpnService` at a
-  time, system-wide. `VpnService.prepare(ctx)` returns one consent
-  Intent; one `Builder.establish()` produces one TUN; a second call
-  on a different `VpnService` subclass kills the first.
-- This means joiner-N must share a single `VpnService` between N
-  joiner wireguard-go devices — there's no kernel-level way around
-  the cap.
-
-### Interpretation 2 — Multi-hop cascade ("Cascade-N proper")
-
-> One joiner tunnel relays for N host tunnels. The phone hosts N
-> tunnels whose outbound traffic egresses via the joiner tunnel
-> instead of the phone's OS network. Already-working `D3 — Validate
-> two-tunnel cascading` is the *1-host-through-1-joiner* version of
-> this; cascade-N generalises the host side.
-
-- **Constraint**: today the host bridge's gvisor netstack egresses
-  via OS sockets (`EgressSelector.socketFactory()` → JVM `Socket`).
-  For cascade, those sockets need to ride the joiner's WG tunnel,
-  i.e. their packets need to enter the joiner's kernel TUN instead
-  of the OS routing table.
-- The user already validated `D3`. Cascade-N is: "all N host tunnels
-  cascade through the same single joiner."
-
-### Interpretation 3 — Both 1 and 2 combined
-
-> N joiner tunnels AND N host tunnels, with N×M routing flexibility.
-
-- Architecturally a superset of 1 and 2. Probably too ambitious for
-  one cycle.
-
-### My read
-
-The hint *"probably isn't as hard to implement after all, considering
-our unique architecture"* points at **Interpretation 2** — the
-existing userspace gvisor netstack is the natural place to route
-host-side traffic through a joiner tunnel. Interpretation 1 would
-require a major refactor of `JoinerVpnService` to be a multi-tenant
-TUN, which our "unique architecture" doesn't particularly help with.
-
-**Recommendation: confirm scope with user before writing more code.**
-
-The rest of this doc assumes **Interpretation 2** unless otherwise
-noted. Sections marked **[I1]** apply only to Interpretation 1.
-
-## Today's joiner / host plumbing
+So joiner-N is *one new wiring shape*, not new infrastructure:
 
 ```
-                    +--- OS network ------------+
-                    |                           |
-   (kernel)         |                           |
-+--TUN(joiner)--+   |  +-OS socket-+            |
-|               |   |  |           |            |
-|  wireguard-go |---+  |  protect()|            |
-|  (joiner)     |      |  outbound |            |
-+---------------+      +-----------+            |
-                            |                   |
-                            v                   |
-                    +-- the wider internet -----+
-                                ^
-                                |
-+-- gvisor netstack(host) --+   |  OS socket egress
-|  wireguard-go(host)       |---+
-|  Catchall TCP/UDP         |
-|  Catchall ICMP            |
-+---------------------------+
+                   apps
+                    |
+                    v
+         +----- kernel tun0 ------+    <-- single VpnService TUN
+         |  routes: union of all  |        addresses: union of all
+         |  joiners' AllowedIPs   |        joiners' [Interface]
+         +-----------+------------+        Address lines
+                     |
+                     v
+         +---- gvisor netstack ----+    <-- routes by dst IP across
+         |   NIC0 = kernel-TUN     |        N+1 NICs
+         |   NIC1 = wg-joiner #1   |
+         |   NIC2 = wg-joiner #2   |
+         |   …                     |
+         |   NICk = wg-joiner #k   |
+         +-+----+----+----+--------+
+           |    |    |    |
+           v    v    v    v
+        wg-go wg-go wg-go wg-go      <-- N userspace instances,
+        (#1)  (#2)  (#3)  (#k)           each with its own UDP
+           \    |    |    /              outer-transport socket
+            \   |    |   /
+         +---- OS sockets ----+        <-- protect()'d so they
+         |  one per joiner   |            bypass the VpnService TUN
+         +--------+----------+
+                  |
+                  v
+              wire
 ```
 
-- Joiner: VpnService TUN → wireguard-go encrypts → OS UDP socket
-  (`protect()`-ed) → wire.
-- Host: gvisor netstack receives plaintext packets from joiners;
-  every catchall forwarder opens a fresh OS socket via
-  `EgressSelector` and writes the payload there.
+**Packet flow**:
 
-**Cascade-N changes the second leg.** Host-side OS sockets need to
-route through the joiner's WG tunnel instead of the phone's WAN.
+- *Outbound* (app → remote network): app writes to `tun0`; our
+  reader pumps bytes into gvisor's NIC0; gvisor's routing table
+  picks the matching joiner's NIC by longest-prefix match on the
+  destination; that joiner's wg-go encrypts and sends on its
+  protected UDP socket.
 
-## Cascade-N target architecture (Interpretation 2)
+- *Inbound* (remote network → app): joiner's UDP socket receives;
+  wg-go decrypts; plaintext IP packet lands on that joiner's
+  gvisor NIC; gvisor routes it to NIC0 (the kernel TUN); our
+  writer pushes it to `tun0`; kernel delivers to the app.
+
+### Reconfigure model — preserving TCP across tunnel set changes
+
+`Builder.addRoute()` must be called *before* `establish()`, so any
+change to the joiner set forces a `Builder.establish()` rebuild.
+But the rebuild is much less disruptive than first feared:
+
+- **Kernel TCP state survives** the swap if the surviving joiners'
+  source addresses and routes are unchanged in the new union.
+  Open sockets are 4-tuple-keyed in the kernel; they don't bind to
+  TUN identity. Packets drop for the millisecond between old TUN
+  release and new TUN ready; TCP retransmits cover it.
+- **Our gvisor flow tables survive** unconditionally — gvisor is
+  in-process state. We just close the old TUN fd and pass gvisor
+  the new one; the NIC0 reader/writer rebinds.
+- **Wireguard-go sessions survive** unconditionally — each wg-go
+  owns its own UDP outer socket, has its own session state,
+  doesn't see the kernel TUN at all.
+
+So the per-action picture:
+
+| Action | What dies | What lives |
+|---|---|---|
+| Add joiner | nothing (brief packet loss during swap) | every existing TCP through every existing joiner |
+| Remove joiner | TCP through the removed joiner | TCP through every other joiner |
+| Edit joiner AllowedIPs (shrink) | TCP whose dst is no longer covered | everything still in coverage |
+| Edit joiner AllowedIPs (grow) | nothing | everything |
+| MTU floor changes | nothing immediately (PMTUD recovers in-flight) | everything |
+
+This matches the use case: user sets up "home + work + hotel
+guest network" once and leaves it; the rare add/remove costs at
+most the connections explicitly tied to the affected tunnel.
+
+### UI implication
+
+A small, non-blocking banner when the user is about to add or
+remove a joiner — "Other VPN connections may briefly interrupt"
+— is appropriate; a full confirm dialog is overkill given how
+rare reconfigure is in the target use case.
+
+### Go-side surface change
+
+`wgbridge_native` today exports two open paths:
+
+- `open(localAddr, mtu, listenPort)` — netstack mode (host).
+- `openWithTunFd(fd, mtu)` — TUN-fd mode (joiner today).
+
+Joiner-N replaces the second with a third:
+
+- `openIntoSharedNetstack(handle, localAddr, mtu)` — opens a wg-go
+  in netstack mode and attaches it as a *NIC* on a pre-existing
+  shared gvisor netstack (created by us). Multiple joiners can
+  attach to the same shared netstack; routes are programmed per
+  AllowedIPs.
+
+Plus one path to wire the kernel TUN as gvisor's "NIC0":
+
+- `bindKernelTunToSharedNetstack(handle, tunFd, mtu)` — starts a
+  read goroutine that pumps the TUN fd into NIC0 and a write
+  callback that delivers gvisor egress back to the TUN.
+
+Total estimate: ~200 LOC in `wgbridge_native/`, plus a
+`JoinerStackBackend` class on the Kotlin side parallel to today's
+`HostModeBackend`.
+
+### Tasks (Joiner-N)
+
+- **D4.J1** — `wgbridge_native`: shared-netstack handle +
+  `openIntoSharedNetstack` Go API + JNI binding. Unit-tested in
+  Go (no Android required).
+- **D4.J2** — `wgbridge_native`: `bindKernelTunToSharedNetstack`
+  + read/write pumps. Tested with a Linux `/dev/net/tun` fixture.
+- **D4.J3** — Kotlin `JoinerStackBackend` parallel to
+  `HostModeBackend`. Same slot-map / pause-resume discipline.
+  Owns the shared netstack handle; spawns / tears down NICs as
+  joiners come and go.
+- **D4.J4** — `JoinerVpnService` rewrite: maintains the kernel TUN,
+  rebuilds `Builder.establish()` on the *set* of active joiners.
+  Debounce reconfigures (200ms) to coalesce rapid add/remove.
+- **D4.J5** — TCP preservation instrumented test: bring up two
+  joiners with overlap-free AllowedIPs; open a TCP socket through
+  joiner-1 (sandbox is the remote); add a third joiner; verify the
+  TCP socket survives. Run on emulator (v4 outer + dual-stack
+  inner) and ARC.
+- **D4.J6** — `TunnelOverlapGuard` updated: refuse joiner-vs-joiner
+  AllowedIPs overlap (gvisor needs unambiguous longest-prefix
+  match). Today the guard already exists for host-vs-active; just
+  extend the active set.
+- **D4.J7** — UI: non-blocking banner on add/remove of a joiner.
+  "Other VPN connections may briefly interrupt."
+- **D4.J8** — Real-device validation: phone connects to home +
+  work simultaneously. Phone shares both via host-N (cascade
+  comes after). User-driven.
+
+Estimated total: ~10 commits, mostly mechanical once D4.J1–J3 are
+in. The risky/novel commits are D4.J1 and D4.J2 (Go + JNI).
+
+## Secondary architecture — Cascade-N (on top of Joiner-N)
+
+Once joiner-N is in, cascade is a small egress routing toggle:
+
+> Per host tunnel, optionally route the host's gvisor egress
+> through a named joiner instead of the OS network.
+
+Today `HostModeBackend.toRunnerConfig()` wires
+`EgressSelector.socketFactory()` → JVM `Socket` (OS-routed). For
+cascade, that factory becomes:
 
 ```
-                    +--- OS network ------------+
-                    |                           |
-+--TUN(joiner)--+   |  +-OS socket-+            |
-|               |   |  |           |            |
-|  wireguard-go |---+  |  protect()|            |
-|  (joiner)     |      +-----^-----+            |
-+--^------------+            |                  |
-   |    (3) cascade route    |  (1) joiner outbound
-   |                         |
-   |  (2) host gvisor egress |
-   |                         |
-+--+---- gvisor netstack(host N) ----+
-|  wireguard-go(host)                 |
-|  Catchall TCP/UDP routes through    |
-|  → joiner TUN instead of OS         |
-+-------------------------------------+
+egressFactoryForHost(hostId):
+  return socketFactory whose .createSocket(...) opens a TCP/UDP
+  flow inside the shared joiner netstack on NIC(joinerId-for-host).
 ```
 
-Path (2) → (3) is the new code:
+gvisor already supports this — it has a netstack-internal
+`socket.NewEndpoint(...)` API used by anyone writing a flow into
+gvisor from outside. The host's gvisor catchall would dial via
+this instead of via `java.net.Socket`. The wg-go on the cascade
+joiner sees an inner packet whose source is the joiner's interface
+address; encrypts; sends.
 
-1. Catchall forwarder receives plaintext from a host's joiner peer.
-2. Instead of `socketFactory.createSocket(...)` (OS-rooted), the
-   forwarder calls into a new `JoinerCascadeEgress` that:
-   - Takes the destination IP + port + protocol.
-   - Constructs a raw IP packet and writes it into the joiner's
-     userspace netstack (or onto its TUN fd).
-3. wireguard-go (joiner) encrypts and sends.
+### Tasks (Cascade-N)
 
-### Where the joiner's TUN fits
+- **D4.C1** — Per-host-tunnel "cascade upstream" setting
+  (`TunnelStore`). Choices: `os` (default) or `joiner:<id>`.
+- **D4.C2** — `JoinerStackEgressFactory` — a `SocketFactory` /
+  UDP egress factory that opens flows inside the shared joiner
+  netstack. Implementation re-uses gvisor's user-facing socket
+  API.
+- **D4.C3** — Routing-loop guard: refuse cascade when host
+  subnet ⊆ joiner AllowedIPs (would loop back into the cascading
+  host).
+- **D4.C4** — UI: host detail screen shows "Egress via {joiner
+  name}" + a warning when the named joiner is down.
+- **D4.C5** — MTU floor: cascade adds inner WG overhead; host
+  tunnel's `MTU` floor recomputed against `joiner.mtu − overhead`.
+- **D4.C6** — Instrumented end-to-end: emulator hosts a host
+  tunnel + a joiner tunnel; sandbox WG client connects to the
+  host; host's egress cascades through the joiner; second sandbox
+  WG client (on the joiner side) sees the traffic.
+- **D4.C7** — Real-device validation: Pixel hosts + cascades
+  through a Chromebook joiner upstream; sandbox is the joining
+  peer. User-driven.
 
-Two sub-options for path (3):
-
-**Option A — Write directly to the joiner's TUN fd**
-
-Bypass the cascade host's gvisor and write the packet directly to the
-joiner's kernel TUN (the one the joiner's wireguard-go reads from).
-Joiner's wireguard-go then matches the packet's destination against
-its peer's AllowedIPs and encrypts.
-
-Risks:
-- Requires source-IP rewriting so the inner header looks like it
-  comes from the joiner's interface address.
-- Joiner-side reply packets land on the TUN with the joiner's
-  interface IP as destination. We'd need to copy them back into the
-  host's gvisor to deliver to the host's joiner peer.
-- IPv6: the joiner's TUN might be v4-only or v6-only; cascade-N
-  needs to handle mismatches gracefully.
-
-**Option B — Cascade via the existing host-forwarder + a second
-gvisor NIC bonded to the joiner's TUN**
-
-Mirror the existing `host_forwarder.go` (V6.H2b ICMPv6 etc.) but
-target NIC2 = joiner-TUN-backed instead of NIC2 = OS-route-backed.
-The joiner's TUN fd is opened twice (once by wireguard-go via the
-Android Builder, once by us via `dup()` for the gvisor side).
-
-Risks:
-- Double-open on a Builder.establish() TUN fd is undocumented.
-  Needs spike to confirm Android lets us `dup()` and use the
-  duplicate concurrently with wireguard-go reading the original.
-- Synchronisation: both wireguard-go and our gvisor would be
-  writing inbound bytes to the same TUN. Packet ordering / locking
-  is delicate.
-
-Option A is simpler if we accept the source-IP rewrite. Option B
-keeps the architecture symmetric with through-host forwarder.
-
-### Prototypes I want to run before committing
-
-1. **`dup(TUN_fd)` smoke test** — call `Builder.establish()` from
-   `JoinerVpnService`, immediately `Os.dup(pfd.fileDescriptor)`,
-   write a hand-crafted IP packet to the dup'd fd, see if it shows
-   up on the wire (encrypted by the joiner wg-go). 30-line spike
-   in instrumented test. Decides Option A vs Option B.
-
-2. **Inner-source IP rewrite** — verify that writing a packet whose
-   source IP is `joiner.iface.address.0/32` actually elicits a
-   correct reply path. The joiner host's WG peer needs to see
-   "this is from my client" — if we use the joiner's own interface
-   IP, replies come back to us; if we use the host-tunnel client's
-   inner IP, the joiner-host peer needs that IP in its AllowedIPs.
-
-3. **Cross-stack TCP handshake** — wire a single cascade flow
-   through a unit/instrumented test rig: emulator hosts a host
-   tunnel + joiner tunnel; a sandbox WG client connects to the
-   host tunnel and tries to TCP-connect to an IP only reachable
-   via the joiner. Pass = SYN reaches the joiner-side WG peer.
-
-## Cascade-N target architecture (Interpretation 1, **[I1]**)
-
-For completeness, Interpretation 1 ("multiple joiner VPNs on one
-phone") would require:
-
-- Subclass `VpnService` with a TUN configured for the union of all
-  active joiner tunnels' AllowedIPs.
-- Internal "joiner router" that:
-  - Demuxes outbound packets from the TUN by destination IP →
-    matches an active joiner's AllowedIPs → hands to that joiner's
-    wireguard-go.
-  - Multiplexes inbound packets from N OS UDP sockets back to one
-    TUN (already true at the kernel level — TUN is one fd).
-- Reconciler for AllowedIPs overlap: today
-  `TunnelOverlapGuard.firstOverlap` refuses to bring up overlapping
-  tunnels; would need to be relaxed for joiner-N or per-flow
-  routing rules added.
-
-Risk: this is a much bigger lift than Interpretation 2 and doesn't
-benefit nearly as much from the existing userspace gvisor netstack
-— it's net-new packet routing code at the VPN-edge layer.
+Estimated total: ~5 commits, mostly Kotlin wiring once D4.J3 is
+in. The Go side doesn't change for cascade.
 
 ## Risk register
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| `dup(TUN_fd)` not allowed by Android security policy on some OEMs | Medium | Spike on x86_64 emulator + arm64 Pixel + ARC ChromeOS before committing |
-| Inner-source-IP rewrite breaks reply-path | Medium | Test 3 above — early instrumented end-to-end before more code |
-| MTU stacking eats payload (outer joiner WG ≈ 1380; cascade inner WG ≈ 1340) | Low | Already handled for V6 MTU; extend `MtuMath` to cascade case |
-| Joiner tunnel goes down mid-cascade → all N host tunnels lose egress | High | Status banner on each host tunnel UI when cascading + joiner is down |
-| Cascade introduces a routing loop (host tunnel's gvisor routes packet to its own joiner peer which routes back) | High | Strict AllowedIPs check + drop if dst ∈ host tunnel's own subnet |
-| ChromeOS ARC's VpnService is per-applicationId; cascade between apps not possible | Low | Document, don't fix |
-| `JoinerVpnServiceBinding` lifetime tied to single tunnel id today; cascade requires a long-lived joiner regardless of which host tunnels are up | Medium | Refactor `connectJob` / `disconnect(id)` paths so joiner stays alive for any active cascading host |
-| Performance: every cascaded byte traverses gvisor twice (host stack + joiner stack) | Medium | Profile after first end-to-end works; userspace WG already has overhead so additive cost may be tolerable |
+| Reconfigure on add/remove drops TCP across surviving joiners | **Low** | Kernel TCP is 4-tuple-keyed; survives the swap as long as source addrs + routes match (see analysis above). Validated by **D4.J5**. |
+| Shared gvisor NIC routing conflict on overlapping AllowedIPs | Medium | `TunnelOverlapGuard` already refuses overlap; **D4.J6** extends it to joiner-vs-joiner. |
+| `Builder.establish()` returns null (user revoked VPN consent) | Medium | Surface as a per-tunnel error; pause all joiners until consent restored. Already handled for the single-joiner path. |
+| Brief packet loss during TUN swap noticed by latency-sensitive apps | Low | TCP retransmits; UDP loses ≤ 1 datagram. Documented in UI banner. |
+| MTU floor reduction on add invalidates in-flight large TCP packets | Low | PMTUD handles it within RTT; no app intervention needed. |
+| N wireguard-go instances overload the Go runtime | Low | Host-N already runs N concurrent instances cleanly. Same pattern. |
+| `bindKernelTunToSharedNetstack` read goroutine blocks under load | Medium | Use a buffered channel; cap to MTU × ringsize; drop oldest on overflow with logging. Standard gvisor pattern. |
+| Cascade routing loop (host's gvisor egresses via a joiner whose AllowedIPs covers the host's subnet) | High → mitigated | **D4.C3** static check refuses the config. |
+| Cascade joiner goes down mid-flow | Medium | Host tunnel's catchall gets `EHOSTUNREACH` from the joiner stack; surface in host detail UI. |
+| Per-applicationId VPN consent (ChromeOS ARC) | Low | Document; no fix needed — already the existing constraint. |
 
-## Tasks I'd cut if we agree on Interpretation 2
+## Open questions
 
-- **D4.C1** — `dup(TUN_fd)` spike (instrumented test). Pass = JNI write to dup'd fd produces encrypted wire traffic.
-- **D4.C2** — `JoinerCascadeEgress` interface + a NIC-2 wiring inside `wgbridge_native/host_forwarder.go`. Plumb a target-mode toggle: `NIC2_TARGET = os | joiner-fd`.
-- **D4.C3** — Cascade routing config: per-host-tunnel "cascade through joiner X" setting in `TunnelStore`. Default off.
-- **D4.C4** — Inner-source-IP rewrite in the cascade path.
-- **D4.C5** — Status banner: host tunnel UI shows "cascading via {joiner name}" + warning when joiner is down.
-- **D4.C6** — Routing-loop guard: refuse cascade when host tunnel's subnet overlaps the joiner's AllowedIPs.
-- **D4.C7** — Instrumented end-to-end on emulator + ARC: sandbox WG client → emulator host tunnel → cascade → joiner → second sandbox WG client receives traffic.
-- **D4.C8** — Real-device validation: Pixel as host+cascade, Chromebook as joiner upstream, sandbox as joining peer.
+1. **Joiner-N first?** Yes; joiner-N is the bigger architectural lift.
+   Cascade-N becomes ~5 commits of Kotlin glue once joiner-N is in.
+2. **Joiner-side "cascade-available" opt-in?** Plausible default:
+   any joiner whose AllowedIPs is `0.0.0.0/0` is offered as a
+   cascade upstream; otherwise opt-in via a per-tunnel toggle.
+3. **Per-flow vs per-tunnel cascade routing?** Per-tunnel for v1.
+   Per-flow (split-tunnel routing inside a host) is a v2 feature
+   if anyone asks for it.
+4. **Reconfigure debounce window?** 200ms feels right (user
+   tapping "Add" then "Add" rapidly should coalesce). Confirm
+   on the first real-device test.
 
-Estimated total: ~5–10 commits, mostly inside `wgbridge_native/`
-and the host-side egress wiring. Joiner-side code change is small
-(expose the TUN fd as an opaque write-target so wgbridge can hand
-it to its host forwarders).
+## Prototypes I'd run before any production code
 
-## Open questions for the user
+1. **`bindKernelTunToSharedNetstack` spike** — open a kernel TUN
+   via `VpnService.Builder` in an instrumented test, hand the fd
+   to a stub Go function that just reads packets and logs
+   src/dst. Confirms the read pump works on real Android (vs the
+   Linux fixture). 1 commit.
+2. **Two-NIC gvisor netstack** — Go-side test (no Android): create
+   a gvisor stack with two NICs, program a route, push an IP
+   packet into NIC0, assert it lands on NIC1. Confirms gvisor
+   API surface matches our needs. 1 commit.
+3. **Kernel-TCP-survives-rebuild spike** — instrumented test that
+   does `Builder.establish()` twice with identical addresses +
+   routes, verifies an app socket (opened between the two
+   `establish` calls) keeps working. Confirms the TCP-preservation
+   thesis empirically on the emulator + ARC. 1 commit.
 
-1. **Scope:** Interpretation 1 (joiner-N) or Interpretation 2
-   (cascade-N as I've described)? Or both?
-2. **Joiner-side cooperation:** If Interpretation 2, do we want the
-   user to mark a joiner tunnel as "available as cascade upstream"
-   (opt-in toggle), or auto-discover from `AllowedIPs = 0.0.0.0/0`?
-3. **Per-flow routing later?** Today we'd cascade entire host
-   tunnels through one joiner; flow-level routing (some traffic via
-   joiner, some via OS) is out of scope for this cycle but worth
-   confirming the user agrees.
-4. **MTU policy when cascading:** auto-recompute the cascading host
-   tunnel's MTU floor to `1280 − wg-overhead − wg-overhead`? Or
-   leave it to the user / tunnel author?
-
-I'll wait for the scope confirmation before starting any prototypes.
+Three prototypes, each independent, each retiring a separate
+assumption. If any one fails we pause and re-plan before committing
+to the rest. **D4.J1** doesn't start until the three pass.
