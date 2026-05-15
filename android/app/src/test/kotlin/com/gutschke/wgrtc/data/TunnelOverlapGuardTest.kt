@@ -86,6 +86,30 @@ class TunnelOverlapGuardTest {
         assertNull(TunnelOverlapGuard.firstOverlap(cand, listOf(a)))
     }
 
+    @Test fun `D4_J6 — three-joiner scenario rejects the third whose AllowedIPs overlap the first`() {
+        // The joiner-N production model lets a user keep many joiner
+        // tunnels active simultaneously. The overlap guard is the
+        // load-bearing piece that prevents the user from configuring
+        // an ambiguous routing scenario — two joiners both claiming
+        // 10.99.0.0/24 would force gvisor to pick one arbitrarily
+        // per the longest-prefix-match rules, which the user has no
+        // way to predict.
+        //
+        // This test pins the invariant against future regressions:
+        // when N joiners are already active, the guard MUST iterate
+        // every one of them, not just the most-recently-added.  The
+        // production ViewModel passes `activeTunnelIds` (D4.H2's
+        // unified flow) verbatim, so the guard sees them all.
+        val home = joinerTunnel("home", "10.99.0.0/24")
+        val work = joinerTunnel("work", "192.168.5.0/24")
+        // A third tunnel that overlaps `home` but is disjoint from
+        // `work` — the guard must still report `home` as the conflict,
+        // not silently allow because `work` didn't overlap.
+        val collidesWithHome = joinerTunnel("hotel", "10.99.0.128/25")
+        assertEquals(home,
+            TunnelOverlapGuard.firstOverlap(collidesWithHome, listOf(home, work)))
+    }
+
     @Test fun `full-tunnel joiner blocks any other tunnel`() {
         val fullTunnel = joinerTunnel("full", "0.0.0.0/0,::/0")
         val cand = joinerTunnel("narrow", "10.0.0.0/24")
