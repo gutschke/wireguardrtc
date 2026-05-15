@@ -26,9 +26,22 @@ object ActiveTunnelTracker {
      * `hostIds`.  Used at call-sites that need an immediate value
      * rather than collecting a flow. */
     fun union(joinerId: String?, hostIds: Set<String>): Set<String> =
-        if (joinerId == null) hostIds
-        else if (hostIds.isEmpty()) setOf(joinerId)
-        else hostIds + joinerId
+        union(joinerId, hostIds, emptySet())
+
+    /** Three-source union: legacy single-joiner slot, host set, and
+     * the joiner-N shared-stack set.  All three are mutually exclusive
+     * by design (the flag picks one joiner path), but we union
+     * unconditionally so a half-rebuild state never claims more
+     * tunnels are down than actually are. */
+    fun union(
+        joinerId: String?,
+        hostIds: Set<String>,
+        joinerNIds: Set<String>,
+    ): Set<String> = buildSet {
+        if (joinerId != null) add(joinerId)
+        addAll(hostIds)
+        addAll(joinerNIds)
+    }
 
     /** Flow form of [union] — emits the merged set whenever either
      * input changes.  Distinct-by-value so identical re-emits from
@@ -37,7 +50,16 @@ object ActiveTunnelTracker {
         joiner: Flow<String?>,
         host: Flow<Set<String>>,
     ): Flow<Set<String>> =
-        combine(joiner, host) { j, h -> union(j, h) }
+        combine(joiner, host) { j, h -> union(j, h, emptySet()) }
+            .distinctUntilChanged()
+
+    /** Flow form including the joiner-N shared-stack set. */
+    fun combinedFlow(
+        joiner: Flow<String?>,
+        host: Flow<Set<String>>,
+        joinerN: Flow<Set<String>>,
+    ): Flow<Set<String>> =
+        combine(joiner, host, joinerN) { j, h, jn -> union(j, h, jn) }
             .distinctUntilChanged()
 
     /** Per-tunnel membership flow — emits true when [id] is in either
@@ -50,6 +72,17 @@ object ActiveTunnelTracker {
         host: Flow<Set<String>>,
     ): Flow<Boolean> =
         combinedFlow(joiner, host)
+            .map { it.contains(id) }
+            .distinctUntilChanged()
+
+    /** Per-tunnel membership flow including the joiner-N set. */
+    fun isActiveFlow(
+        id: String,
+        joiner: Flow<String?>,
+        host: Flow<Set<String>>,
+        joinerN: Flow<Set<String>>,
+    ): Flow<Boolean> =
+        combinedFlow(joiner, host, joinerN)
             .map { it.contains(id) }
             .distinctUntilChanged()
 }

@@ -49,6 +49,46 @@ class ActiveTunnelTrackerTest {
     }
 
     @Test
+    fun `three-source union adds joiner-N set to the merge`() {
+        assertEquals(setOf("jn1"),
+            ActiveTunnelTracker.union(null, emptySet(), setOf("jn1")))
+        assertEquals(setOf("h1", "jn1", "jn2"),
+            ActiveTunnelTracker.union(null, setOf("h1"), setOf("jn1", "jn2")))
+        assertEquals(setOf("j1", "h1", "jn1"),
+            ActiveTunnelTracker.union("j1", setOf("h1"), setOf("jn1")))
+    }
+
+    @Test
+    fun `three-source union dedupes across all three slots`() {
+        assertEquals(setOf("x"),
+            ActiveTunnelTracker.union("x", setOf("x"), setOf("x")))
+    }
+
+    @Test
+    fun `three-source combinedFlow reflects joiner-N updates`() = runTest {
+        val joiner = MutableStateFlow<String?>(null)
+        val host = MutableStateFlow<Set<String>>(emptySet())
+        val joinerN = MutableStateFlow<Set<String>>(emptySet())
+        val emissions = mutableListOf<Set<String>>()
+        val job = launch {
+            ActiveTunnelTracker.combinedFlow(joiner, host, joinerN)
+                .collect { emissions += it }
+        }
+        runCurrent()
+        joinerN.value = setOf("jn1")
+        runCurrent()
+        joinerN.value = setOf("jn1", "jn2")
+        runCurrent()
+        joinerN.value = emptySet()
+        runCurrent()
+        job.cancel()
+        assertEquals(
+            listOf(emptySet(), setOf("jn1"), setOf("jn1", "jn2"), emptySet()),
+            emissions,
+        )
+    }
+
+    @Test
     fun `union dedupes if joiner id is also somehow in the host set`() {
         // Defensive: shouldn't happen at runtime (the two slot groups
         // are independent), but the helper must not produce a
