@@ -92,4 +92,29 @@ class SettingsStoreTest {
         s.resetToDefaults()
         assertEquals(EgressPolicy.OsDefault, s.egressPolicy)
     }
+
+    @Test fun `joinerNEnabled defaults to false`() {
+        val s = SettingsStore.forTestInMemory()
+        assertEquals(false, s.joinerNEnabled)
+        assertEquals(false, s.joinerNEnabledFlow.value)
+    }
+
+    @Test fun `joinerNEnabled round-trips through persistence`() {
+        val s = SettingsStore.forTestInMemory()
+        s.joinerNEnabled = true
+        assertEquals(true, s.joinerNEnabled)
+        assertEquals(true, s.joinerNEnabledFlow.value)
+    }
+
+    @Test fun `joinerNEnabled reads back persisted value on construction`() {
+        val s = SettingsStore.forTestInMemory(mapOf("joiner_n_enabled" to "true"))
+        assertEquals(true, s.joinerNEnabled)
+    }
+
+    @Test fun `resetToDefaults clears joinerNEnabled`() {
+        val s = SettingsStore.forTestInMemory()
+        s.joinerNEnabled = true
+        s.resetToDefaults()
+        assertEquals(false, s.joinerNEnabled)
+    }
 }

@@ -207,6 +207,13 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.outlineVariant,
             )
             Spacer(Modifier.height(16.dp))
+            ExperimentalSection(settings)
+
+            Spacer(Modifier.height(24.dp))
+            androidx.compose.material3.HorizontalDivider(
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+            Spacer(Modifier.height(16.dp))
             NotificationSection(settings)
 
             Spacer(Modifier.height(24.dp))
@@ -298,6 +305,46 @@ private fun NotificationSection(settings: SettingsStore) {
                 // change wouldn't be visible until the next
                 // listener-count change.
                 com.gutschke.wgrtc.WgrtcApp.instance.ensureListenerServiceRunning()
+            },
+        )
+    }
+}
+
+/**
+ * Experimental-features section. Holds opt-in flags for code paths
+ * that are functionally complete but not yet validated on real-
+ * world workloads. Each toggle should ship behind a "(experimental)"
+ * label and concrete prose so the user knows what changes.
+ */
+@Composable
+private fun ExperimentalSection(settings: SettingsStore) {
+    val joinerN by settings.joinerNEnabledFlow.collectAsState()
+    Text("Experimental", style = MaterialTheme.typography.titleMedium)
+    Spacer(Modifier.height(8.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "Multi-joiner shared tunnel",
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                "Lets the app keep more than one joiner-mode tunnel " +
+                    "up at the same time by sharing one Android VPN " +
+                    "slot across all of them. The default single-" +
+                    "joiner path is unchanged when this is off. Turn " +
+                    "it off again if joining a tunnel ever fails after " +
+                    "an upgrade.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = joinerN,
+            onCheckedChange = { newValue ->
+                settings.joinerNEnabled = newValue
             },
         )
     }

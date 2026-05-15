@@ -47,6 +47,8 @@ class SettingsStore internal constructor(private val backing: Backing) {
         parseEgressPolicy(backing.getString(K_EGRESS_POLICY)))
     private val _hideListenerNotification = MutableStateFlow(
         backing.getString(K_HIDE_LISTENER_NOTIFICATION) == "true")
+    private val _joinerNEnabled = MutableStateFlow(
+        backing.getString(K_JOINER_N_ENABLED) == "true")
 
     val defaultBrokerWssFlow: StateFlow<String> = _wss.asStateFlow()
     val defaultBrokerKeyFlow: StateFlow<String> = _key.asStateFlow()
@@ -63,6 +65,14 @@ class SettingsStore internal constructor(private val backing: Backing) {
      * app backgrounding) — only the visible badge is hidden. */
     val hideListenerNotificationFlow: StateFlow<Boolean> =
         _hideListenerNotification.asStateFlow()
+
+    /** When true, joiner-mode tunnels share one VpnService TUN
+     * through a userspace gvisor netstack (see
+     * `docs/cascade-n-design.md`). Default false — single-joiner
+     * path is the legacy behavior that ships unchanged across
+     * upgrades. Marked experimental in the UI until V1 real-device
+     * validation. */
+    val joinerNEnabledFlow: StateFlow<Boolean> = _joinerNEnabled.asStateFlow()
 
     var defaultBrokerWss: String
         get() = _wss.value
@@ -92,6 +102,13 @@ class SettingsStore internal constructor(private val backing: Backing) {
             _hideListenerNotification.value = value
         }
 
+    var joinerNEnabled: Boolean
+        get() = _joinerNEnabled.value
+        set(value) {
+            backing.putString(K_JOINER_N_ENABLED, value.toString())
+            _joinerNEnabled.value = value
+        }
+
     /**
      * Whether the first-launch onboarding has been completed.
      * Read once on Application startup to decide whether the user
@@ -112,6 +129,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         backing.remove(K_BROKER_KEY)
         backing.remove(K_EGRESS_POLICY)
         backing.remove(K_HIDE_LISTENER_NOTIFICATION)
+        backing.remove(K_JOINER_N_ENABLED)
         // K_HOSTING_MODE / K_JOINER_BACKEND keys removed in
         // when wireguard-android went away; we also drop any
         // legacy persisted values so they don't linger in prefs.
@@ -121,6 +139,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         _key.value = WormholeDefaults.BROKER_KEY
         _egress.value = EgressPolicy.OsDefault
         _hideListenerNotification.value = false
+        _joinerNEnabled.value = false
     }
 
     data class Snapshot(val brokerWss: String, val brokerKey: String)
@@ -132,6 +151,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         private const val K_EGRESS_POLICY = "egress_policy"
         private const val K_ONBOARDING_SEEN = "onboarding_seen"
         private const val K_HIDE_LISTENER_NOTIFICATION = "hide_listener_notification"
+        private const val K_JOINER_N_ENABLED = "joiner_n_enabled"
         // Legacy keys — read only during resetToDefaults() to
         // scrub leftover prefs from pre- installs. Never
         // written.
