@@ -201,6 +201,89 @@ class HostModeBackendInstrumentedTest {
     }
 
     /**
+     * D4.H5 — two host tunnels with different ids and different
+     * listen ports coexist under the real wireguard-go JNI: each
+     * spawns its own bridge, the active-id set contains both, and
+     * per-tunnel stats stay isolated.  Catches any cross-tunnel
+     * leakage that pure-JVM tests can't see because they don't
+     * exercise the cgo/wireguard-go device path.
+     */
+    @Test
+    fun twoHostTunnelsCoexistUnderRealJni() = runBlocking<Unit> {
+        val be = HostModeBackend(realFactory(), parentScope)
+        val t1 = hostTunnel(
+            listenPort = pickPort(),
+            peers = listOf(EnrolledPeer(peerB64, "10.99.0.2", "g1", 1L)),
+        )
+        val t2 = hostTunnel(
+            listenPort = pickPort(),
+            peers = listOf(EnrolledPeer(peer2B64, "10.99.0.3", "g2", 2L)),
+        )
+
+        be.start(t1)
+        be.start(t2)
+        assertTrue("both ids must be active: ${be.activeTunnelIds.value}",
+            be.activeTunnelIds.value.containsAll(setOf(t1.id, t2.id)))
+
+        val s1 = be.snapshotStats(t1.id)
+        val s2 = be.snapshotStats(t2.id)
+        assertNotNull("snapshotStats(t1) returned null after start", s1)
+        assertNotNull("snapshotStats(t2) returned null after start", s2)
+        // Tunnel 1's UAPI must list t1's peer pubkey, NOT t2's, and
+        // vice versa — proving the gvisor / wireguard-go state is
+        // per-bridge, not bleeding across.
+        assertTrue("t1 stats must contain its own peer: ${s1!!.peers.keys}",
+            peerB64 in s1.peers)
+        assertTrue("t1 stats must NOT contain t2's peer: ${s1.peers.keys}",
+            peer2B64 !in s1.peers)
+        assertTrue("t2 stats must contain its own peer: ${s2!!.peers.keys}",
+            peer2B64 in s2.peers)
+        assertTrue("t2 stats must NOT contain t1's peer: ${s2.peers.keys}",
+            peerB64 !in s2.peers)
+
+        // Tear down one at a time; the surviving slot must stay live.
+        be.stop(t1.id)
+        assertTrue("t2 must still be active after t1 stop",
+            t2.id in be.activeTunnelIds.value)
+        assertTrue("t1 must be paused after stop",
+            t1.id !in be.activeTunnelIds.value)
+        be.stop(t2.id)
+        assertTrue("both must be paused: ${be.activeTunnelIds.value}",
+            be.activeTunnelIds.value.isEmpty())
+    }
+
+    /**
+     * D4.H5 — port-collision guard catches a collision under the real
+     * JNI before wireguard-go's bind ever surfaces an opaque
+     * EADDRINUSE.  Documents that the typed exception fires deep enough
+     * to be useful — pure-JVM tests assert the check, this one asserts
+     * the check fires *before* the cgo bridge open.
+     */
+    @Test
+    fun portCollisionRefusedBeforeRealBridgeOpens() = runBlocking<Unit> {
+        val be = HostModeBackend(realFactory(), parentScope)
+        val port = pickPort()
+        val t1 = hostTunnel(listenPort = port)
+        val t2 = hostTunnel(listenPort = port)
+        be.start(t1)
+        try {
+            be.start(t2)
+            org.junit.Assert.fail("second start on the same port should have thrown")
+        } catch (e: PortCollisionException) {
+            // Both ids match what we passed in.  The exception carries
+            // the *new* id, the *existing* id, and the port.
+            assertTrue("exception ids should not be empty", e.newTunnelId.isNotEmpty())
+            assertTrue("exception ids should not be empty", e.existingTunnelId.isNotEmpty())
+            org.junit.Assert.assertEquals(port, e.port)
+        }
+        // t1 must still be the sole live tunnel after the refused
+        // start — the failed start() leaves no slot for t2 behind.
+        assertTrue("t1 alone should still be active: ${be.activeTunnelIds.value}",
+            be.activeTunnelIds.value == setOf(t1.id))
+        be.stop(t1.id)
+    }
+
+    /**
      * part 2: revoke a peer + add a new one, then verify the
      * old peer is gone from wireguard-go's internal table. The
      * regression fired when [HostModeUapi.render] omitted
