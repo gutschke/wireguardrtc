@@ -47,6 +47,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
 	gvstack "gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -54,6 +55,30 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
+
+// formatEndpointAddr produces a `host:port` or `[host]:port`
+// string from a gvisor [tcpip.Address] + port.  V6 addresses are
+// bracketed so the result is unambiguously parseable by Kotlin
+// (`splitHostPort` and friends).  V4 addresses are emitted
+// dotted-quad style.
+//
+// V4-mapped v6 (e.g. `::ffff:203.0.113.5`) is bracketed too,
+// since gvisor's `tcpip.Address` reports it as 16 bytes — the
+// receiver needs to know to parse the whole bracket-contents
+// segment as a v6 address; an unbracketed `::ffff:203.0.113.5:80`
+// would be split on the wrong colon.
+//
+// V6.H2 — without this helper, the catchall forwarders rendered
+// v6 source/dest as e.g. `2001:db8::5:51820` which downstream
+// `splitHostPort` calls in Kotlin couldn't disambiguate from
+// hostnames containing colons.
+func formatEndpointAddr(addr tcpip.Address, port uint16) string {
+	s := addr.String()
+	if addr.Len() == 16 {
+		return fmt.Sprintf("[%s]:%d", s, port)
+	}
+	return fmt.Sprintf("%s:%d", s, port)
+}
 
 // listenerState is the union of TCP / UDP listener and
 // forwarder bookkeeping. We keep them in a single map keyed by
@@ -376,8 +401,11 @@ func wgbridgeInstallTCPForwarder(handle C.int) C.int {
 			conn := gonet.NewTCPConn(&wq, ep)
 			cs := &tcpConnState{conn: conn, listenerID: id}
 			connID := allocateTCPConnHandle(cs)
-			peer := fmt.Sprintf("%s:%d", tid.RemoteAddress, tid.RemotePort)
-			dest := fmt.Sprintf("%s:%d", tid.LocalAddress, tid.LocalPort)
+			// V6.H2: bracket v6 addresses so the joined
+			// `host:port` form is unambiguously parseable
+			// by Kotlin's splitHostPort consumers.
+			peer := formatEndpointAddr(tid.RemoteAddress, tid.RemotePort)
+			dest := formatEndpointAddr(tid.LocalAddress, tid.LocalPort)
 			cPeer := C.CString(peer)
 			cDest := C.CString(dest)
 			C.wgbridge_dispatch_tcp_forwarded_accept(
@@ -447,8 +475,9 @@ func wgbridgeInstallUDPForwarder(handle C.int) C.int {
 		conn := gonet.NewUDPConn(&wq, ep)
 		fs := &udpFlowState{conn: conn, forwarderID: id}
 		flowID := allocateUDPFlowHandle(fs)
-		peer := fmt.Sprintf("%s:%d", tid.RemoteAddress, tid.RemotePort)
-		dest := fmt.Sprintf("%s:%d", tid.LocalAddress, tid.LocalPort)
+		// V6.H2: bracket v6 addresses (mirrors the TCP catchall).
+		peer := formatEndpointAddr(tid.RemoteAddress, tid.RemotePort)
+		dest := formatEndpointAddr(tid.LocalAddress, tid.LocalPort)
 		// Read the first datagram from the netstack-side conn
 		// so we can hand its payload to Java with the
 		// flow-open callback. Subsequent datagrams in this

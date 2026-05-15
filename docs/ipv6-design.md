@@ -380,3 +380,33 @@ Test additions:
 - DNS proxy v6 upstream (`DnsProxy.kt` resolves via `InetAddress.getAllByName` which already returns both families) — but the catchall UDP forwarder that intercepts joiner DNS queries is v4-only.  V6.H3.
 
 Files: `android/wgbridge_native/api.go`, `android/wgbridge_native/parse_local_addrs_test.go`, `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostTunnelSnapshotBuilder.kt`, `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostModeBackend.kt`, tests in matching test trees.
+
+### V6.H2 — 2026-05-13
+
+Bracket v6 addresses in the `peer/dest` strings the catchall forwarders dispatch into Java.  Pre-V6.H2 the Go side did:
+
+```go
+peer := fmt.Sprintf("%s:%d", tid.RemoteAddress, tid.RemotePort)
+dest := fmt.Sprintf("%s:%d", tid.LocalAddress, tid.LocalPort)
+```
+
+For v4 (`203.0.113.5`) that produces `203.0.113.5:51820` — fine.  For v6 (`2001:db8::5`) it produces `2001:db8::5:51820` — ambiguous (could be a v6 host with no port, or v6+port).  The Kotlin parsers use `lastIndexOf(':')` and would silently split on the wrong colon, sending traffic to `2001:db8::5:51820` as if it were the host part, then failing in `InetSocketAddress` construction.
+
+Fix: new `formatEndpointAddr(addr tcpip.Address, port uint16) string` helper that brackets v6 (`addr.Len() == 16`) and leaves v4 alone (`addr.Len() == 4`).  Wired into both TCP and UDP catchall callbacks in `listeners.go`.
+
+Worth noting: the Kotlin-side `parseHostPort` in both `TcpForwarderHandler.kt` and `UdpForwarderHandler.kt` was already v6-bracket-aware (it uses `s.substring(0, colon).trim().trim('[', ']')`).  V6.H2 just fixes the *producer* side — the consumer was already correct.
+
+V4-mapped v6 (`::ffff:cb00:7105`) is also bracketed; gvisor reports it as 16 bytes regardless of the trailing v4 octets, so bracketing keeps the receiver-side parse unambiguous.
+
+Test additions:
+
+- `format_endpoint_test.go` (Go, 7 tests): v4 dotted-quad, v6 bracketed with port, v6 loopback (`[::1]:53`), v4 loopback retains form, zero port for both families, v4-mapped v6 stays bracketed (pinning gvisor's `::ffff:cb00:7105` rendering rather than the dotted-quad sugar).
+
+8/8 Go tests pass; full Go + JVM suites green.
+
+**Not addressed in V6.H2:**
+
+- ICMP forwarder (`host_forwarder.go`) still IPv4-only — `gvipv4.ICMPTypeEcho` / `buildIPv4ICMPEchoReply` / `inEp.InjectInbound(gvipv4.ProtocolNumber, …)`.  V6 needs separate ICMPv6 handling (echo type 128, separate checksum, etc.) — that's a larger deliverable.  When the host-side gets a v6 address (V6.2) and a joiner pings v6, ICMPv6 from the joiner will land at the netstack but the through-host forwarder won't know what to do with it.  This is V6.H2b or later.
+- The catchall handler bridges any inbound packet of the right transport protocol REGARDLESS of network family, so once V6.H1 + V6.H2 are in place, a v6 TCP SYN from a joiner WILL fire the same `tcp.NewForwarder` handler and bracket the addresses correctly.  The forwarder's downstream — `TcpForwarderHandler.run()` opening an OS socket via `SocketFactory.createSocket(host, port)` — handles `host` as either v4 or v6 string fine; Java's `InetSocketAddress(host, port)` resolves both.  So the END-TO-END v6 TCP+UDP path through the host should work once V6.H1 + V6.H2 are deployed AND the host has a v6 `[Interface] Address`.
+
+Files: `android/wgbridge_native/listeners.go`, `android/wgbridge_native/format_endpoint_test.go`.
