@@ -439,3 +439,43 @@ Files: `android/app/src/test/kotlin/com/gutschke/wgrtc/data/DnsProxyTest.kt` (re
 
 - The joiner has to actually USE the host's v6 address as DNS in its wg-quick `DNS = …` line for the v6 path to fire.  Today host enrolment renders `DNS = <host's v4 WG-side address>` (`buildHostTunnelSnapshot` derives one address).  When V6.2 lands v6 host addresses, the enrolment payload should emit `DNS = <v4-host>, <v6-host>` so the joiner has both.  V6.2 / V6.3 territory.
 - ICMPv6 from joiner → host's gvisor stack (e.g. `ping6 fd00::1`) — still v4-only via `host_forwarder.go`'s ICMP path.  Same H2-deferred work.
+
+### V6.PL — 2026-05-14
+
+Plausibility verification for the random-ULA design before committing to V6.2 wire-up.  Three test layers, each strictly more demanding:
+
+**Layer 1 — gvisor netstack with ULA (Go, 6 tests in `v6_plausibility_test.go`):**
+
+- `netstack.CreateNetTUN([]netip.Addr{ULA}, ...)` accepts a v6 ULA in the address list AND registers the v6 NIC at that address (gvisor stack source: registers `ipv6.NewProtocol` unconditionally + `AddProtocolAddress` per-entry based on `ip.Is6()`; adds `header.IPv6EmptySubnet` default route when at least one v6 address is present).
+- Same `*netstack.Net` can `ListenTCP([fd00::1]:8080)` AND `DialTCP([fd00::1]:8080)` — `HandleLocal: true` in CreateNetTUN routes same-stack traffic via the loopback path.  Bytes flow round-trip.
+- Dual-stack registration (`[]netip.Addr{v4, v6}`) works for both families simultaneously with no cross-talk.
+- Documented limitation pinned: gvisor's TCP `ListenTCP` rejects `[::]` (IPv6 unspecified) as a wildcard bind address — only specific-address binds work for v6.  `wgbridgeListenTCP` uses `IPv4zero` which works as v4 wildcard.  Doesn't matter in production because the catchall TCP/UDP forwarder operates at the transport-protocol level via `tcp.NewForwarder`, not a port-bound listener.
+
+**Layer 2 — catchall TCP forwarder fires on v6 traffic (Go, 2 tests):**
+
+- Install the same `tcp.NewForwarder(stack, ...)` that production code uses, dial a v6 destination from inside the stack, verify the forwarder callback fires AND the delivered `tcpip.Address` has `.Len() == 16` (v6 family).  Format the address via `formatEndpointAddr` (V6.H2 helper) and confirm it produces a bracket-parseable `[fd00::1]:port` string.
+- Regression-pin: registering a v6 NIC alongside v4 doesn't break the v4 catchall path.  Same handler fires for v4 SYNs, delivers a 4-byte `tcpip.Address` (v4 family).
+
+**Layer 3 — real WG tunnel with v6 inner traffic (Android instrumented, `HostNativeV6SelfLoopTest`):**
+
+Two `wgbridge_native` instances in one process, each registered with `localAddr = "10.99.0.1,fd00::1"` and `"10.99.0.2,fd00::2"` respectively.  Peer's `allowed_ip` lines include both families.  Pins:
+
+1. `wgbridgeNew("10.99.0.1,fd00::1", ...)` accepts the comma-joined dual-stack address (V6.H1 wire-in).
+2. WG handshake completes on a dual-stack bridge (UAPI `last_handshake_time_sec > 0` on both sides).
+3. `allowed_ip=fd00::1/128` and `allowed_ip=fd00::2/128` survive the UAPI round-trip (`nativeSnapshotUAPI` returns dual-stack lines).
+4. `nativeDialTcp(clientHandle, "[fd00::1]:9999")` returns `-4` (`DialTCP failed`) — the SYN reached the server's gvisor netstack, hit no listener at port 9999, and bounced back as a RST.  If wireguard-go had blocked v6 at the AllowedIPs gate or the gvisor stack had no v6 route, we'd see a different failure mode (parse error -3, or timeout / hang).  The -4 confirms v6 packets traversed the WG layer correctly.
+
+**Results:** 8/8 Go tests pass.  Layer-3 instrumented test passes on emulator (174 ms) AND ChromeOS ARC (186 ms).  Confirmed:
+
+- gvisor accepts ULA addresses, registers a v6 NIC, routes traffic correctly
+- catchall forwarder is family-agnostic — same handler fires for v4 + v6 SYNs
+- wireguard-go's AllowedIPs filter honours v6 entries; v6 packets cross the WG tunnel both directions
+- V6.H1 (dual-stack address list) + V6.H2 (bracket v6 in forwarder peer/dest) are correctly wired into the production code path
+
+**Architectural conclusion:** random ULA is the right choice for V6.2.  The userspace-NAT architecture decouples WG-side addressing from the host's underlying network — the catchall forwarder on the host opens OS sockets from the host's actual interface (which has a GUA if the host's network is dual-stack), so ULA on the WG-side never appears on the public internet.  No NAT66 needed; no v6-specific transport code in `host_forwarder.go` for inner-routing (only ICMPv6 deferral remains).
+
+**Caveat — what V6.PL did NOT prove (still V6.E2E territory):**
+
+- Outbound v6 from the host's catchall forwarder's OS socket reaching the public v6 internet.  This relies on Android's `protect()` callback working for v6 sockets, which is documented as family-agnostic but never verified end-to-end in this codebase.  Requires a dual-stack Android device on a dual-stack network (e.g. ChromeOS ARC on the user's home WiFi) and a real test (e.g. `curl -6 https://www.google.com` from a joiner through the host).  V6.E2E.
+
+Files: `android/wgbridge_native/v6_plausibility_test.go`, `android/app/src/androidTest/kotlin/com/gutschke/wgrtc/data/HostNativeV6SelfLoopTest.kt`.
