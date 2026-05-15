@@ -371,17 +371,78 @@ func TestHandleLocalICMPv6FiltersNonEcho(t *testing.T) {
 			if ret {
 				t.Fatalf("handleLocalICMPv6 returned true; want false")
 			}
-			// The handler may spawn a goroutine for EchoRequest;
-			// for everything else it must NOT.  EchoRequest is
-			// excluded from this list (only filtered-out types).
-			time.Sleep(50 * time.Millisecond)
-			after := state.pingsSent.Load()
-			if after != before {
-				t.Fatalf("type %s triggered a ping goroutine "+
-					"(pingsSent: %d -> %d); filter is broken",
-					tc.name, before, after)
+			// Poll-with-deadline rather than a fixed sleep —
+			// `dispatchPingV6` increments `pingsSent` as its
+			// first statement, so once a goroutine is scheduled
+			// the counter bumps fast.  We give it a generous
+			// 500 ms upper bound to absorb CI / emulator load,
+			// failing FAST if the counter bumps before then.
+			// (Under load the schedule-time can stretch into
+			// the hundreds of ms; a fixed 50 ms sleep would
+			// false-negative.)
+			deadline := time.Now().Add(500 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if state.pingsSent.Load() != before {
+					t.Fatalf("type %s triggered a ping goroutine "+
+						"(pingsSent: %d -> %d); filter is broken",
+						tc.name, before, state.pingsSent.Load())
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
 		})
+	}
+}
+
+// V6.H2b — `handleLocalICMPv6` returns `false` (and does NOT
+// spawn a ping goroutine) for real-local destinations.  Pre-
+// V6.H2b this was implicit ("our handler covers temp-local only,
+// gvisor auto-replies to real-local"); this test pins the
+// behaviour against an accidental refactor that drops the
+// `LocalAddressTemporary` guard.
+func TestHandleLocalICMPv6RealLocalDoesNotPing(t *testing.T) {
+	state := &hostForwarderState{}
+	totalLen := header.IPv6MinimumSize + header.ICMPv6MinimumSize
+	pktBytes := make([]byte, totalLen)
+	ip := header.IPv6(pktBytes[:header.IPv6MinimumSize])
+	ip.Encode(&header.IPv6Fields{
+		PayloadLength:     uint16(header.ICMPv6MinimumSize),
+		TransportProtocol: header.ICMPv6ProtocolNumber,
+		HopLimit:          64,
+		SrcAddr:           tcpip.AddrFromSlice(net.ParseIP("fd00::2").To16()),
+		DstAddr:           tcpip.AddrFromSlice(net.ParseIP("fd00::1").To16()),
+	})
+	icmpHdr := header.ICMPv6(pktBytes[header.IPv6MinimumSize:])
+	icmpHdr.SetType(header.ICMPv6EchoRequest)
+	icmpHdr.SetCode(0)
+
+	buf := buffer.MakeWithData(pktBytes)
+	pkt := gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{Payload: buf})
+	defer pkt.DecRef()
+	if _, ok := pkt.NetworkHeader().Consume(header.IPv6MinimumSize); !ok {
+		t.Fatalf("Consume(network)")
+	}
+	if _, ok := pkt.TransportHeader().Consume(header.ICMPv6MinimumSize); !ok {
+		t.Fatalf("Consume(transport)")
+	}
+	// Real-local: the temp-local flag is false.  gvisor's
+	// built-in ICMPv6 auto-reply should handle this — our custom
+	// handler just bows out via `return false` so it falls
+	// through to gvisor's default protocol module.
+	pkt.NetworkPacketInfo.LocalAddressTemporary = false
+
+	before := state.pingsSent.Load()
+	ret := state.handleLocalICMPv6(gvstack.TransportEndpointID{}, pkt)
+	if ret {
+		t.Fatalf("handleLocalICMPv6 returned true; want false " +
+			"(gvisor's auto-reply needs the fall-through)")
+	}
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if state.pingsSent.Load() != before {
+			t.Fatalf("real-local echo wrongly triggered a ping goroutine " +
+				"(LocalAddressTemporary guard is broken)")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -493,7 +554,7 @@ func TestHandleOutboundDispatchesByIPVersion(t *testing.T) {
 			t.Fatalf("v6 UDP packet wrongly counted as TCP")
 		}
 	})
-	t.Run("v6-unknown-next-header-drops-no-counter", func(t *testing.T) {
+	t.Run("v6-unknown-next-header-bumps-unsupportedDrops", func(t *testing.T) {
 		state := newDispatchTestState()
 		pkt := buildV6OtherProto(t,
 			net.ParseIP("fd00::2"), net.ParseIP("2001:db8::1"),
@@ -502,6 +563,24 @@ func TestHandleOutboundDispatchesByIPVersion(t *testing.T) {
 		if state.tcpRedirs.Load() != 0 || state.udpRedirs.Load() != 0 ||
 			state.pingsSent.Load() != 0 {
 			t.Fatalf("v6 unsupported next-hdr triggered a redirect counter")
+		}
+		if state.unsupportedDrops.Load() != 1 {
+			t.Fatalf("expected unsupportedDrops=1 for v6 Fragment; got %d",
+				state.unsupportedDrops.Load())
+		}
+	})
+	t.Run("unknown-IP-version-bumps-unsupportedDrops", func(t *testing.T) {
+		// Top nibble = 7 — not v4 (4) and not v6 (6).  Must
+		// not silently disappear; the outer dispatch's default
+		// branch increments unsupportedDrops.
+		state := newDispatchTestState()
+		raw := []byte{0x70, 0x00, 0x00, 0x14} // version=7, garbage rest
+		buf := buffer.MakeWithData(raw)
+		pkt := gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{Payload: buf})
+		state.handleOutbound(pkt)
+		if state.unsupportedDrops.Load() != 1 {
+			t.Fatalf("expected unsupportedDrops=1 for IP version 7; got %d",
+				state.unsupportedDrops.Load())
 		}
 	})
 }

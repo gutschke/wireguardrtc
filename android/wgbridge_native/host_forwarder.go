@@ -96,6 +96,12 @@ type hostForwarderState struct {
 	tcpRedirs atomic.Int64
 	udpRedirs atomic.Int64
 	tempAddrN atomic.Int64
+	// V6.H2b — counts packets dropped because the IP version or
+	// next-header isn't one we handle (e.g. IPv6 Fragment).
+	// Exposed for diagnostic tests (`TestHandleOutboundDispatches…`)
+	// to actively assert the DROP branch fired rather than
+	// inferring it from the absence of other counter changes.
+	unsupportedDrops atomic.Int64
 }
 
 func extractChannelEndpoint(n *netstack.Net) *gvchannel.Endpoint {
@@ -289,14 +295,15 @@ func (s *hostForwarderState) run(ls *listenerState) {
 				if s.closed.Load() {
 					return
 				}
-				hostFwdLog("heartbeat: pktsSeen=%d ping(sent=%d rpld=%d inj=%d) tcpRedir=%d udpRedir=%d tempAddrs=%d",
+				hostFwdLog("heartbeat: pktsSeen=%d ping(sent=%d rpld=%d inj=%d) tcpRedir=%d udpRedir=%d tempAddrs=%d unsupportedDrops=%d",
 					s.pktsSeen.Load(),
 					s.pingsSent.Load(),
 					s.pingsRpld.Load(),
 					s.injectsOK.Load(),
 					s.tcpRedirs.Load(),
 					s.udpRedirs.Load(),
-					s.tempAddrN.Load())
+					s.tempAddrN.Load(),
+					s.unsupportedDrops.Load())
 			}
 		}
 	}()
@@ -343,6 +350,7 @@ func (s *hostForwarderState) handleOutbound(pkt *gvstack.PacketBuffer) {
 	default:
 		hostFwdLog("NIC2 unknown IP version %d (len=%d) — DROPPED",
 			raw[0]>>4, len(raw))
+		s.unsupportedDrops.Add(1)
 	}
 }
 
@@ -375,6 +383,7 @@ func (s *hostForwarderState) handleOutboundV4(raw []byte) {
 	default:
 		hostFwdLog("NIC2 proto=%d %v -> %v (len=%d) — DROPPED (unsupported)",
 			proto, net.IP(srcSlice), net.IP(dstSlice), len(raw))
+		s.unsupportedDrops.Add(1)
 	}
 }
 
@@ -429,6 +438,7 @@ func (s *hostForwarderState) handleOutboundV6(raw []byte) {
 		// fragment, but worth fixing before bulk-UDP workloads.
 		hostFwdLog("NIC2 v6 next-hdr=%d %v -> %v (len=%d) — DROPPED (unsupported)",
 			nextHdr, net.IP(srcSlice), net.IP(dstSlice), len(raw))
+		s.unsupportedDrops.Add(1)
 	}
 }
 

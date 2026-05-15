@@ -133,6 +133,28 @@ class HostNativeV6ForwarderTest {
     }
 
     @Test
+    fun rejectsEmptySubnetString() {
+        // V6.H2b — defensive: passing an empty subnet string must
+        // be a clean -4 (parse failed), not a silent install with
+        // no routes installed (which would leave the bridge
+        // accepting traffic but unable to route it anywhere).
+        val (hostPriv, _) = newKeyPair()
+        val listenPort = 51000 + SecureRandom().nextInt(500)
+
+        hostHandle = WgBridgeNative.nativeNew(
+            localAddr = "10.99.0.1", mtu = 1420, listenPort = listenPort)
+        assertTrue(hostHandle > 0)
+        WgBridgeNative.nativeConfigureUAPI(hostHandle, buildString {
+            append("private_key=").append(hostPriv).append('\n')
+            append("listen_port=").append(listenPort).append('\n')
+            append("replace_peers=true\n")
+        })
+
+        val rc = WgBridgeNative.nativeInstallHostForwarder(hostHandle, "")
+        assertEquals(-4, rc)
+    }
+
+    @Test
     fun rejectsAllMalformedSubnetList() {
         // When EVERY entry fails to parse, the install must fail
         // with -4 (subnet parse failed) — defends against the
