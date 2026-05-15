@@ -2,13 +2,23 @@ package com.gutschke.wgrtc.data
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * host backend: owns at most one [HostModeRunner] at a time
- * and exposes a suspend-friendly start / stop / reconfigure surface
- * for the view-model.
+ * host backend: owns N [HostModeRunner] slots keyed by `tunnel.id`
+ * and exposes a suspend-friendly start / stop / teardown /
+ * reconfigure surface for the view-model. As of D4.H1 the app
+ * supports running multiple host tunnels concurrently on one
+ * phone — each slot is independent; the per-bridge close+reopen
+ * crash risk still applies, so stop() pauses a slot rather than
+ * destroying it, while teardown() commits to a real shutdown.
  *
  * Every lifecycle entry point wraps its body in
  * `withContext(Dispatchers.IO)`. The wireguard-go calls reached via
@@ -18,8 +28,11 @@ import java.net.InetSocketAddress
  * triggers an input ANR. See
  * `feedback_jni_calls_off_main_thread.md`.
  *
- * `start` / `stop` / `reconfigure` are not mutually thread-safe; the
- * view-model serialises them through `viewModelScope.launch`.
+ * `start` / `stop` / `reconfigure` are not mutually thread-safe per
+ * slot; the view-model serialises them through
+ * `viewModelScope.launch`. The slot map itself is a
+ * [ConcurrentHashMap] so cross-slot operations don't trample each
+ * other.
  */
 class HostModeBackend(
     private val factory: WgBridgeBackendFactory,
@@ -34,110 +47,181 @@ class HostModeBackend(
      * UDP/53 like any other UDP. */
     private val dnsProxy: DnsProxy? = null,
 ) {
-    @Volatile private var runner: HostModeRunner? = null
-    @Volatile private var activeId: String? = null
-    /** ID of the tunnel the [runner] currently *belongs to* — even
-     * when the user has tapped Disconnect (i.e. we paused). Used
-     * to decide whether the next [start] can reuse the bridge or
-     * must close + open a fresh one. */
-    @Volatile private var ownerId: String? = null
+    /**
+     * One slot per tunnel id. `paused == true` means the runner is
+     * still alive (the wireguard-go device is configured but bound
+     * to listen_port=0 with an empty peer set) but the tunnel is
+     * not counted in [activeTunnelIds]. Keeping the slot around
+     * across pause/resume cycles avoids the wireguard-go
+     * close+reopen panic.
+     */
+    private data class Slot(
+        val runner: HostModeRunner,
+        @Volatile var paused: Boolean = false,
+    )
 
-    /** ID of the host tunnel currently up under , or null. */
-    val activeTunnelId: String?
-        get() = activeId
+    private val slots: ConcurrentHashMap<String, Slot> = ConcurrentHashMap()
 
     /**
-     * Bring up [tunnel] as a host. Cheapest-path first:
-     * 1. **Resume:** runner already owns this tunnel — reissue the
-     * UAPI to un-pause. Avoids the close+reopen crash risk.
-     * 2. **Replace:** runner owns a different tunnel — close it,
-     * open a fresh one.
-     * 3. **Cold start:** no runner.
+     * Serialises [start] across the whole backend so two concurrent
+     * cold-start calls for the same `tunnel.id` can't both win the
+     * map-miss race and leak a duplicate bridge.  Class-level (not
+     * per-slot) because [start] is rare and the cost of serialising
+     * different-id starts is negligible compared with the JNI work
+     * each one does.  The docstring still permits cross-slot
+     * concurrency on stop / teardown / reconfigure — they don't take
+     * this lock.
+     */
+    private val startMutex = Mutex()
+
+    private val _activeTunnelIds = MutableStateFlow<Set<String>>(emptySet())
+    /** Set of tunnel ids whose slot is currently UP (not paused).
+     * Re-emits after every start / stop / teardown / teardownAll
+     * transition. */
+    val activeTunnelIds: StateFlow<Set<String>> = _activeTunnelIds.asStateFlow()
+
+    /** Recompute [_activeTunnelIds] from the current slot map. Safe
+     * to call from any thread because both ConcurrentHashMap and
+     * MutableStateFlow are thread-safe. */
+    private fun refreshActiveIds() {
+        _activeTunnelIds.value = slots.entries
+            .asSequence()
+            .filter { !it.value.paused }
+            .map { it.key }
+            .toSet()
+    }
+
+    /**
+     * Bring [tunnel] up as a host. Cheapest-path first:
+     * 1. **Resume / reconfigure:** slot for this id exists (paused
+     *    or not) — reissue UAPI to un-pause or refresh peers.
+     *    Avoids the close+reopen crash risk.
+     * 2. **Cold start:** no slot for this id — open a fresh bridge.
+     *
+     * Allowed when other tunnels are running; different ids never
+     * share a slot, so no replace path is needed.
      */
     @Throws(Exception::class)
     suspend fun start(tunnel: Tunnel) {
-        check(activeId == null) { "another tunnel is already running" }
         val cfg = tunnel.toRunnerConfig()
-        withContext(Dispatchers.IO) {
-            if (runner != null && ownerId == tunnel.id) {
-                runner!!.reconfigureUapi(cfg.renderUapi())
-                activeId = tunnel.id
-                return@withContext
+        startMutex.withLock {
+            withContext(Dispatchers.IO) {
+                val existing = slots[tunnel.id]
+                if (existing != null) {
+                    existing.runner.reconfigureUapi(cfg.renderUapi())
+                    existing.paused = false
+                    refreshActiveIds()
+                    return@withContext
+                }
+                val r = HostModeRunner(factory, parentScope)
+                try {
+                    r.start(cfg)
+                } catch (t: Throwable) {
+                    // The runner's own start() unwinds the bridge on
+                    // failure, so we just drop the reference here.
+                    throw t
+                }
+                slots[tunnel.id] = Slot(runner = r, paused = false)
+                refreshActiveIds()
             }
-            if (runner != null) {
-                try { runner!!.stop() } catch (_: Throwable) {}
-                runner = null
-                ownerId = null
-            }
-            val r = HostModeRunner(factory, parentScope)
-            r.start(cfg)
-            runner = r
-            ownerId = tunnel.id
-            activeId = tunnel.id
         }
     }
 
     /**
-     * Pause the active tunnel — drops peers and unbinds the listen
-     * port via UAPI, but keeps the wireguard-go device alive so the
-     * next [start] can reuse it. Idempotent.
+     * Pause the slot for [tunnelId] — drops peers and unbinds the
+     * listen port via UAPI, but keeps the wireguard-go device alive
+     * so the next [start] can reuse it. Idempotent; no-op when the
+     * slot doesn't exist or is already paused.
      */
-    suspend fun stop() {
-        val r = runner ?: return
-        if (activeId == null) return
+    suspend fun stop(tunnelId: String) {
+        val slot = slots[tunnelId] ?: return
+        if (slot.paused) return
         withContext(Dispatchers.IO) {
-            try { r.pause() } catch (_: Throwable) {}
+            try { slot.runner.pause() } catch (_: Throwable) {}
         }
-        activeId = null
+        slot.paused = true
+        refreshActiveIds()
     }
 
     /**
      * Real shutdown for app exit / tunnel deletion. Closes the
-     * wireguard-go device; the next [start] re-opens from scratch
-     * (close+reopen of the same tunnel can crash — prefer [stop]).
+     * wireguard-go device and removes the slot; the next [start]
+     * re-opens from scratch (close+reopen of the same tunnel can
+     * crash — prefer [stop] for user-initiated disconnects).
      */
-    suspend fun teardown() {
+    suspend fun teardown(tunnelId: String) {
+        val slot = slots.remove(tunnelId) ?: return
         withContext(Dispatchers.IO) {
-            runner?.stop()
+            try { slot.runner.stop() } catch (_: Throwable) {}
         }
-        runner = null
-        ownerId = null
-        activeId = null
+        refreshActiveIds()
+    }
+
+    /**
+     * Real shutdown of every slot. Used on app exit / activity
+     * finishing where the whole process is going away. Iterates
+     * slots sequentially via [teardown] — a slow JNI close on one
+     * slot blocks the rest of the sweep. Acceptable on app exit
+     * (the process is leaving anyway) but not for hot-path shutdown.
+     * D4.H3: revisit if any caller needs parallel teardown — wrap
+     * the loop body in `parentScope.async { teardown(id) }` and
+     * `awaitAll()`.
+     */
+    suspend fun teardownAll() {
+        val ids = slots.keys.toList()
+        for (id in ids) {
+            teardown(id)
+        }
     }
 
     /**
      * Push a fresh wg-quick config without a DOWN→UP cycle. Silent
-     * no-op if no tunnel is running, or if [tunnel].id doesn't match
-     * the active one (handles stale ViewModel callbacks after stop).
+     * no-op if no slot for [tunnel].id exists (e.g. ListenerHub
+     * callbacks for a tunnel the user just tore down).
      */
     suspend fun reconfigure(tunnel: Tunnel) {
-        val r = runner ?: return
-        if (tunnel.id != activeId) return
+        val slot = slots[tunnel.id] ?: return
         val uapi = tunnel.toRunnerConfig().renderUapi()
-        withContext(Dispatchers.IO) { r.reconfigureUapi(uapi) }
+        withContext(Dispatchers.IO) { slot.runner.reconfigureUapi(uapi) }
     }
 
-    /** Forward a VpnService-backed protector into the live runner.
-     * No-op if not running. Caller is responsible for re-calling
-     * this after each [start] — the runner forgets the protector
-     * on stop(). */
+    /** Forward a VpnService-backed protector into every live slot's
+     * runner. No-op when no slot exists. Caller is responsible for
+     * re-calling this after each [start] — the runner forgets the
+     * protector on stop(). */
     fun setProtector(protector: WgFdProtector?) {
-        runner?.setProtector(protector)
+        for (slot in slots.values) {
+            slot.runner.setProtector(protector)
+        }
     }
 
     /**
-     * Snapshot of wireguard-go's current state, parsed into a
-     * [UapiStats] so the view-model can feed `_throughput` and
-     * `_peerStats` from a uniform shape regardless of mode. Returns
-     * `null` when no tunnel is running, when the snapshot fails (the
-     * caller treats this as "skip this tick"), or when the UAPI
-     * dump is empty.
+     * Snapshot of wireguard-go's current state for [tunnelId],
+     * parsed into a [UapiStats] so the view-model can feed
+     * `_throughput` and `_peerStats` from a uniform shape regardless
+     * of mode. Returns `null` when no slot exists, when the snapshot
+     * fails (the caller treats this as "skip this tick"), or when
+     * the UAPI dump is empty.
      */
-    fun snapshotStats(): UapiStats? {
-        val r = runner ?: return null
-        val raw = try { r.snapshotUapi() } catch (_: Throwable) { return null }
+    fun snapshotStats(tunnelId: String): UapiStats? {
+        val slot = slots[tunnelId] ?: return null
+        val raw = try { slot.runner.snapshotUapi() } catch (_: Throwable) { return null }
         if (raw.isEmpty()) return null
         return UapiStatsParser.parse(raw)
+    }
+
+    /**
+     * Per-slot snapshot for every running tunnel, keyed by tunnel
+     * id. Skips slots that fail to dump or return an empty UAPI
+     * blob. Convenience for batch UI refreshes that need all
+     * counters in one tick.
+     */
+    fun snapshotAllStats(): Map<String, UapiStats> {
+        val out = mutableMapOf<String, UapiStats>()
+        for ((id, _) in slots) {
+            snapshotStats(id)?.let { out[id] = it }
+        }
+        return out
     }
 
     /** Convert a [Tunnel] to a [HostModeRunnerConfig]. Pulled out so

@@ -222,7 +222,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
 
  // (legacy GoBackend tunnel-state listener removed in the
  // wgbridge_native path manages its lifecycle through
- // activeJoinerBinding + hostModeBackend.activeTunnelId.)
+ // activeJoinerBinding + hostModeBackend.activeTunnelIds.)
 
  /** Application-scoped owner of the OFFER listeners. Created
  * in [WgrtcApp.onCreate] before any ViewModel exists, so the
@@ -256,11 +256,17 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // branch at the top of `connect()`. Joiner-side recovery is
  // a separate problem — the bound JoinerVpnService is per-
  // Context, so a new Activity always starts unbound.
- WgrtcApp.instance.hostModeBackend.activeTunnelId?.let { liveId ->
-  _activeTunnelId.value = liveId
-  _liveState.value = "UP"
-  startThroughputSampler()
- }
+ //
+ // D4.H2: with N concurrent host tunnels the ViewModel's
+ // single `_activeTunnelId` slot can only mirror one of them;
+ // we pick "any" here as a best-effort guess. Fully
+ // representing N-active in the UI lands with D4.H2.
+ WgrtcApp.instance.hostModeBackend.activeTunnelIds.value
+  .firstOrNull()?.let { liveId ->
+   _activeTunnelId.value = liveId
+   _liveState.value = "UP"
+   startThroughputSampler()
+  }
  // Subscribe to the hub's endpoint-applied events so the
  // viewmodel's _tunnels stays in sync with the disk state
  // when listeners (which run in the hub's scope) rewrite
@@ -690,22 +696,19 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
 
  /**
  * The tunnels currently considered "active" for the purposes of the
- * AllowedIPs overlap gate.  Today there are two independent slots:
- * one joiner-side ([_activeTunnelId]) and one host-side
- * ([HostModeBackend.activeTunnelId]).  Both surface here so the gate
- * catches a joiner-side claim that would conflict with an already-up
- * host (or vice versa).
- *
- * When task D4 generalises the app to N concurrent tunnels, this
- * function grows to return the full active set — no other change in
- * the gate itself is needed.
+ * AllowedIPs overlap gate.  Today there are two independent slot
+ * groups: the joiner-side ([_activeTunnelId]) and the host-side
+ * ([HostModeBackend.activeTunnelIds] — N entries since D4.H1).  Both
+ * surface here so the gate catches a joiner-side claim that would
+ * conflict with any already-up host (or vice versa).
  */
  private fun activeTunnelsForOverlapGate(): List<Tunnel> {
  val byId = _tunnels.value.associateBy { it.id }
  val ids = mutableSetOf<String>()
  _activeTunnelId.value?.let { ids.add(it) }
  try {
- WgrtcApp.instance.hostModeBackend.activeTunnelId?.let { ids.add(it) }
+ WgrtcApp.instance.hostModeBackend.activeTunnelIds.value
+  .forEach { ids.add(it) }
  } catch (_: Throwable) {
  // WgrtcApp not initialised yet (unit-test seam) — treat as
  // no active host-mode tunnel.
@@ -1091,10 +1094,17 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // single tunnel slot is unrelated to the runner) so
  // we don't accidentally cycle a sibling.
  val modeABackend = WgrtcApp.instance.hostModeBackend
- if (modeABackend.activeTunnelId != null) {
- try { modeABackend.stop() }
+ // D4.H2: disconnect() today is "tear down the one tunnel the
+ // ViewModel knows is active"; with N concurrent host tunnels
+ // we conservatively pause every running host slot so the user's
+ // Disconnect tap behaves the same as before.  A per-tunnel
+ // disconnect button lands with D4.H2.
+ if (modeABackend.activeTunnelIds.value.isNotEmpty()) {
+ for (id in modeABackend.activeTunnelIds.value.toList()) {
+ try { modeABackend.stop(id) }
  catch (t: Throwable) {
- Log.e("wgrtc-vm", "stop failed", t)
+ Log.e("wgrtc-vm", "stop $id failed", t)
+ }
  }
  _activeTunnelId.value = null
  _liveState.value = "DOWN"
@@ -1148,7 +1158,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // tunnel by id so the Tunnel → UAPI conversion sees the
  // up-to-date enrolledPeers list.
  val modeABackend = WgrtcApp.instance.hostModeBackend
- if (modeABackend.activeTunnelId != tunnelId) return
+ if (!modeABackend.activeTunnelIds.value.contains(tunnelId)) return
  val tunnel = _tunnels.value.firstOrNull { it.id == tunnelId } ?: return
  try {
  withContext(Dispatchers.IO) { modeABackend.reconfigure(tunnel) }
@@ -1197,9 +1207,22 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  prevRx: Long, prevTx: Long, prevAt: Long, seeding: Boolean,
  ): SampleBaseline? {
  val modeABackend = WgrtcApp.instance.hostModeBackend
+ // D4.H2: sampler still samples the ViewModel's single
+ // `_activeTunnelId` slot.  When that tunnel is host-mode and
+ // running, prefer its stats; otherwise fall back to the joiner
+ // path.  Per-tunnel throughput surfacing lands with D4.H2.
+ val primaryHostId = _activeTunnelId.value
+  ?.takeIf { modeABackend.activeTunnelIds.value.contains(it) }
  val stats: UapiStats = when {
- modeABackend.activeTunnelId != null ->
- modeABackend.snapshotStats() ?: return null
+ primaryHostId != null ->
+ modeABackend.snapshotStats(primaryHostId) ?: return null
+ modeABackend.activeTunnelIds.value.isNotEmpty() ->
+ // ViewModel's _activeTunnelId is stale (e.g. host
+ // tunnel started outside this VM); sample any running
+ // host slot so the UI doesn't go dark.
+ modeABackend.snapshotStats(
+  modeABackend.activeTunnelIds.value.first()
+ ) ?: return null
  activeJoinerBinding != null ->
  activeJoinerBinding?.service?.snapshotStats() ?: return null
  else -> return null
