@@ -479,3 +479,29 @@ Two `wgbridge_native` instances in one process, each registered with `localAddr 
 - Outbound v6 from the host's catchall forwarder's OS socket reaching the public v6 internet.  This relies on Android's `protect()` callback working for v6 sockets, which is documented as family-agnostic but never verified end-to-end in this codebase.  Requires a dual-stack Android device on a dual-stack network (e.g. ChromeOS ARC on the user's home WiFi) and a real test (e.g. `curl -6 https://www.google.com` from a joiner through the host).  V6.E2E.
 
 Files: `android/wgbridge_native/v6_plausibility_test.go`, `android/app/src/androidTest/kotlin/com/gutschke/wgrtc/data/HostNativeV6SelfLoopTest.kt`.
+
+### V6.2 — 2026-05-14 (in progress: allocator landed)
+
+Per-tunnel ULA generation + joiner v6 address allocation.  Decision: random ULA per RFC 4193 §3.2.1 (`fd<random40>::<16-bit subnet=0>::/64`), as validated by V6.PL.  No NAT66; the userspace-NAT architecture re-sources at the host's OS socket layer, so the ULA never appears on the wire outside the WG tunnel.
+
+**Landed in this step: allocator API (`HostSubnetAllocator` v6 sibling).**
+
+- `generateUlaPrefix(rng: SecureRandom = SecureRandom()): String` — sample 40 random bits, render as `fdXX:XXXX:XXXX::/64`.  Canonical RFC 5952 form: lowercase, no leading zeros, `::` for the all-zero suffix.
+- `nextFreeIpV6(subnet, hostIp, inUse): String?` — v6 sibling of `nextFreeIp`.  Linear scan from `hostIp + 1` upward; first hole wins.  Returns canonical compressed form (RFC 5952).  Capped at 2²⁰ iterations to avoid pathological loops on /0 (unrealistic but defensive).
+- Both functions normalise input addresses (case-insensitive, accepts `0123` and `123` segment forms, supports `inUse` set in mixed canonicalisations).
+
+Custom canonicalisation helper: `addrToString(BigInteger)` builds the RFC 5952 compressed form by hand instead of via `InetAddress.getByAddress().hostAddress`.  Reason: the JVM unit-test runtime returns the long form (`fd00:0:0:0:0:0:0:1`) on some JREs, while Android's libcore returns compressed (`fd00::1`).  We need a single representation so tests + production agree byte-for-byte.
+
+Test additions: `HostSubnetAllocatorV6Test.kt` (11 tests) — generation, dual-stack uniqueness across seeds, parse-round-trip, sequential allocation, host exclusion, in-use exclusion, hole-filling, malformed input, host-outside-subnet rejection, case-insensitive normalisation, deep-subnet bulk allocation.
+
+12 V6 allocator tests + 14 pre-existing v4 allocator tests all pass.
+
+**Not yet landed (next steps for V6.2 completion):**
+
+- `HostModeConfig.subnetV6: String?` field (nullable for backward compat) and `EnrolledPeer.assignedIpV6: String?`.
+- `HostModeFactory.newTunnel()` generates a fresh ULA + writes a second `[Interface] Address = fd...::1/64` line into `configText`.
+- Peer enrolment code paths (`MainActivity`, `WgrtcViewModel`, `HostModeSection`, `ListenerHub`) allocate a v6 alongside the v4 when adding a new peer.
+
+After those land, V6.3 will render dual-stack addresses + AllowedIPs in the enrolment payload + manual config invitations.
+
+Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocator.kt`, `android/app/src/test/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocatorV6Test.kt`.
