@@ -38,6 +38,16 @@ extern int wgbridgeUDPFlowWrite(int flowHandle, char *buf, int bufLen);
 extern void wgbridgeUDPFlowClose(int flowHandle);
 extern int wgbridgePingV4(int handle, const char *dest, int destLen, int timeoutMs);
 extern int wgbridgeInstallHostForwarder(int handle, const char *peerSubnet, int peerSubnetLen);
+// D4.J3 — joiner-N shared netstack exports.  See
+// wgbridge_native/joiner_n_exports.go for the Go side + return
+// code documentation.
+extern int wgbridgeSharedStackNew(int mtu);
+extern void wgbridgeSharedStackClose(int handle);
+extern int wgbridgeSharedStackAttachKernelTun(int handle, int fd, int mtu);
+extern int wgbridgeSharedStackOpenJoiner(int stackHandle,
+                                          const char *peerAllowedCsv, long peerAllowedLen,
+                                          const char *interfaceAddrsCsv, long interfaceAddrsLen,
+                                          int mtu);
 extern int wgbridgeTCPRead(int connHandle, char *buf, int bufLen);
 extern int wgbridgeTCPWrite(int connHandle, char *buf, int bufLen);
 extern void wgbridgeTCPClose(int connHandle);
@@ -475,6 +485,72 @@ Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeInstallHostForwarder(
     jsize n = (*env)->GetStringUTFLength(env, peerSubnet);
     int rc = wgbridgeInstallHostForwarder((int) handle, s, (int) n);
     (*env)->ReleaseStringUTFChars(env, peerSubnet, s);
+    return (jint) rc;
+}
+
+// ─── D4.J3 — shared-stack JNI surface ────────────────────────────
+// Adapt the //export functions from joiner_n_exports.go to the
+// Kotlin native-method signatures declared in WgBridgeNative.kt.
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeSharedStackNew(
+    JNIEnv *env, jclass cls, jint mtu)
+{
+    (void) env; (void) cls;
+    return (jint) wgbridgeSharedStackNew((int) mtu);
+}
+
+JNIEXPORT void JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeSharedStackClose(
+    JNIEnv *env, jclass cls, jint handle)
+{
+    (void) env; (void) cls;
+    wgbridgeSharedStackClose((int) handle);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeSharedStackAttachKernelTun(
+    JNIEnv *env, jclass cls, jint handle, jint fd, jint mtu)
+{
+    (void) env; (void) cls;
+    return (jint) wgbridgeSharedStackAttachKernelTun((int) handle, (int) fd, (int) mtu);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeSharedStackOpenJoiner(
+    JNIEnv *env, jclass cls,
+    jint stackHandle,
+    jstring peerAllowed,
+    jstring interfaceAddrs,
+    jint mtu)
+{
+    // Either string may be null when the caller has no routes for
+    // that direction. Convert null to ("", 0) so the Go side's
+    // parsePrefixCsv sees an empty list (no error).
+    const char *pa_str = "";
+    jsize pa_len = 0;
+    if (peerAllowed != NULL) {
+        pa_str = (*env)->GetStringUTFChars(env, peerAllowed, 0);
+        if (pa_str == NULL) return -2;
+        pa_len = (*env)->GetStringUTFLength(env, peerAllowed);
+    }
+    const char *ia_str = "";
+    jsize ia_len = 0;
+    if (interfaceAddrs != NULL) {
+        ia_str = (*env)->GetStringUTFChars(env, interfaceAddrs, 0);
+        if (ia_str == NULL) {
+            if (peerAllowed != NULL) (*env)->ReleaseStringUTFChars(env, peerAllowed, pa_str);
+            return -3;
+        }
+        ia_len = (*env)->GetStringUTFLength(env, interfaceAddrs);
+    }
+    int rc = wgbridgeSharedStackOpenJoiner(
+        (int) stackHandle,
+        pa_str, (long) pa_len,
+        ia_str, (long) ia_len,
+        (int) mtu);
+    if (peerAllowed != NULL) (*env)->ReleaseStringUTFChars(env, peerAllowed, pa_str);
+    if (interfaceAddrs != NULL) (*env)->ReleaseStringUTFChars(env, interfaceAddrs, ia_str);
     return (jint) rc;
 }
 

@@ -230,5 +230,12 @@ func attachKernelTunPump(ss *sharedStackState, fd int, mtu int) (*kernelTunPumpH
 		close(done)
 	}()
 
+	// Stash the pump handle on the stack so `sharedStackState.close`
+	// shuts it down as part of the unified teardown. The JNI surface
+	// only exchanges stack handles, not per-pump handles.
+	ss.mu.Lock()
+	ss.pumpHandle = handle
+	ss.mu.Unlock()
+
 	return handle, nil
 }

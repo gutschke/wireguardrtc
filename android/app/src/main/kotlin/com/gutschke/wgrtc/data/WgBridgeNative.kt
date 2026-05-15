@@ -132,6 +132,73 @@ object WgBridgeNative {
     @JvmStatic external fun nativeClose(handle: Int)
 
     // ─────────────────────────────────────────────────────────
+    // D4.J3 — joiner-N shared-netstack surface.
+    //
+    // Adapts the `wgbridgeSharedStack*` //export functions from
+    // `wgbridge_native/joiner_n_exports.go`. The shared stack is
+    // a separate handle namespace from the bridge handles above;
+    // see `JoinerStackBackend.kt` for the high-level lifecycle.
+
+    /**
+     * Create a new shared netstack. Returns:
+     *
+     *   > 0 : opaque stack handle (pass to other native methods)
+     *   -1  : MTU out of range (576 ≤ mtu ≤ 65535)
+     *   -2  : gvisor stack init failed (out of memory or similar)
+     */
+    @JvmStatic external fun nativeSharedStackNew(mtu: Int): Int
+
+    /**
+     * Tear down the shared stack: stop the kernel-TUN pump (if
+     * attached), close all channel endpoints, destroy the gvisor
+     * stack. Idempotent.
+     */
+    @JvmStatic external fun nativeSharedStackClose(handle: Int)
+
+    /**
+     * Wire [fd] (typically a `VpnService.Builder.establish()` TUN
+     * fd) as NIC 1 of the shared stack and start the read+write
+     * pump goroutines. The shared stack TAKES OWNERSHIP of [fd];
+     * the caller MUST NOT close it directly — `nativeSharedStackClose`
+     * does that. Returns 0 on success, negative on error:
+     *
+     *   -1 : unknown stack handle
+     *   -2 : attach failed (bad fd, duplicate attach, NIC create)
+     */
+    @JvmStatic external fun nativeSharedStackAttachKernelTun(
+        handle: Int, fd: Int, mtu: Int,
+    ): Int
+
+    /**
+     * Open a joiner-mode bridge as a new NIC on the shared stack
+     * and program routes. Returns a BRIDGE handle (positive) —
+     * pass it to `nativeConfigureUAPI` / `nativeSnapshotUAPI` /
+     * `nativeClose`, exactly like a host-mode bridge.
+     *
+     * `peerAllowedCsv` is a comma-separated CIDR list — the
+     * joiner's AllowedIPs that forward apps → this joiner. May
+     * be null or empty.
+     * `interfaceAddrsCsv` mirrors that shape for the reverse
+     * direction (joiner → apps).
+     *
+     * Closing the bridge via `nativeClose` automatically detaches
+     * the NIC from the shared stack.
+     *
+     * Returns:
+     *   > 0 : bridge handle (success)
+     *   -1  : unknown stack handle
+     *   -2  : peer-allowed prefix parse failed
+     *   -3  : interface-addr prefix parse failed
+     *   -4  : openJoinerBridge failed (NIC create / wg-go Up / routes)
+     */
+    @JvmStatic external fun nativeSharedStackOpenJoiner(
+        stackHandle: Int,
+        peerAllowedCsv: String?,
+        interfaceAddrsCsv: String?,
+        mtu: Int,
+    ): Int
+
+    // ─────────────────────────────────────────────────────────
     // TCP / UDP listeners on the host's gvisor netstack.
     //
     // **Async model.** [nativeListenTcp] / [nativeListenUdp] are

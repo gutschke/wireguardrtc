@@ -62,6 +62,13 @@ type sharedStackState struct {
 	// silently rebinding to a different joiner.
 	nextNicID atomic.Int32
 
+	// pumpHandle owns the kernel-TUN read/write goroutines once
+	// `attachKernelTunPump` has been called. Stored here so
+	// [close] is a one-stop teardown for the whole stack
+	// (D4.J3 — the JNI surface only exchanges stack handles, not
+	// per-pump handles).
+	pumpHandle *kernelTunPumpHandle
+
 	// mtu is the link-layer MTU advertised to each NIC. We keep it
 	// stack-wide because gvisor's PMTUD machinery wants every NIC
 	// of a routing path to agree. For joiner-N the floor is min(
@@ -173,13 +180,23 @@ func newSharedStack(mtu uint32) (*sharedStackState, error) {
 }
 
 // closeSharedStack tears down the gvisor stack and every
-// associated channel endpoint. Idempotent — closing a stack
-// twice is harmless.
+// associated channel endpoint. If a kernel-TUN pump was attached,
+// it's stopped first (which closes the fd and waits for both pump
+// goroutines to drain). Idempotent — closing twice is harmless.
 func (ss *sharedStackState) close() {
 	ss.mu.Lock()
+	pumpHandle := ss.pumpHandle
+	ss.pumpHandle = nil
 	endpoints := ss.endpoints
 	ss.endpoints = nil
 	ss.mu.Unlock()
+	// Stop the pump BEFORE tearing down endpoints / the stack —
+	// the pump's reader/writer goroutines reference NIC 1's
+	// channel endpoint, and closing that endpoint underneath
+	// them is what causes the race we're avoiding here.
+	if pumpHandle != nil {
+		_ = pumpHandle.Stop()
+	}
 	for _, ep := range endpoints {
 		ep.Close()
 	}
