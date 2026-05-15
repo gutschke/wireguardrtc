@@ -152,9 +152,19 @@ class HostModeBackend(
             ?.toIntOrNull()
             ?: error("[Interface] ListenPort missing or not an integer")
         val mtu = parseInterfaceField(configText, "MTU")?.toIntOrNull() ?: defaultMtu
-        // Strip "/24" — wgbridge wants a bare IPv4 literal as the
-        // netstack's local address.
-        val localAddr = addr.substringBefore('/').trim()
+        // V6.H1 — pass every bare address from the [Interface]
+        // Address line(s) to wgbridgeNew, comma-joined.  The Go
+        // side splits + parses + passes the slice through to
+        // netstack.CreateNetTUN (already dual-stack-capable).
+        // Falls back to the legacy single-address path if the
+        // helper found nothing (defensive — `addr` already passed
+        // the not-null check above, so this is unreachable).
+        val parsedAddrs = parseInterfaceAddresses(configText)
+        val localAddr = if (parsedAddrs.isNotEmpty()) {
+            parsedAddrs.joinToString(",")
+        } else {
+            addr.substringBefore('/').trim()
+        }
         val peers = hm.enrolledPeers.map { ep ->
             HostModeUapi.Peer(
                 publicKeyB64 = ep.pubkeyB64,

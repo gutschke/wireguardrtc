@@ -121,6 +121,46 @@ internal fun parseInterfaceField(configText: String, key: String): String? {
 }
 
 /**
+ * V6.H1 — return every bare IP literal from the `[Interface]
+ * Address = …` lines, with `/prefix` stripped.  Accepts both
+ * multi-line entries and comma-separated single-line entries,
+ * mirroring wg-quick syntax.  Lines outside `[Interface]` are
+ * ignored.  Inline comments (`# …`) are stripped before parsing.
+ *
+ * Used by [HostModeBackend] to assemble the comma-separated
+ * dual-stack address string for [WgBridgeBackendFactory.open]; the
+ * Go side's `parseLocalAddrs` accepts the joined form verbatim.
+ *
+ * Returns an empty list when no `Address` line is present —
+ * callers must check and surface a meaningful error.
+ */
+internal fun parseInterfaceAddresses(configText: String): List<String> {
+    val out = mutableListOf<String>()
+    var inInterface = false
+    for (rawLine in configText.lineSequence()) {
+        val line = rawLine.substringBefore('#').trim()
+        if (line.isEmpty()) continue
+        if (line.startsWith("[") && line.endsWith("]")) {
+            inInterface = line.equals("[Interface]", ignoreCase = true)
+            continue
+        }
+        if (!inInterface) continue
+        val eq = line.indexOf('=')
+        if (eq < 0) continue
+        val k = line.substring(0, eq).trim()
+        if (!k.equals("Address", ignoreCase = true)) continue
+        val value = line.substring(eq + 1)
+        for (part in value.split(',')) {
+            val s = part.trim()
+            if (s.isEmpty()) continue
+            val bare = s.substringBefore('/').trim()
+            if (bare.isNotEmpty()) out.add(bare)
+        }
+    }
+    return out
+}
+
+/**
  * Pick the host's wire-side endpoint as `ip:port`. Preference
  * order, mirroring [enumerateAndRank]'s LAN-first ranking:
  *

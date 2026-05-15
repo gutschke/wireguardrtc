@@ -348,3 +348,35 @@ Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/MtuMath.kt`, `androi
 
 - Host-side wgbridge / `HostModeRunner.defaultMtu` still uses `MtuMath.DEFAULT_WG_MTU` directly.  Host mode owns its own gvisor netstack, so the inner MTU is governed by the userspace NIC, not by an Android Builder.  The v6-outer adjustment lands when V6.H1 wires up the v6 NIC.
 - Runtime path-MTU detection / PMTU black-hole mitigation past the conservative-defaults strategy is still future work — see `wireguard-runtime-architecture.md` §5.
+
+### V6.H1 — 2026-05-13
+
+Host-mode gvisor netstack registers both v4 and v6 protocols when the host's tunnel config carries dual-stack `[Interface] Address` lines.  Two-side wire-in:
+
+**Go side (`wgbridge_native/api.go`):**
+
+- New `parseLocalAddrs(s string) ([]netip.Addr, error)` — splits a comma-separated address string into typed `netip.Addr` values, tolerates whitespace + bracketed v6 (`[fd00::1]`), rejects malformed entries (one bad address poisons the whole list — partial application would silently drop addresses the operator typed).
+- `wgbridgeNew` (the //export entry) now calls `parseLocalAddrs` and passes the slice to `netstack.CreateNetTUN`.  Single-address callers (`"10.99.0.1"`) keep working unchanged.  Dual-stack callers (`"10.99.0.1,fd00::1"`) get both v4 + v6 NICs registered on the underlying gvisor stack — `netstack.CreateNetTUN` already iterates the slice and registers `ipv4.ProtocolNumber` or `ipv6.ProtocolNumber` per-entry.
+
+**Kotlin side (`HostTunnelSnapshotBuilder.kt` + `HostModeBackend.kt`):**
+
+- New `parseInterfaceAddresses(configText): List<String>` — pulls every `[Interface] Address = …` entry, splits comma-separated single-line forms, strips `/prefix`, and returns bare literals.  Tolerates multi-line + comma-separated.
+- `HostModeBackend.toRunnerConfig()` now uses `parseInterfaceAddresses(configText).joinToString(",")` for `localAddr`.  Pre-V6.H1 the code did `parseInterfaceField(text, "Address")?.substringBefore('/')`, which kept only the first line and silently dropped v6.  Falls back to the legacy single-address path defensively when the helper finds nothing.
+
+**Why this is wire-in not implement:** `netstack.CreateNetTUN`'s signature has always been `(localAddresses []netip.Addr, ...)`.  The gvisor stack it builds internally already registers both ipv4 + ipv6 NetworkProtocolFactory and tcp/udp/icmp TransportProtocolFactory.  Pre-V6.H1 the caller just never handed it a v6 entry.
+
+Test additions:
+
+- `parse_local_addrs_test.go` (Go, 10 tests): single v4, single v6, dual-stack comma form, whitespace tolerance, empty-segment skipping, malformed rejection, mixed valid/invalid rejection, empty / whitespace-only / bracketed-v6 acceptance.
+- `ParseInterfaceAddressesTest.kt` (JVM, 11 tests): single + multi v4, multi-line dual-stack, comma-separated single-line dual-stack, mixed forms, bare addresses without prefix, no-Address, outside-`[Interface]` ignored, case-insensitive key, inline comments stripped, empty segments dropped.
+- `HostModeBackendTest.kt` (extended): two V6.H1 cases pinning that dual-stack Address lines (both multi-line and comma-separated single-line) flow comma-joined to the backend factory's `localAddr` parameter.
+
+23 new tests + the entire pre-existing HostModeBackend / HostTunnelSnapshotBuilder / app-unit suite green.
+
+**Not addressed in V6.H1 (deferred to later H-pass):**
+
+- v6 forwarders (TCP/UDP/ICMP) — `host_forwarder.go` hard-codes `gvipv4.ProtocolNumber` throughout, so v6-destined traffic from joiners through the host's gvisor netstack still has no handler.  V6.H2.
+- Host's v6 address generation — host-mode tunnels still only have a v4 `[Interface] Address` line in production.  Generating a per-tunnel v6 ULA (e.g. `fd<random-40-bit>:<tunnel-suffix>::1/64`) is V6.2 in the original numbered plan; once that lands, the dual-stack wire-in here automatically delivers it to the gvisor stack.
+- DNS proxy v6 upstream (`DnsProxy.kt` resolves via `InetAddress.getAllByName` which already returns both families) — but the catchall UDP forwarder that intercepts joiner DNS queries is v4-only.  V6.H3.
+
+Files: `android/wgbridge_native/api.go`, `android/wgbridge_native/parse_local_addrs_test.go`, `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostTunnelSnapshotBuilder.kt`, `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostModeBackend.kt`, tests in matching test trees.

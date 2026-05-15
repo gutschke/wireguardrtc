@@ -369,6 +369,64 @@ class HostModeBackendTest {
         assertEquals("192.168.42.1", addr)
     }
 
+    @Test
+    fun `V6_H1 dual-stack Interface Address lines flow comma-joined to the factory`() = runBlocking<Unit> {
+        val backend = HookedBackend()
+        val factory = HookedFactory(backend)
+        val be = HostModeBackend(factory, parentScope)
+        // When the host's tunnel config has BOTH a v4 and a v6
+        // Address line, the backend factory must see them joined
+        // with a comma so wgbridge_native's parseLocalAddrs splits
+        // them back out and registers both protocols on the gvisor
+        // netstack.  Pre-V6.H1 the v6 line was silently dropped
+        // (parseInterfaceField returns only the first match).
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.1/24
+            Address = fd00::1/64
+            ListenPort = 51820
+
+            [Peer]
+            PublicKey = $peerB64
+            AllowedIPs = 10.99.0.2/32
+        """.trimIndent()
+        be.start(hostTunnel(configText = cfg).let {
+            it.copy(hostMode = it.hostMode!!.copy(
+                enrolledPeers = listOf(
+                    EnrolledPeer(peerB64, "10.99.0.2", "g", 1L))
+            ))
+        })
+        val (addr, _, _) = factory.opens.single()
+        assertEquals("10.99.0.1,fd00::1", addr,
+            "dual-stack Address lines must flow as comma-joined to the bridge factory")
+    }
+
+    @Test
+    fun `V6_H1 comma-separated single-line dual-stack also flows correctly`() = runBlocking<Unit> {
+        val backend = HookedBackend()
+        val factory = HookedFactory(backend)
+        val be = HostModeBackend(factory, parentScope)
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.1/24, fd00::1/64
+            ListenPort = 51820
+
+            [Peer]
+            PublicKey = $peerB64
+            AllowedIPs = 10.99.0.2/32
+        """.trimIndent()
+        be.start(hostTunnel(configText = cfg).let {
+            it.copy(hostMode = it.hostMode!!.copy(
+                enrolledPeers = listOf(
+                    EnrolledPeer(peerB64, "10.99.0.2", "g", 1L))
+            ))
+        })
+        val (addr, _, _) = factory.opens.single()
+        assertEquals("10.99.0.1,fd00::1", addr)
+    }
+
     /** Backend fake — captures UAPI calls + protector swaps. */
     private class HookedBackend(
         private val uapiError: Exception? = null,

@@ -132,8 +132,50 @@ func wgbridgeVersion() *C.char {
 
 const wgGoVersion = "f333402bd9cb"
 
+// parseLocalAddrs splits a comma-separated address string into a
+// slice of [netip.Addr] values, tolerating surrounding whitespace
+// and empty entries (from trailing commas / accidental doubles).
+// Bracketed v6 (`[fd00::1]`) is accepted since some callers pre-
+// canonicalise that way before handing the string in.  Empty /
+// whitespace-only input is an error.  A single bad entry rejects
+// the whole list — partial application would silently drop
+// addresses the operator typed.
+//
+// V6.H1: introduced for dual-stack host bridges; `10.99.0.1` and
+// `10.99.0.1,fd00::1` both work.  Pure function — exhaustively
+// unit-tested in parse_local_addrs_test.go.
+func parseLocalAddrs(s string) ([]netip.Addr, error) {
+	parts := strings.Split(s, ",")
+	addrs := make([]netip.Addr, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Tolerate `[fd00::1]` form.
+		if len(p) >= 2 && p[0] == '[' && p[len(p)-1] == ']' {
+			p = p[1 : len(p)-1]
+		}
+		a, err := netip.ParseAddr(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid addr %q: %w", p, err)
+		}
+		addrs = append(addrs, a)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no valid addresses in %q", s)
+	}
+	return addrs, nil
+}
+
 // wgbridgeNew constructs a host-mode bridge with a userspace
 // gvisor netstack. Used by (HOST_MODE tunnels).
+//
+// `localAddrStr` may be a single address or a comma-separated
+// dual-stack list (V6.H1) — e.g. `10.99.0.1` or
+// `10.99.0.1,fd00::1`.  `netstack.CreateNetTUN` already registers
+// both v4 and v6 protocols and accepts a mixed-family slice; we
+// just plumb the parsed list through.
 //
 // Returns:
 //
@@ -150,12 +192,12 @@ const wgGoVersion = "f333402bd9cb"
 //export wgbridgeNew
 func wgbridgeNew(localAddrStr *C.char, localAddrLen C.long, mtu C.int, listenPort C.int) C.int {
 	localAddr := goStringToGo(localAddrStr, localAddrLen)
-	addr, err := netip.ParseAddr(localAddr)
+	addrs, err := parseLocalAddrs(localAddr)
 	if err != nil {
 		return -1
 	}
 	tunDev, tnet, err := netstack.CreateNetTUN(
-		[]netip.Addr{addr},
+		addrs,
 		nil, // no DNS — caller drives sockets directly
 		int(mtu),
 	)
