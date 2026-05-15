@@ -11,8 +11,8 @@ Three independent properties:
 
 1. **Wire format.**  Enrollment payloads, candidate lists, and
    AllowedIPs entries carry both v4 and v6 addresses without
-   silently dropping the v6 half.  Pinned by the V6.3 unit tests +
-   the `HostNativeV6SelfLoopTest` instrumented test.
+   silently dropping the v6 half.  Pinned by the dual-stack
+   enrollment-payload unit tests plus `HostNativeV6SelfLoopTest`.
 
 2. **Tunnel handshake.**  A joiner and host with dual-stack
    addresses complete a WireGuard handshake and can exchange
@@ -22,12 +22,12 @@ Three independent properties:
 3. **Public-internet reach.**  The through-host forwarder relays
    TCP, UDP, ICMP, and ICMPv6 from the joiner to a real public v6
    destination, and the reply gets re-injected into the tunnel.
-   This is the V6.H2b deliverable.  Validated below.
+   This is the ICMPv6 forwarder.  Validated below.
 
 ## Quick check (5 minutes, no app required)
 
 The `tmp/v6probe/` directory contains a small Go binary that
-exercises the same syscall paths V6.H2b's `dispatchPingV6` uses:
+exercises the same syscall paths `dispatchPingV6` uses:
 `icmpx.ListenPacket("udp6", "::")` for ICMPv6 SOCK_DGRAM, plus
 plain `net.DialContext("tcp6", ...)` and `net.DialUDP("udp6", ...)`.
 
@@ -64,7 +64,7 @@ Reading the output:
 - `icmp6 ok:true` from the shell UID is the **load-bearing
   signal** — it means the unprivileged ICMPv6 socket Android grants
   to apps in `ping_group_range` is delivering packets to the public
-  internet and getting replies back.  V6.H2b's `dispatchPingV6`
+  internet and getting replies back.  `dispatchPingV6`
   takes the exact same path.
 - `tcp6 ok:true` + a non-link-local `local=` address proves the
   device has a real public v6 GUA (not just a site-local) and that
@@ -76,7 +76,7 @@ Reading the output:
   with normal manifest permissions don't hit this.
 
 If `icmp6` and `tcp6` both succeed, the device is suitable for
-V6.H2b regression testing.  Plug a real WireGuard tunnel in on top
+IPv6 forwarder regression testing.  Plug a real WireGuard tunnel in on top
 (via the wgrtc app) and use the same probe binary as if you were a
 joiner peer — that confirms the through-host forwarder relays the
 traffic end-to-end.
@@ -121,7 +121,7 @@ traffic end-to-end.
    forwarder.
 
 4. From a shell on the joiner (Termux on Android, or `adb shell`
-   on ARC), `ping6 google.com` should succeed.  That's V6.H2b's
+   on ARC), `ping6 google.com` should succeed.  That's the host forwarder
    ICMPv6 echo path.
 
 If step 3 fails: check the host's gvisor netstack actually got the
@@ -132,18 +132,17 @@ which pinpoint where the v6 path is breaking.
 
 ## Where the code lives
 
-- Daemon v6: `daemon/wireguardrtc` (V6.D1, V6.D3, V6.D4, V6.D5).
+- Daemon v6: `daemon/wireguardrtc`.
 - Joiner v6: `android/app/src/main/kotlin/.../{JoinerVpnConfig,
-  ConnectionRunner, MtuMath}.kt` (V6.A1, V6.A2, V6.A3).
-- Host v6: `android/wgbridge_native/host_forwarder.go` (V6.H1,
-  V6.H2, V6.H2b) and `android/app/src/main/kotlin/.../HostModeBackend.kt`.
+  ConnectionRunner, MtuMath}.kt`.
+- Host v6: `android/wgbridge_native/host_forwarder.go`
 - Enrollment wire format: `signalling/.../EnrollOkPlain.kt`,
-  `daemon/wireguardrtc` (V6.3).
-- ULA allocation: `HostSubnetAllocator.kt` (V6.2).
+  `daemon/wireguardrtc`.
+- ULA allocation: `HostSubnetAllocator.kt`.
 
 ## What's deferred (known caveats)
 
-These are documented in `ipv6-design.md` under the V6.H2b entry —
+These are documented in `ipv6-design.md` under the ICMPv6 forwarder section —
 none affect normal use:
 
 - IPv6 extension headers (Fragment, HBH) are dropped at the host

@@ -1,26 +1,25 @@
-# Joiner-N + Cascade-N Design — D4 phase 2
+# Multi-Tunnel Joiner + Cascade Design
 
-> Status: **DRAFT — Option 1 primary; ready for review.**
-> Author: agentic / supervised
+> Status: **DRAFT — primary shape settled; ready for review.**
 > Last touched: 2026-05-15
 
 ## Background
 
-D4 phase 1 (host-N) shipped in commits `eea8e00..6ef5949`:
+The first phase generalised host-mode to N concurrent tunnels:
 
 - `HostModeBackend` keeps a `ConcurrentHashMap<TunnelId, Slot>` of N
-  independent wireguard-go bridges (`D4.H1`).
+  independent wireguard-go bridges.
 - `WgrtcViewModel.activeTunnelIds` is a unified flow; per-tunnel
   `throughputFor(id)` / `peerStatsFor(id)` / `isActive(id)` flows
-  are `WhileSubscribed`-cached (`D4.H2`).
-- FGS notification body enumerates active tunnel names (`D4.H3`).
-- `PortCollisionException` fail-fast (`D4.H4`).
+  are `WhileSubscribed`-cached.
+- FGS notification body enumerates active tunnel names.
+- `PortCollisionException` fail-fast.
 - Instrumented coexistence + dual-stack inner-v6 tests under real
-  JNI on x86_64 emulator and ARC ChromeOS (`D4.H5`).
+  JNI on x86_64 emulator and ARC ChromeOS.
 
-Phase 2 generalises **joiner** tunnels to N concurrent, and layers
-**cascade** routing on top of that for host tunnels that want to
-egress via a joiner.
+This document covers the next phase: generalising **joiner** tunnels
+to N concurrent, and layering **cascade** routing on top of that for
+host tunnels that want to egress via a joiner.
 
 ## Primary architecture — Joiner-N
 
