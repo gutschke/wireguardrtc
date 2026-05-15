@@ -147,25 +147,26 @@ class HostModeBackendInstrumentedTest {
         val tunnel = hostTunnel()
 
         be.start(tunnel)
-        assertNotNull("first start failed to register active tunnel",
-            be.activeTunnelId)
+        assertTrue("first start failed to register active tunnel",
+            be.activeTunnelIds.value.contains(tunnel.id))
 
-        be.stop()
-        assertNull("stop should clear activeTunnelId", be.activeTunnelId)
+        be.stop(tunnel.id)
+        assertTrue("stop should clear active tunnel id from the set",
+            tunnel.id !in be.activeTunnelIds.value)
 
         // The crash, if it happens, fires here:
         be.start(tunnel)
-        assertNotNull("second start failed to register active tunnel",
-            be.activeTunnelId)
+        assertTrue("second start failed to register active tunnel",
+            be.activeTunnelIds.value.contains(tunnel.id))
 
         // Hammer it a few more times — the user's repro sometimes
         // needed a second cycle. Each iteration must remain crash-free.
         repeat(3) {
-            be.stop()
+            be.stop(tunnel.id)
             be.start(tunnel)
         }
 
-        be.stop()
+        be.stop(tunnel.id)
     }
 
     /**
@@ -225,7 +226,7 @@ class HostModeBackendInstrumentedTest {
         // appear; hex of peer2 SHOULD. Convert via the same path
         // the parser uses so the assertion isn't sensitive to
         // case / formatting subtleties.
-        val stats = be.snapshotStats()
+        val stats = be.snapshotStats(tunnel1.id)
         assertNotNull("snapshotStats returned null after reconfigure", stats)
         val peers = stats!!.peers.keys
         assertTrue("revoked peer $peerB64 still in wg-go table: $peers",
@@ -233,6 +234,6 @@ class HostModeBackendInstrumentedTest {
         assertTrue("new peer $peer2B64 missing from wg-go table: $peers",
             peer2B64 in peers)
 
-        be.stop()
+        be.stop(tunnel1.id)
     }
 }

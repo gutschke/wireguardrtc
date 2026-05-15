@@ -11,6 +11,10 @@ import androidx.compose.runtime.compositionLocalOf
 val LocalConnect = compositionLocalOf<(String) -> Unit> {
     error("LocalConnect not provided")
 }
-val LocalDisconnect = compositionLocalOf<() -> Unit> {
+/** Disconnect a specific tunnel by id.  Per-tunnel since D4.H2 —
+ * before then the app could only have one tunnel up at a time so
+ * "the active tunnel" was unambiguous, but with N concurrent host
+ * tunnels the UI needs to say which one to bring down. */
+val LocalDisconnect = compositionLocalOf<(String) -> Unit> {
     error("LocalDisconnect not provided")
 }

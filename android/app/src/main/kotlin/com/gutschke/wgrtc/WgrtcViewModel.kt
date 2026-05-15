@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.gutschke.wgrtc.data.ActiveTunnelTracker
 import com.gutschke.wgrtc.data.HostModeFactory
 import com.gutschke.wgrtc.data.HostModeReconfigurer
 import com.gutschke.wgrtc.data.JoinerVpnBinding
@@ -39,8 +40,13 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -70,14 +76,22 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  private val _tunnels = MutableStateFlow<List<Tunnel>>(emptyList())
  val tunnels: StateFlow<List<Tunnel>> = _tunnels.asStateFlow()
 
- /** The id of the tunnel currently UP, or null. */
- private val _activeTunnelId = MutableStateFlow<String?>(null)
- val activeTunnelId: StateFlow<String?> = _activeTunnelId.asStateFlow()
+ /** The id of the joiner-side tunnel currently UP, or null.
+ *
+ * Joiner tunnels are subject to Android's per-process VpnService
+ * singleton — at most one can be active at a time.  Host tunnels
+ * use a separate slot group ([HostModeBackend.activeTunnelIds])
+ * that allows N concurrent entries since D4.H1.
+ *
+ * UI should not read this directly — use [activeTunnelIds] for
+ * the unified view, or [isActive] for a per-tunnel boolean. */
+ private val _activeJoinerTunnelId = MutableStateFlow<String?>(null)
+ val activeJoinerTunnelId: StateFlow<String?> = _activeJoinerTunnelId.asStateFlow()
 
  /** Set by paths that intentionally drive an in-place reconfigure
  * on a tunnel that is already UP, so a transient DOWN→UP cycle
  * in the underlying runner doesn't briefly null
- * [_activeTunnelId] and leave the UI flickering "Idle". */
+ * [_activeJoinerTunnelId] and leave the UI flickering "Idle". */
  @Volatile
  private var reconfiguringTunnelId: String? = null
 
@@ -95,6 +109,73 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  /** State string ("DOWN", "UP", "TOGGLE", "FAILED", …) for the live tunnel. */
  private val _liveState = MutableStateFlow("DOWN")
  val liveState: StateFlow<String> = _liveState.asStateFlow()
+
+ /**
+ * Unified "what tunnels are currently up" — the union of the
+ * joiner slot (at most one id) and the host slot map (N ids
+ * since D4.H1).  Single source of truth for UI status badges:
+ * `activeTunnelIds.value.contains(tunnel.id)`.
+ *
+ * Built lazily so the test seam can construct a [WgrtcViewModel]
+ * subclass without a live [WgrtcApp.instance.hostModeBackend] —
+ * the lazy thunk runs on first collection, by which point real
+ * code has gone through `WgrtcApp.onCreate`.
+ *
+ * Sharing strategy: [SharingStarted.Eagerly].  Unlike the
+ * per-tunnel caches below, this flow is read via `.value` by
+ * non-UI paths even when the UI isn't subscribed:
+ * [activeTunnelsForOverlapGate] gates `connect`, [disconnect] /
+ * [disconnectAll] decide what to tear down, and the `init` block
+ * reconciles after Activity recreate.  `WhileSubscribed(...)`
+ * would let those `.value` reads return a stale snapshot whenever
+ * no Compose collector was attached, mis-routing the disconnect
+ * path.  This is the one combined flow that pays for an idle
+ * collector; the per-tunnel slices below switch to
+ * `WhileSubscribed` because they're leaf flows used only by the
+ * UI.
+ */
+ val activeTunnelIds: StateFlow<Set<String>> by lazy {
+ ActiveTunnelTracker.combinedFlow(
+ joiner = _activeJoinerTunnelId,
+ host = WgrtcApp.instance.hostModeBackend.activeTunnelIds,
+ ).stateIn(
+ viewModelScope,
+ SharingStarted.Eagerly,
+ ActiveTunnelTracker.union(
+ _activeJoinerTunnelId.value,
+ WgrtcApp.instance.hostModeBackend.activeTunnelIds.value,
+ ),
+ )
+ }
+
+ /**
+ * Per-tunnel membership flow.  Cached so two screens watching the
+ * same id share a single underlying combine() pipeline — Compose
+ * recomposes will re-acquire the same StateFlow on every render
+ * and shouldn't churn the upstream.
+ *
+ * D4.H2 leak fix: sharing strategy is
+ * [SharingStarted.WhileSubscribed] with a 5 s grace window so a
+ * Compose screen-swap doesn't tear down the upstream collector,
+ * but an unsubscribed tunnel (the user navigated away) no longer
+ * keeps a permanent collector rooted in [viewModelScope].
+ * [deleteTunnel] additionally evicts the cache entry so a
+ * rename/delete cycle in a long-lived process can't grow the
+ * cache unboundedly.  Compose-only flow — there is no non-UI
+ * caller that reads `.value` for these.
+ */
+ private val isActiveCache = java.util.concurrent.ConcurrentHashMap<String, StateFlow<Boolean>>()
+ fun isActive(tunnelId: String): StateFlow<Boolean> =
+ isActiveCache.getOrPut(tunnelId) {
+ activeTunnelIds
+ .map { it.contains(tunnelId) }
+ .distinctUntilChanged()
+ .stateIn(
+ viewModelScope,
+ SharingStarted.WhileSubscribed(5_000),
+ activeTunnelIds.value.contains(tunnelId),
+ )
+ }
 
  /** Per-tunnel live race-winner endpoint, separate from the
  * persisted Endpoint=… line in the wg-quick config. The UI
@@ -139,22 +220,68 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * readable reason ENROLL_ERR carried). */
  data class TokenUsedAlert(val serverNote: String?)
 
- /** Sampled RX/TX counters + per-second rate for the live tunnel.
- * `null` while no tunnel is active (or while the first sample
- * hasn't been taken yet, which is sub-second). */
- private val _throughput = MutableStateFlow<ThroughputStats?>(null)
- val throughput: StateFlow<ThroughputStats?> = _throughput.asStateFlow()
+ /**
+ * Sampled RX/TX counters + per-second rate keyed by tunnel id.
+ * One entry per currently-active tunnel (joiner or any of the
+ * N host slots).  Empty when nothing is up.  Per-tunnel readers
+ * use [throughputFor] which derives a tunnel-scoped flow.
+ */
+ private val _throughput = MutableStateFlow<Map<String, ThroughputStats>>(emptyMap())
+ val throughput: StateFlow<Map<String, ThroughputStats>> = _throughput.asStateFlow()
  private var throughputJob: Job? = null
 
- /** Per-peer slice of the active tunnel's stats. Map key is the
- * peer's base64 pubkey (matches [EnrolledPeer.pubkeyB64]).
- * Empty when no tunnel is up; refreshed at the same ~1 Hz
- * cadence as [throughput]. Used by the host-mode peer list
- * to render "Last handshake N s ago" per row. */
- private val _peerStats =
- MutableStateFlow<Map<String, com.gutschke.wgrtc.data.PeerStats>>(emptyMap())
- val peerStats: StateFlow<Map<String, com.gutschke.wgrtc.data.PeerStats>> =
+ /** Derived per-tunnel throughput stream.  Cached so repeat
+ * subscriptions for the same id share an upstream collector.
+ * Sharing: [SharingStarted.WhileSubscribed] — see [isActive] for
+ * the same leak-avoidance rationale.  The throughput sampler
+ * still writes into [_throughput] every tick regardless of
+ * subscribers; this flow is just the per-id projection that
+ * Compose pulls. */
+ private val throughputCache =
+ java.util.concurrent.ConcurrentHashMap<String, StateFlow<ThroughputStats?>>()
+ fun throughputFor(tunnelId: String): StateFlow<ThroughputStats?> =
+ throughputCache.getOrPut(tunnelId) {
+ _throughput
+ .map { it[tunnelId] }
+ .distinctUntilChanged()
+ .stateIn(
+ viewModelScope,
+ SharingStarted.WhileSubscribed(5_000),
+ _throughput.value[tunnelId],
+ )
+ }
+
+ /**
+ * Per-peer slice of every active tunnel's stats, outer-keyed by
+ * tunnel id, inner-keyed by the peer's base64 pubkey (matches
+ * [EnrolledPeer.pubkeyB64]).  Refreshed at the same ~1 Hz cadence
+ * as [throughput].  Empty inner map for tunnels that haven't
+ * produced peer counters yet.
+ */
+ private val _peerStats = MutableStateFlow<
+ Map<String, Map<String, com.gutschke.wgrtc.data.PeerStats>>
+ >(emptyMap())
+ val peerStats: StateFlow<Map<String, Map<String, com.gutschke.wgrtc.data.PeerStats>>> =
  _peerStats.asStateFlow()
+
+ /** Per-tunnel peer-stats stream — what the host-mode peer list
+ * subscribes to via the detail screen's tunnel.id.
+ * Sharing: [SharingStarted.WhileSubscribed] — see [isActive] for
+ * the same leak-avoidance rationale. */
+ private val peerStatsCache = java.util.concurrent.ConcurrentHashMap<
+ String, StateFlow<Map<String, com.gutschke.wgrtc.data.PeerStats>>
+ >()
+ fun peerStatsFor(tunnelId: String): StateFlow<Map<String, com.gutschke.wgrtc.data.PeerStats>> =
+ peerStatsCache.getOrPut(tunnelId) {
+ _peerStats
+ .map { it[tunnelId].orEmpty() }
+ .distinctUntilChanged()
+ .stateIn(
+ viewModelScope,
+ SharingStarted.WhileSubscribed(5_000),
+ _peerStats.value[tunnelId].orEmpty(),
+ )
+ }
 
  /** One-shot text inbox for the Paste screen — populated by Scan/external
  * intent prefill, consumed by [PasteTunnelScreen] on its next compose. */
@@ -210,7 +337,12 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // endpointUpdates collector above will re-setState with
  // the listener's rewritten config once the daemon's
  // responsive OFFER arrives. Acceptable trade-off.
- val id = _activeTunnelId.value ?: return@NetworkChangeMonitor
+ // network-change wakes target the joiner tunnel — the joiner
+ // is the side whose endpoint can roam (host tunnels are
+ // entered, not joined).  Host tunnels don't need a wake on
+ // network change; the daemon-side equivalent is the listener
+ // path.
+ val id = _activeJoinerTunnelId.value ?: return@NetworkChangeMonitor
  Log.i("wgrtc-vm", "network change → force-wake tunnel $id")
  hub.wake(id, force = true)
  // also notify the roam handler so it can
@@ -252,21 +384,19 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // real state instead of showing the tunnel as Idle (which
  // then prompts the user to tap Connect and earns them an
  // "another tunnel is already running" error from
- // HostModeBackend.start). Mirrors the host-mode connect
- // branch at the top of `connect()`. Joiner-side recovery is
- // a separate problem — the bound JoinerVpnService is per-
- // Context, so a new Activity always starts unbound.
- //
- // D4.H2: with N concurrent host tunnels the ViewModel's
- // single `_activeTunnelId` slot can only mirror one of them;
- // we pick "any" here as a best-effort guess. Fully
- // representing N-active in the UI lands with D4.H2.
- WgrtcApp.instance.hostModeBackend.activeTunnelIds.value
-  .firstOrNull()?.let { liveId ->
-   _activeTunnelId.value = liveId
-   _liveState.value = "UP"
-   startThroughputSampler()
-  }
+ // HostModeBackend.start). The unified [activeTunnelIds] flow
+ // already mirrors the backend's set (the StateFlow combine
+ // picks up `hostModeBackend.activeTunnelIds.value` on
+ // construction), so we just need to (a) bring `_liveState`
+ // out of "DOWN" if anything is up, and (b) restart the
+ // throughput sampler so the detail screen has stats to
+ // display. Joiner-side recovery is a separate problem — the
+ // bound JoinerVpnService is per-Context, so a new Activity
+ // always starts unbound.
+ if (WgrtcApp.instance.hostModeBackend.activeTunnelIds.value.isNotEmpty()) {
+ _liveState.value = "UP"
+ startThroughputSampler()
+ }
  // Subscribe to the hub's endpoint-applied events so the
  // viewmodel's _tunnels stays in sync with the disk state
  // when listeners (which run in the hub's scope) rewrite
@@ -283,15 +413,14 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // and shouldn't depend on the wireguard backend's
  // setState. The hub already saved the new
  // configText to disk; here we just re-apply it.
- if (_activeTunnelId.value == evt.tunnelId) {
+ if (_activeJoinerTunnelId.value == evt.tunnelId) {
  reconfiguringTunnelId = evt.tunnelId
  try {
  // Live endpoint update: route through the
  // joiner service's in-place UAPI reconfigure.
- // Host () tunnels never have their
- // Endpoint = line rewritten by the listener,
- // so this is only load-bearing for
- // joiner-side roam.
+ // Host tunnels never have their Endpoint =
+ // line rewritten by the listener, so this is
+ // only load-bearing for joiner-side roam.
  activeJoinerBinding?.service?.let { svc ->
  withContext(Dispatchers.IO) {
  svc.reconfigure(evt.tunnel.configText)
@@ -314,12 +443,33 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
 
  fun deleteTunnel(id: String) {
  viewModelScope.launch {
- if (_activeTunnelId.value == id) disconnect()
+ if (activeTunnelIds.value.contains(id)) disconnect(id)
  hub.stop(id)
  val updated = _tunnels.value.filterNot { it.id == id }
  _tunnels.value = updated
  withContext(Dispatchers.IO) { hub.saveTunnels(updated) }
+ // D4.H2: drop cached per-tunnel flows so a long-lived
+ // process with many rename/delete cycles can't grow the
+ // caches unboundedly.  Each StateFlow was rooted in
+ // viewModelScope; without eviction those subscriptions
+ // outlive the tunnel even with WhileSubscribed, because the
+ // map still holds the StateFlow object (and the
+ // grace-window timer would never see a re-subscribe).
+ pruneTunnelCaches(id)
  }
+ }
+
+ /** Evict the per-tunnel cache entries for [tunnelId].  Called by
+ * [deleteTunnel] and exposed package-private for unit tests of
+ * the leak-fix contract.  The sampler's writes into
+ * [_throughput] / [_peerStats] for a still-active tunnel keep
+ * working; they just don't get reflected through a cached
+ * StateFlow until the next subscriber pulls a fresh one.  Safe
+ * to call for an id that was never cached (no-op). */
+ internal fun pruneTunnelCaches(tunnelId: String) {
+ isActiveCache.remove(tunnelId)
+ throughputCache.remove(tunnelId)
+ peerStatsCache.remove(tunnelId)
  }
 
  // ─── OFFER listener lifecycle moved to ListenerHub ────────────
@@ -375,8 +525,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // Bring the tunnel down if it's currently up — wg-go can't
  // hot-swap config, and even if it could the OFFER listener's
  // candidate cache may now be stale (broker change).
- if (_activeTunnelId.value == updated.id) {
- disconnect()
+ if (activeTunnelIds.value.contains(updated.id)) {
+ disconnect(updated.id)
  }
  // Listener subscription depends on the broker; tear down the
  // old one before we save so reconcileFromStore picks up the
@@ -696,22 +846,19 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
 
  /**
  * The tunnels currently considered "active" for the purposes of the
- * AllowedIPs overlap gate.  Today there are two independent slot
- * groups: the joiner-side ([_activeTunnelId]) and the host-side
- * ([HostModeBackend.activeTunnelIds] — N entries since D4.H1).  Both
- * surface here so the gate catches a joiner-side claim that would
- * conflict with any already-up host (or vice versa).
+ * AllowedIPs overlap gate.  Reads the unified [activeTunnelIds]
+ * directly — it already encodes the union of the joiner slot
+ * ([_activeJoinerTunnelId]) and the host slot map
+ * ([HostModeBackend.activeTunnelIds], N entries since D4.H1).
  */
  private fun activeTunnelsForOverlapGate(): List<Tunnel> {
  val byId = _tunnels.value.associateBy { it.id }
- val ids = mutableSetOf<String>()
- _activeTunnelId.value?.let { ids.add(it) }
- try {
- WgrtcApp.instance.hostModeBackend.activeTunnelIds.value
-  .forEach { ids.add(it) }
+ val ids = try {
+ activeTunnelIds.value
  } catch (_: Throwable) {
  // WgrtcApp not initialised yet (unit-test seam) — treat as
- // no active host-mode tunnel.
+ // no active tunnel.
+ emptySet()
  }
  return ids.mapNotNull { byId[it] }
  }
@@ -769,15 +916,20 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  if (t.source == Tunnel.Source.HOST_MODE) {
  try {
  WgrtcApp.instance.hostModeBackend.start(t)
- _activeTunnelId.value = id
+ // The backend's [activeTunnelIds] now contains this id;
+ // [activeTunnelIds] (the unified flow on this VM)
+ // mirrors it automatically.  We only need to nudge
+ // `_liveState` and the per-tunnel sampler.
  _liveState.value = "UP"
  _lastError.value = null
  startThroughputSampler()
  Log.i("wgrtc-vm", "connect: host tunnel $id is up")
  } catch (e: Throwable) {
  Log.e("wgrtc-vm", "host start failed", e)
- _activeTunnelId.value = null
- _liveState.value = "DOWN"
+ // Don't touch `_liveState` here — other tunnels may be
+ // up (since D4.H1) and a global "DOWN" would mislead
+ // the UI.  The unified set already excludes this id
+ // because the backend's start() didn't add it.
  _lastError.value = "Host start failed: ${e.message}"
  throw e
  } finally {
@@ -908,7 +1060,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  "${r.finalEndpoint.ip}:${r.finalEndpoint.port} " +
  "(egress=${r.egressInterface ?: "default"}, " +
  "wait=${r.handshakeWaitMs}ms)")
- _activeTunnelId.value = id
+ _activeJoinerTunnelId.value = id
  // Without this the UI's TunnelDetailScreen falls
  // through to its `isUp && liveState != "UP"`
  // arm and shows the "connecting" spinner
@@ -1014,7 +1166,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
  Log.w("wgrtc-vm", "connect race failed: $msg")
  _lastError.value = msg
- _activeTunnelId.value = null
+ _activeJoinerTunnelId.value = null
  // Clean up the joiner-vpn-service binding (if
  // any) — controller.bringDown closes the
  // runner but doesn't unbind the service.
@@ -1042,7 +1194,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  try { binding.service.start(parsed, t.configText) }
  catch (e: Throwable) { binding.unbind(); throw e }
  activeJoinerBinding = binding
- _activeTunnelId.value = id
+ _activeJoinerTunnelId.value = id
  _liveState.value = "UP"
  _lastError.value = null
  startThroughputSampler()
@@ -1054,11 +1206,11 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  } catch (t: Throwable) {
  Log.e("wgrtc-vm", "connect failed", t)
  _lastError.value = t.message ?: t.javaClass.simpleName
- _activeTunnelId.value = null
+ _activeJoinerTunnelId.value = null
  // stop the network monitor on failure too — without
  // this, an earlier successful connect's monitor stays
- // registered firing wakes for an _activeTunnelId that's
- // now null. Idempotent.
+ // registered firing wakes for a joiner that's now null.
+ // Idempotent.
  networkChangeMonitor.stop()
  activeRoamController?.stop()
  activeRoamController = null
@@ -1073,48 +1225,123 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
  }
 
- suspend fun disconnect() {
- // cancel any in-flight connect race so disconnect's
- // setState(DOWN) is the LAST backend mutation, not racing
+ /**
+ * Per-tunnel disconnect.  Pauses the host slot or tears down the
+ * joiner binding for [tunnelId] only; other host tunnels keep
+ * running.  Safe to call for an id that isn't actually up
+ * (idempotent no-op).
+ *
+ * UI callers (the per-row Disconnect button, the Disconnect button
+ * on TunnelDetailScreen) should always use this.  The whole-app
+ * sweep lives on [disconnectAll].
+ */
+ suspend fun disconnect(tunnelId: String) {
+ val hostBackend = WgrtcApp.instance.hostModeBackend
+ val isJoiner = _activeJoinerTunnelId.value == tunnelId
+ val isHost = hostBackend.activeTunnelIds.value.contains(tunnelId)
+ if (!isJoiner && !isHost) {
+ Log.i("wgrtc-vm", "disconnect($tunnelId): not active, no-op")
+ return
+ }
+ if (isJoiner) {
+ // Cancel any in-flight connect race so disconnect's
+ // tear-down is the LAST backend mutation, not racing
  // the next setEndpoint of an unfinished candidate sweep.
  // cancelAndJoin waits for the cancellation to settle —
  // ConnectionRunner's delay() / setState calls are
  // cooperatively cancellable.
+ tearDownJoinerInternal()
+ }
+ if (isHost) {
+ // Host-side per-tunnel "pause not teardown" — leaves
+ // the wireguard-go device alive so a subsequent
+ // [connect] is a fast resume instead of a full
+ // close+reopen JNI cycle (F16).  [disconnectAll]
+ // bypasses this path and calls
+ // [HostModeBackend.teardownAll] instead.
+ try { hostBackend.stop(tunnelId) }
+ catch (t: Throwable) {
+ Log.e("wgrtc-vm", "host stop $tunnelId failed", t)
+ }
+ _throughput.update { it - tunnelId }
+ _peerStats.update { it - tunnelId }
+ }
+ // [_liveState] is a legacy single-tunnel signal; collapse to
+ // DOWN only when nothing is left up.  The unified
+ // [activeTunnelIds] is the actual source of truth for the
+ // UI's per-tunnel badge.
+ if (activeTunnelIds.value.isEmpty()) {
+ _liveState.value = "DOWN"
+ stopThroughputSampler()
+ }
+ }
+
+ /**
+ * Sweep disconnect: stop every running tunnel (joiner + every
+ * host slot).  Used by panic / app-exit paths where the JVM is
+ * about to lose the process, so JNI resources must actually be
+ * released — not just paused.
+ *
+ * Per-tunnel [disconnect] is the user-facing "pause" path: it
+ * calls [HostModeBackend.stop] which suspends the slot but leaves
+ * the wireguard-go device alive (the F16 pause-not-close
+ * decision, avoids the close+reopen JNI panic that bit us
+ * earlier).  That's the right behaviour for a user tapping a
+ * row's Disconnect, but [disconnectAll] runs at app-exit /
+ * panic, so we route the host side through
+ * [HostModeBackend.teardownAll] instead — a full close that
+ * releases every JNI slot.  The joiner side has no equivalent
+ * "pause" so its teardown is the same as the per-tunnel path,
+ * factored into [tearDownJoinerInternal] so both callers share
+ * one implementation.
+ */
+ suspend fun disconnectAll() {
+ // 1. Joiner first — has a VpnService binding that has to
+ //    release before host teardown so HostNativeBackend isn't
+ //    racing on the same wireguard-go Device close path.
+ if (_activeJoinerTunnelId.value != null) {
+ try { tearDownJoinerInternal() }
+ catch (t: Throwable) {
+ Log.e("wgrtc-vm", "disconnectAll: joiner teardown failed", t)
+ }
+ }
+ // 2. Host slots — full JNI close, not pause.
+ try {
+ WgrtcApp.instance.hostModeBackend.teardownAll()
+ } catch (t: Throwable) {
+ Log.e("wgrtc-vm", "disconnectAll: host teardownAll failed", t)
+ }
+ // 3. State cleanup the same way disconnect() would — once
+ //    nothing is left up.  Throughput sampler stops itself
+ //    via stopThroughputSampler when both per-tunnel maps go
+ //    empty; the sampler also writes empty maps before its
+ //    job is cancelled, which would wake any per-id throughput
+ //    subscribers with null exactly once.
+ _throughput.value = emptyMap()
+ _peerStats.value = emptyMap()
+ if (activeTunnelIds.value.isEmpty()) {
+ _liveState.value = "DOWN"
+ stopThroughputSampler()
+ }
+ }
+
+ /** Tear down the joiner slot — cancel the in-flight connect
+ * coroutine, stop the network-change monitor + roam controller,
+ * stop and unbind the [JoinerVpnService], and clear the active
+ * id + this tunnel's stats entries.  Shared between [disconnect]
+ * (per-tunnel pause-or-disconnect path) and [disconnectAll]
+ * (sweep teardown).  Caller is responsible for the
+ * `_liveState`/throughput-sampler collapse afterwards. */
+ private suspend fun tearDownJoinerInternal() {
+ val joinerId = _activeJoinerTunnelId.value ?: return
  connectJob?.let {
  try { it.cancelAndJoin() }
  catch (e: Throwable) { Log.w("wgrtc-vm", "connect cancel failed", e) }
  }
  connectJob = null
- stopThroughputSampler()
  networkChangeMonitor.stop()
  activeRoamController?.stop()
  activeRoamController = null
- // path takes precedence — if the active tunnel is
- // running on wgbridge, never call into GoBackend (whose
- // single tunnel slot is unrelated to the runner) so
- // we don't accidentally cycle a sibling.
- val modeABackend = WgrtcApp.instance.hostModeBackend
- // D4.H2: disconnect() today is "tear down the one tunnel the
- // ViewModel knows is active"; with N concurrent host tunnels
- // we conservatively pause every running host slot so the user's
- // Disconnect tap behaves the same as before.  A per-tunnel
- // disconnect button lands with D4.H2.
- if (modeABackend.activeTunnelIds.value.isNotEmpty()) {
- for (id in modeABackend.activeTunnelIds.value.toList()) {
- try { modeABackend.stop(id) }
- catch (t: Throwable) {
- Log.e("wgrtc-vm", "stop $id failed", t)
- }
- }
- _activeTunnelId.value = null
- _liveState.value = "DOWN"
- return
- }
- // WGBRIDGE joiner path — same precedence reasoning.
- // The bound JoinerVpnService owns wireguard-go for the
- // joiner tunnel; calling setState on wireguard-android's
- // GoBackend is a no-op at best, a process-wide
- // dual-runtime hazard at worst.
  activeJoinerBinding?.let { binding ->
  try { binding.service.stop() }
  catch (t: Throwable) {
@@ -1123,8 +1350,9 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  binding.unbind()
  activeJoinerBinding = null
  }
- _activeTunnelId.value = null
- _liveState.value = "DOWN"
+ _activeJoinerTunnelId.value = null
+ _throughput.update { it - joinerId }
+ _peerStats.update { it - joinerId }
  }
 
  // ---------------------------- HostModeReconfigurer
@@ -1148,7 +1376,12 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  override suspend fun reconfigureHostTunnel(
  tunnelId: String, newConfigText: String,
  ) {
- if (_activeTunnelId.value != tunnelId) {
+ // The unified gate: skip the IpcSet when this tunnel
+ // isn't actually a live host slot.  Joiner tunnels can't
+ // host so they're trivially skipped by the
+ // hostModeBackend membership check.
+ val modeABackend = WgrtcApp.instance.hostModeBackend
+ if (!modeABackend.activeTunnelIds.value.contains(tunnelId)) {
  Log.i("wgrtc-vm",
  "host-mode reconfig: tunnel $tunnelId not active; " +
  "deferring wg-go reload until next Connect")
@@ -1157,8 +1390,6 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // In-place IpcSet, no DOWN cycle. Look up the canonical
  // tunnel by id so the Tunnel → UAPI conversion sees the
  // up-to-date enrolledPeers list.
- val modeABackend = WgrtcApp.instance.hostModeBackend
- if (!modeABackend.activeTunnelIds.value.contains(tunnelId)) return
  val tunnel = _tunnels.value.firstOrNull { it.id == tunnelId } ?: return
  try {
  withContext(Dispatchers.IO) { modeABackend.reconfigure(tunnel) }
@@ -1176,75 +1407,91 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  *
  * Source-of-truth selection happens per tick: the host-mode
  * runner's UAPI dump wins when a host tunnel is active,
- * otherwise we read from the active joiner. Both feed the
- * same [ThroughputStats] / [_peerStats] flows so the
- * status line is source-agnostic. */
+ * otherwise we read from the active joiner.  Per-tunnel entries
+ * are written into [_throughput] / [_peerStats] keyed by
+ * `tunnel.id` so the UI can render N independent host
+ * tunnels at once. */
  private fun startThroughputSampler() {
  throughputJob?.cancel()
- _throughput.value = null
  throughputJob = viewModelScope.launch(Dispatchers.IO) {
- var prevRx = 0L
- var prevTx = 0L
- var prevAt = System.nanoTime()
+ val baselines = mutableMapOf<String, SampleBaseline>()
  // Seed via an immediate sample (rates start at 0).
- sampleOnce(prevRx, prevTx, prevAt, seeding = true)?.let {
- prevRx = it.rxBytes; prevTx = it.txBytes; prevAt = it.atNanos
- }
+ sampleOnce(baselines, seeding = true)
  while (isActive) {
  delay(1_000)
- sampleOnce(prevRx, prevTx, prevAt, seeding = false)?.let {
- prevRx = it.rxBytes; prevTx = it.txBytes; prevAt = it.atNanos
- }
+ sampleOnce(baselines, seeding = false)
  }
  }
  }
 
- /** One throughput sample. Picks the live source (host
- * backend or the active joiner runner), updates [_throughput]
- * / [_peerStats], and returns the new baseline values (or null
- * when the source refused to give us a reading this tick). */
+ /** One throughput tick — refreshes [_throughput] / [_peerStats]
+ * for every currently-active tunnel (joiner + each running host
+ * slot).  Updates [baselines] in place so the next tick can
+ * compute correct per-second rates.  Drops entries for tunnels
+ * that aren't active any more so a freshly-stopped slot doesn't
+ * leak stale counters. */
  private fun sampleOnce(
- prevRx: Long, prevTx: Long, prevAt: Long, seeding: Boolean,
- ): SampleBaseline? {
- val modeABackend = WgrtcApp.instance.hostModeBackend
- // D4.H2: sampler still samples the ViewModel's single
- // `_activeTunnelId` slot.  When that tunnel is host-mode and
- // running, prefer its stats; otherwise fall back to the joiner
- // path.  Per-tunnel throughput surfacing lands with D4.H2.
- val primaryHostId = _activeTunnelId.value
-  ?.takeIf { modeABackend.activeTunnelIds.value.contains(it) }
- val stats: UapiStats = when {
- primaryHostId != null ->
- modeABackend.snapshotStats(primaryHostId) ?: return null
- modeABackend.activeTunnelIds.value.isNotEmpty() ->
- // ViewModel's _activeTunnelId is stale (e.g. host
- // tunnel started outside this VM); sample any running
- // host slot so the UI doesn't go dark.
- modeABackend.snapshotStats(
-  modeABackend.activeTunnelIds.value.first()
- ) ?: return null
- activeJoinerBinding != null ->
- activeJoinerBinding?.service?.snapshotStats() ?: return null
- else -> return null
- }
- return try {
- val rx = stats.totalRxBytes
- val tx = stats.totalTxBytes
+ baselines: MutableMap<String, SampleBaseline>,
+ seeding: Boolean,
+ ) {
+ val hostBackend = WgrtcApp.instance.hostModeBackend
+ val hostIds = hostBackend.activeTunnelIds.value
+ val joinerId = _activeJoinerTunnelId.value
+ val joinerBinding = activeJoinerBinding
  val now = System.nanoTime()
- val dtSec = (now - prevAt).coerceAtLeast(1).toDouble() / 1e9
- _throughput.value = ThroughputStats(
- rxBytes = rx, txBytes = tx,
- rxBytesPerSec = if (seeding) 0.0 else ((rx - prevRx).coerceAtLeast(0)) / dtSec,
- txBytesPerSec = if (seeding) 0.0 else ((tx - prevTx).coerceAtLeast(0)) / dtSec,
- lastHandshakeEpochMs = stats.mostRecentHandshakeEpochMs,
- )
- _peerStats.value = stats.peers
- SampleBaseline(rx, tx, now)
- } catch (t: Throwable) {
- if (seeding) Log.w("wgrtc-vm", "initial sampleOnce failed", t)
- else Log.w("wgrtc-vm", "sampleOnce failed; retrying next tick", t)
+ val tps = mutableMapOf<String, ThroughputStats>()
+ val pps = mutableMapOf<String, Map<String, com.gutschke.wgrtc.data.PeerStats>>()
+ for (id in hostIds) {
+ val stats = try { hostBackend.snapshotStats(id) } catch (t: Throwable) {
+ if (seeding) Log.w("wgrtc-vm", "initial host sample $id failed", t)
+ else Log.w("wgrtc-vm", "host sample $id failed; retrying", t)
+ null
+ } ?: continue
+ recordSample(id, stats, now, seeding, baselines, tps, pps)
+ }
+ if (joinerId != null && joinerBinding != null) {
+ val stats = try { joinerBinding.service.snapshotStats() } catch (t: Throwable) {
+ if (seeding) Log.w("wgrtc-vm", "initial joiner sample failed", t)
+ else Log.w("wgrtc-vm", "joiner sample failed; retrying", t)
  null
  }
+ if (stats != null) {
+ recordSample(joinerId, stats, now, seeding, baselines, tps, pps)
+ }
+ }
+ // Prune baselines for tunnels that are no longer active so
+ // the next start-cycle reseeds cleanly.
+ val activeIds = hostIds + listOfNotNull(joinerId)
+ baselines.keys.retainAll(activeIds)
+ _throughput.value = tps
+ _peerStats.value = pps
+ }
+
+ private fun recordSample(
+ id: String,
+ stats: UapiStats,
+ now: Long,
+ seeding: Boolean,
+ baselines: MutableMap<String, SampleBaseline>,
+ tps: MutableMap<String, ThroughputStats>,
+ pps: MutableMap<String, Map<String, com.gutschke.wgrtc.data.PeerStats>>,
+ ) {
+ val prev = baselines[id]
+ val rx = stats.totalRxBytes
+ val tx = stats.totalTxBytes
+ val (rxRate, txRate) = if (seeding || prev == null) 0.0 to 0.0 else {
+ val dtSec = (now - prev.atNanos).coerceAtLeast(1).toDouble() / 1e9
+ val r = ((rx - prev.rxBytes).coerceAtLeast(0)) / dtSec
+ val t = ((tx - prev.txBytes).coerceAtLeast(0)) / dtSec
+ r to t
+ }
+ tps[id] = ThroughputStats(
+ rxBytes = rx, txBytes = tx,
+ rxBytesPerSec = rxRate, txBytesPerSec = txRate,
+ lastHandshakeEpochMs = stats.mostRecentHandshakeEpochMs,
+ )
+ pps[id] = stats.peers
+ baselines[id] = SampleBaseline(rx, tx, now)
  }
 
  private data class SampleBaseline(val rxBytes: Long, val txBytes: Long, val atNanos: Long)
@@ -1252,7 +1499,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  private fun stopThroughputSampler() {
  throughputJob?.cancel()
  throughputJob = null
- _throughput.value = null
+ _throughput.value = emptyMap()
  _peerStats.value = emptyMap()
  }
 

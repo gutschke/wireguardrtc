@@ -501,9 +501,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestDisconnect() {
+    private fun requestDisconnect(tunnelId: String) {
         lifecycleScope.launch {
-            vm.disconnect()
+            vm.disconnect(tunnelId)
         }
     }
 

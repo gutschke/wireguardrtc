@@ -112,7 +112,9 @@ fun HostModeSection(
     if (hm.enrolledPeers.isNotEmpty()) {
         Spacer(Modifier.height(12.dp))
         val invitations by vm.lastInvitations.collectAsState()
-        val peerStats by vm.peerStats.collectAsState()
+        // peerStats is keyed per-tunnel since D4.H2 (N concurrent
+        // host tunnels share one ViewModel); narrow to this tunnel.
+        val peerStats by vm.peerStatsFor(tunnel.id).collectAsState()
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             for (p in hm.enrolledPeers) {
                 // Prefer the durable copy on the EnrolledPeer

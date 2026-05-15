@@ -103,11 +103,17 @@ fun TunnelDetailScreen(
     vm: WgrtcViewModel = viewModel(),
 ) {
     val tunnels by vm.tunnels.collectAsState()
-    val activeId by vm.activeTunnelId.collectAsState()
+    val isUp by vm.isActive(tunnelId).collectAsState()
     val connectingId by vm.connectingTunnelId.collectAsState()
-    val liveState by vm.liveState.collectAsState()
+    // D4.H2: TunnelDetailScreen used to read vm.liveState (a
+    // legacy single-tunnel global) to derive its ConnectionState.
+    // With N concurrent tunnels that's wrong — tunnel A's UP
+    // would paint tunnel B's screen as Connected.  isActive(id)
+    // is per-tunnel; connectingTunnelId is already per-tunnel.
+    // Together they cover the full state ladder without touching
+    // the global signal.
     val liveEndpoints by vm.liveEndpoints.collectAsState()
-    val throughput by vm.throughput.collectAsState()
+    val throughput by vm.throughputFor(tunnelId).collectAsState()
     val tunnel = tunnels.firstOrNull { it.id == tunnelId }
     val connect = LocalConnect.current
     val disconnect = LocalDisconnect.current
@@ -123,12 +129,10 @@ fun TunnelDetailScreen(
         return
     }
 
-    val isUp = activeId == tunnel.id
     val isConnecting = connectingId == tunnel.id
     val state = when {
         isConnecting -> ConnectionState.Connecting
-        isUp && liveState.equals("UP", ignoreCase = true) -> ConnectionState.Up
-        isUp -> ConnectionState.Connecting // wg-go transitional
+        isUp -> ConnectionState.Up
         else -> ConnectionState.Idle
     }
 
@@ -183,7 +187,7 @@ fun TunnelDetailScreen(
                 tunnel = tunnel,
                 handshakeMs = throughput?.lastHandshakeEpochMs,
                 onConnect = { connect(tunnel.id) },
-                onDisconnect = disconnect,
+                onDisconnect = { disconnect(tunnel.id) },
             )
 
             ConnectionCard(
