@@ -31,7 +31,7 @@ object WgBridgeNative {
 
     /**
      * Construct a host-mode bridge with a userspace gvisor
-     * netstack. Used by . Returns:
+     * netstack. Returns:
      * > 0 : opaque handle
      * < 0 : error (see api.go for codes)
      */
@@ -43,9 +43,8 @@ object WgBridgeNative {
      * Returns:
      * > 0 : opaque handle for the other native methods
      * -1 : invalid fd (negative)
-     * -2 : CreateUnmonitoredTUNFromFD failed (SELinux /
-     * ioctl rejection — see
-     * memory/the dev-env README)
+     * -2 : CreateUnmonitoredTUNFromFD failed (SELinux / ioctl
+     *      rejection)
      * -3 : device.Up failed
      *
      * The handle takes ownership of [fd] — closing the bridge

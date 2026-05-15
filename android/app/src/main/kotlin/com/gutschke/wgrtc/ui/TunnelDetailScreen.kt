@@ -72,8 +72,7 @@ import com.gutschke.wgrtc.ui.theme.StatusUpContainerLight
 import com.gutschke.wgrtc.ui.theme.StatusUpLight
 
 /**
- * Tunnel detail screen — completely reorganised in . Layout
- * pattern:
+ * Tunnel detail screen. Layout pattern:
  *
  * 1. **Status hero card** — color-keyed to the current state
  * (Connected = teal-green, Connecting = amber, Idle =

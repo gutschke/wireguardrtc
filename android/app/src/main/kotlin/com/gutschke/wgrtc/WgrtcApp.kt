@@ -35,9 +35,9 @@ class WgrtcApp : Application() {
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /**
-     * host backend. Lazy by design — instantiating
-     * loads `libwgbridge_native.so`, the cgo + //export path
-     * we ship as the only userspace WG runtime since .
+     * Host backend. Lazy by design — instantiating loads
+     * `libwgbridge_native.so`, the cgo + //export path that is
+     * the only userspace WireGuard runtime we ship.
      */
     val hostModeBackend: HostModeBackend by lazy {
         // egress selector reads the user's policy choice from

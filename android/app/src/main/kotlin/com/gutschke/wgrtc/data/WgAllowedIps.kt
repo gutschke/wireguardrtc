@@ -45,7 +45,7 @@ object WgAllowedIps {
 
     /** Compiled-in dual-stack full-tunnel default — already
      * canonicalized. Single source of truth so we don't have to
-     * audit every literal `"0.0.0.0/0, ::/0"` we sprinkled
-     * around the codebase before . */
+     * audit every literal `"0.0.0.0/0, ::/0"` scattered around
+     * the codebase. */
     const val FULL_TUNNEL: String = "0.0.0.0/0,::/0"
 }
