@@ -196,7 +196,19 @@ class HostModeBackend(
         // → "10.99.0.0/24") drives the host forwarder's NIC2 default
         // route — see host_forwarder.go. Null disables through-host
         // forwarding without breaking the local-dst path.
-        val hostForwarderSubnet = canonicalSubnetForAddress(addr)
+        //
+        // V6.H2b — when the tunnel has a v6 ULA, append it
+        // (comma-separated, canonical no-whitespace form per
+        // WgAllowedIps).  The Go side's wgbridgeInstallHostForwarder
+        // splits the comma form and installs dual-stack routes +
+        // ICMPv6 transport handler accordingly.
+        val v4Subnet = canonicalSubnetForAddress(addr)
+        val hostForwarderSubnet = when {
+            v4Subnet != null && hm.subnetV6 != null -> "$v4Subnet,${hm.subnetV6}"
+            v4Subnet != null -> v4Subnet
+            hm.subnetV6 != null -> hm.subnetV6
+            else -> null
+        }
         return HostModeRunnerConfig(
             localAddr = localAddr,
             listenPort = listenPort,
@@ -222,8 +234,11 @@ class HostModeBackend(
          * factories replace under production wiring. */
         val REFUSE_ALL: (String, String) -> InetSocketAddress? = { _, _ -> null }
 
-        /** "10.99.0.1/24" → "10.99.0.0/24"; null on parse failure
-         * or IPv6 (the host forwarder is IPv4-only —x). */
+        /** Canonicalise the v4 subnet for the host forwarder:
+         * `"10.99.0.1/24"` → `"10.99.0.0/24"`.  Null on parse
+         * failure or v6 input — v6 is appended separately by the
+         * caller via the comma-form (`subnetV6` is already in
+         * network form, no canonicalisation needed). */
         fun canonicalSubnetForAddress(addr: String): String? {
             val slash = addr.indexOf('/')
             if (slash <= 0) return null

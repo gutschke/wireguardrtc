@@ -29,6 +29,7 @@ import (
 	"context"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,11 +37,14 @@ import (
 
 	icmpx "golang.org/x/net/icmp"
 	netipv4 "golang.org/x/net/ipv4"
+	netipv6 "golang.org/x/net/ipv6"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	gvchannel "gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	gvipv4 "gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	gvipv6 "gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	gvstack "gvisor.dev/gvisor/pkg/tcpip/stack"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
@@ -61,6 +65,9 @@ const (
 	// Linux IANA protocol number for ICMPv4 (icmp.ParseMessage
 	// takes IANA, NOT gvisor's NetworkProtocolNumber).
 	protoICMPv4 = 1
+	// Linux IANA protocol number for ICMPv6 / IPv6-ICMP. Same
+	// distinction: icmp.ParseMessage takes IANA values.
+	protoICMPv6 = 58
 )
 
 type hostForwarderState struct {
@@ -102,9 +109,17 @@ func extractChannelEndpoint(n *netstack.Net) *gvchannel.Endpoint {
 }
 
 // wgbridgeInstallHostForwarder installs the Option B host
-// forwarder on the bridge identified by [handle]. [peerSubnet]
-// (CIDR, e.g. "10.99.0.0/24") is the WG-side subnet kept on NIC1;
-// everything else gets routed via NIC2 + the forwarder goroutine.
+// forwarder on the bridge identified by [handle].  `peerSubnet`
+// is the WG-side subnet(s) kept on NIC1; everything else gets
+// routed via NIC2 + the forwarder goroutine.
+//
+// V6.H2b: `peerSubnet` is now a comma-separated CIDR list
+// (e.g. `"10.99.0.0/24,fd00:dead:beef::/64"`) — same wire format
+// as `wgbridgeNew` (V6.H1).  Whitespace tolerated on input.  When
+// a v6 entry is present, the forwarder also installs a v6 route +
+// enables ipv6 forwarding + registers the ICMPv6 transport handler
+// so non-local v6 destinations route through the same forwarder
+// goroutine as v4.
 //
 // Returns:
 //
@@ -112,7 +127,8 @@ func extractChannelEndpoint(n *netstack.Net) *gvchannel.Endpoint {
 //	 -1 : invalid bridge handle
 //	 -2 : bridge is not host-mode (no netstack)
 //	 -3 : netstack internal layout unexpected
-//	 -4 : peerSubnet parse failed
+//	 -4 : peerSubnet parse failed (or none of the comma entries
+//	      parsed; at least one v4 OR v6 CIDR is required)
 //	 -5 : CreateNIC failed (port collision / OOM)
 //
 //export wgbridgeInstallHostForwarder
@@ -133,13 +149,33 @@ func wgbridgeInstallHostForwarder(handle C.int,
 	if inEp == nil {
 		return -3
 	}
-	peerSubnetGo := C.GoStringN(peerSubnetStr, C.int(peerSubnetLen))
-	_, ipnet, err := net.ParseCIDR(peerSubnetGo)
-	if err != nil {
-		return -4
+	peerSubnetsGo := C.GoStringN(peerSubnetStr, C.int(peerSubnetLen))
+	// V6.H2b — split on comma + trim each entry (whitespace
+	// tolerated on input but never emitted on output).  Sort
+	// entries by family so we have at most one v4 + at most one
+	// v6.  Extra entries of the same family are silently ignored;
+	// in practice the caller produces exactly one of each.
+	var v4Net, v6Net *net.IPNet
+	for _, part := range strings.Split(peerSubnetsGo, ",") {
+		s := strings.TrimSpace(part)
+		if s == "" {
+			continue
+		}
+		_, ipn, err := net.ParseCIDR(s)
+		if err != nil {
+			continue
+		}
+		if ipn.IP.To4() != nil {
+			if v4Net == nil {
+				v4Net = ipn
+			}
+		} else if len(ipn.IP) == 16 {
+			if v6Net == nil {
+				v6Net = ipn
+			}
+		}
 	}
-	ipv4Net := ipnet.IP.To4()
-	if ipv4Net == nil {
+	if v4Net == nil && v6Net == nil {
 		return -4
 	}
 
@@ -165,20 +201,48 @@ func wgbridgeInstallHostForwarder(handle C.int,
 		return -5
 	}
 
-	peerAddr := tcpip.AddrFromSlice(ipv4Net)
-	maskBits, _ := ipnet.Mask.Size()
-	peerMask := tcpip.MaskFromBytes(net.CIDRMask(maskBits, 32))
-	peerSubnet, snErr := tcpip.NewSubnet(peerAddr, peerMask)
-	if snErr != nil {
-		stk.RemoveNIC(newNICID)
-		return -4
+	// Build the route table.  V4 always covers the host's WG
+	// subnet → NIC1 + a default → NIC2.  V6 (when present) adds
+	// the v6 prefix → NIC1 + a v6 default → NIC2.  The two
+	// defaults coexist: gvisor's per-family route matching picks
+	// the right one based on the packet's network protocol.
+	routes := []tcpip.Route{}
+	if v4Net != nil {
+		ipv4Bytes := v4Net.IP.To4()
+		peerAddr := tcpip.AddrFromSlice(ipv4Bytes)
+		maskBits, _ := v4Net.Mask.Size()
+		peerMask := tcpip.MaskFromBytes(net.CIDRMask(maskBits, 32))
+		peerSubnet, snErr := tcpip.NewSubnet(peerAddr, peerMask)
+		if snErr != nil {
+			stk.RemoveNIC(newNICID)
+			return -4
+		}
+		routes = append(routes,
+			tcpip.Route{Destination: peerSubnet, NIC: origID},
+			tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: newNICID},
+		)
+	}
+	if v6Net != nil {
+		// IP slice is already 16 bytes for v6.
+		peerAddr := tcpip.AddrFromSlice(v6Net.IP)
+		maskBits, _ := v6Net.Mask.Size()
+		peerMask := tcpip.MaskFromBytes(net.CIDRMask(maskBits, 128))
+		peerSubnet, snErr := tcpip.NewSubnet(peerAddr, peerMask)
+		if snErr != nil {
+			stk.RemoveNIC(newNICID)
+			return -4
+		}
+		routes = append(routes,
+			tcpip.Route{Destination: peerSubnet, NIC: origID},
+			tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: newNICID},
+		)
 	}
 	origRoutes := append([]tcpip.Route(nil), stk.GetRouteTable()...)
-	stk.SetRouteTable([]tcpip.Route{
-		{Destination: peerSubnet, NIC: origID},
-		{Destination: header.IPv4EmptySubnet, NIC: newNICID},
-	})
+	stk.SetRouteTable(routes)
 	stk.SetForwardingDefaultAndAllNICs(gvipv4.ProtocolNumber, true)
+	if v6Net != nil {
+		stk.SetForwardingDefaultAndAllNICs(gvipv6.ProtocolNumber, true)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &hostForwarderState{
@@ -198,9 +262,15 @@ func wgbridgeInstallHostForwarder(handle C.int,
 	// our handler covers that gap (see handleLocalICMP).
 	stk.SetTransportProtocolHandler(header.ICMPv4ProtocolNumber,
 		state.handleLocalICMP)
+	if v6Net != nil {
+		// V6.H2b — same temp-local-addr ICMP gap exists for v6;
+		// install the sibling handler.
+		stk.SetTransportProtocolHandler(header.ICMPv6ProtocolNumber,
+			state.handleLocalICMPv6)
+	}
 	go state.run(ls)
-	hostFwdLog("host forwarder installed (NIC=%d, peerSubnet=%s)",
-		newNICID, peerSubnetGo)
+	hostFwdLog("host forwarder installed (NIC=%d, peerSubnets=%q v6=%v)",
+		newNICID, peerSubnetsGo, v6Net != nil)
 	return C.int(id)
 }
 
@@ -257,6 +327,26 @@ func (s *hostForwarderState) handleOutbound(pkt *gvstack.PacketBuffer) {
 	}
 	defer bufV.Release()
 	raw := bufV.AsSlice()
+	if len(raw) < 1 {
+		return
+	}
+	// IP version sits in the top nibble of byte 0 (RFC 791 §3.1 /
+	// RFC 8200 §3).  V6.H2b — dispatch v6 to the v6 handler path
+	// rather than dropping with "unsupported" the way pre-V6 code
+	// did when wireguard-go's TUN started carrying mixed-family
+	// inner traffic.
+	switch raw[0] >> 4 {
+	case 4:
+		s.handleOutboundV4(raw)
+	case 6:
+		s.handleOutboundV6(raw)
+	default:
+		hostFwdLog("NIC2 unknown IP version %d (len=%d) — DROPPED",
+			raw[0]>>4, len(raw))
+	}
+}
+
+func (s *hostForwarderState) handleOutboundV4(raw []byte) {
 	if len(raw) < header.IPv4MinimumSize {
 		return
 	}
@@ -266,8 +356,8 @@ func (s *hostForwarderState) handleOutbound(pkt *gvstack.PacketBuffer) {
 	}
 	srcAddr := ip.SourceAddress()
 	dstAddr := ip.DestinationAddress()
-	srcSlice := srcAddr.AsSlice()
-	dstSlice := dstAddr.AsSlice()
+	srcSlice := addrSliceLocal(srcAddr)
+	dstSlice := addrSliceLocal(dstAddr)
 	proto := ip.Protocol()
 	switch proto {
 	case uint8(header.ICMPv4ProtocolNumber):
@@ -287,6 +377,67 @@ func (s *hostForwarderState) handleOutbound(pkt *gvstack.PacketBuffer) {
 			proto, net.IP(srcSlice), net.IP(dstSlice), len(raw))
 	}
 }
+
+// handleOutboundV6 mirrors [handleOutboundV4] for IPv6.  Parses
+// the IPv6 fixed header, dispatches ICMPv6 echo via the v6 ping
+// helper, redirects TCP/UDP via temp-local v6 addresses on NIC1.
+//
+// V6.H2b: this is the entry point for through-host v6 forwarding.
+// Non-local v6 dsts (anything outside the host's `subnetV6`) reach
+// NIC2 via the route table installed by `wgbridgeInstallHostForwarder`;
+// without this handler they'd be silently dropped by gvisor's IPv6
+// forwarder.
+func (s *hostForwarderState) handleOutboundV6(raw []byte) {
+	if len(raw) < header.IPv6MinimumSize {
+		return
+	}
+	ip := header.IPv6(raw)
+	if !ip.IsValid(len(raw)) {
+		return
+	}
+	srcAddr := ip.SourceAddress()
+	dstAddr := ip.DestinationAddress()
+	srcSlice := addrSliceLocal(srcAddr)
+	dstSlice := addrSliceLocal(dstAddr)
+	// IPv6 may carry extension headers between the fixed header
+	// and the transport segment.  We only handle the "no extension
+	// headers" case here — ICMPv6 echo from a stock Linux/Android
+	// joiner doesn't include any.  If a future joiner needs HBH /
+	// Routing / Fragment headers, this branch would need a full
+	// extension-header walk (RFC 8200 §4).
+	nextHdr := ip.NextHeader()
+	switch nextHdr {
+	case uint8(header.ICMPv6ProtocolNumber):
+		s.handleOutboundICMPv6(ip, raw)
+	case uint8(header.TCPProtocolNumber):
+		hostFwdLog("NIC2 v6 TCP %v -> %v (len=%d) — redirecting",
+			net.IP(srcSlice), net.IP(dstSlice), len(raw))
+		s.redirectViaTempAddressV6(dstAddr, raw)
+		s.tcpRedirs.Add(1)
+	case uint8(header.UDPProtocolNumber):
+		hostFwdLog("NIC2 v6 UDP %v -> %v (len=%d) — redirecting",
+			net.IP(srcSlice), net.IP(dstSlice), len(raw))
+		s.redirectViaTempAddressV6(dstAddr, raw)
+		s.udpRedirs.Add(1)
+	default:
+		// TODO V6.H2c: extension header walk (RFC 8200 §4).
+		// Fragment (44) is the most common one we'd see from a
+		// joiner that fragments a >MTU outbound datagram.  Today
+		// we drop it — the joiner sees half the response missing
+		// and times out at the application layer.  Not a v0.2.x
+		// blocker because stock Linux/Android `ping6` doesn't
+		// fragment, but worth fixing before bulk-UDP workloads.
+		hostFwdLog("NIC2 v6 next-hdr=%d %v -> %v (len=%d) — DROPPED (unsupported)",
+			nextHdr, net.IP(srcSlice), net.IP(dstSlice), len(raw))
+	}
+}
+
+// addrSliceLocal is the production sibling of the test helper.
+// gvisor's `tcpip.Address.AsSlice` is a pointer method since
+// 2025-05; calling it on a temporary (`ip.SourceAddress().AsSlice()`)
+// fails to compile.  Storing the address in a parameter makes it
+// addressable.
+func addrSliceLocal(a tcpip.Address) []byte { return a.AsSlice() }
 
 // handleOutboundICMP synthesises an echo-reply for outbound ICMP
 // echo requests. Real ICMP via `SOCK_DGRAM/IPPROTO_ICMP`; the
@@ -322,6 +473,188 @@ func (s *hostForwarderState) handleOutboundICMP(ip header.IPv4, raw []byte) {
 		defer s.pingWg.Done()
 		s.dispatchPing(srcIP, dstIP, ident, seq, payload)
 	}()
+}
+
+// handleOutboundICMPv6 — v6 sibling of [handleOutboundICMP].
+// Synthesises an echo-reply for outbound ICMPv6 echo requests by
+// doing a real outbound ping (SOCK_DGRAM/IPPROTO_ICMPV6 via
+// `icmpx.ListenPacket("udp6", "::")`) and injecting the reply
+// back through NIC1's channel endpoint with `WritePackets`.
+//
+// V6.H2b: mirrors the v4 path's ident-preservation trick — the
+// kernel rewrites the ident on outbound ICMPv6, so we cache the
+// joiner's original ident and re-stamp it on the synthesised
+// reply.
+func (s *hostForwarderState) handleOutboundICMPv6(ip header.IPv6, raw []byte) {
+	icmpStart := header.IPv6MinimumSize
+	if len(raw) < icmpStart+header.ICMPv6MinimumSize {
+		return
+	}
+	icmpBytes := raw[icmpStart:]
+	icmpHdr := header.ICMPv6(icmpBytes)
+	if icmpHdr.Type() != header.ICMPv6EchoRequest || icmpHdr.Code() != 0 {
+		return
+	}
+	srcAddr := ip.SourceAddress()
+	dstAddr := ip.DestinationAddress()
+	srcIP := net.IP(addrSliceLocal(srcAddr))
+	dstIP := net.IP(addrSliceLocal(dstAddr))
+	if len(srcIP) != 16 || len(dstIP) != 16 {
+		return
+	}
+	ident := icmpHdr.Ident()
+	seq := icmpHdr.Sequence()
+	// Slice the payload past the 8-byte ICMPv6 header.  Defensive
+	// copy: the underlying packet buffer is consumed before the
+	// goroutine runs.
+	payload := append([]byte(nil), icmpHdr.Payload()...)
+	hostFwdLog("outbound ICMPv6 echo %v -> %v ident=%d seq=%d",
+		srcIP, dstIP, ident, seq)
+	s.pingWg.Add(1)
+	go func() {
+		defer s.pingWg.Done()
+		s.dispatchPingV6(srcIP, dstIP, ident, seq, payload)
+	}()
+}
+
+// dispatchPingV6 — v6 sibling of [dispatchPing].  Opens an
+// unprivileged ICMPv6 socket, sends the echo request to [dstIP],
+// and waits up to `s.pingTimeout` for the reply.  On success,
+// injects a synthesised echo-reply back to the joiner.
+//
+// The `udp6` network spec is misleading: under the hood this opens
+// a `SOCK_DGRAM/IPPROTO_ICMPV6` socket (Linux's unprivileged ICMP
+// path, RFC 6334 / kernel commit c319b4d76b9e), NOT a UDP socket.
+// `icmpx.ListenPacket` paper-tigers the choice of dgram vs raw
+// per protocol.
+func (s *hostForwarderState) dispatchPingV6(
+	srcIP, dstIP net.IP, ident, seq uint16, payload []byte,
+) {
+	s.pingsSent.Add(1)
+	conn, err := icmpx.ListenPacket("udp6", "::")
+	if err != nil {
+		hostFwdLog("v6 ListenPacket failed: %v", err)
+		return
+	}
+	defer conn.Close()
+	out := &icmpx.Message{
+		Type: netipv6.ICMPTypeEchoRequest,
+		Code: 0,
+		Body: &icmpx.Echo{ID: int(ident), Seq: int(seq), Data: payload},
+	}
+	// `nil` for the pseudo-header arg: the kernel computes the
+	// real ICMPv6 checksum on outbound (it has to — we don't know
+	// our actual source address until the socket binds).
+	outBytes, err := out.Marshal(nil)
+	if err != nil {
+		return
+	}
+	if _, err := conn.WriteTo(outBytes, &net.UDPAddr{IP: dstIP}); err != nil {
+		hostFwdLog("v6 WriteTo %v failed: %v", dstIP, err)
+		return
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(s.pingTimeout)); err != nil {
+		return
+	}
+	rb := make([]byte, 1500)
+	n, _, err := conn.ReadFrom(rb)
+	if err != nil || n <= 0 {
+		hostFwdLog("v6 ReadFrom %v failed: err=%v n=%d (no reply within %v)",
+			dstIP, err, n, s.pingTimeout)
+		return
+	}
+	s.pingsRpld.Add(1)
+	msg, err := icmpx.ParseMessage(protoICMPv6, rb[:n])
+	if err != nil {
+		hostFwdLog("v6 ParseMessage failed: %v", err)
+		return
+	}
+	if msg.Type != netipv6.ICMPTypeEchoReply {
+		// Non-echo reply: Destination Unreachable, Packet Too Big,
+		// Time Exceeded, or Parameter Problem.  PTB (RFC 8201) is
+		// the load-bearing one for IPv6 PMTUD — the joiner's
+		// kernel needs it to size further packets.  TODO V6.H2c:
+		// translate the ICMPv6 error type into a synthesised
+		// packet back to the joiner.  Silent-drop here means the
+		// joiner can't discover path MTU through this forwarder,
+		// which is mostly academic until joiners push fragments.
+		return
+	}
+	echo, ok := msg.Body.(*icmpx.Echo)
+	if !ok {
+		return
+	}
+	// Same ident-preservation as v4: the kernel rewrote our ident
+	// on the unprivileged socket, so use the joiner's original
+	// value, not what we just read.
+	s.injectEchoReplyV6(dstIP, srcIP, ident, uint16(echo.Seq), echo.Data)
+}
+
+// injectEchoReplyV6 — v6 sibling of [injectEchoReply].  Builds an
+// IPv6+ICMPv6 echo-reply and pushes it into NIC1's channel via
+// `WritePackets` (same anti-loop reasoning as v4: `InjectInbound`
+// would trip gvisor's same-NIC drop).
+func (s *hostForwarderState) injectEchoReplyV6(
+	src, dst net.IP, ident, seq uint16, payload []byte,
+) {
+	if s.closed.Load() {
+		return
+	}
+	pktBytes := buildIPv6ICMPEchoReply(src, dst, ident, seq, payload)
+	buf := buffer.MakeWithData(pktBytes)
+	pkt := gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{Payload: buf})
+	var pkts gvstack.PacketBufferList
+	pkts.PushBack(pkt)
+	s.inEp.WritePackets(pkts)
+	pkt.DecRef()
+	s.injectsOK.Add(1)
+	hostFwdLog("injected v6 echo-reply %v -> %v ident=%d seq=%d (payload=%dB)",
+		src, dst, ident, seq, len(payload))
+}
+
+// redirectViaTempAddressV6 — v6 sibling of [redirectViaTempAddress].
+// Registers `dst` as a temp /128 local address on NIC1, then
+// re-injects the v6 bytes through NIC1's channel.  gvisor's
+// catchall TCP/UDP forwarders (registered at the transport layer
+// in `listeners.go`) fire on the next pass since gvisor's TCP and
+// UDP code are family-agnostic — the same handler accepts a v4 or
+// v6 SYN/datagram.
+func (s *hostForwarderState) redirectViaTempAddressV6(dst tcpip.Address, raw []byte) {
+	s.ensureTempLocalAddressV6(dst)
+	bytesCopy := make([]byte, len(raw))
+	copy(bytesCopy, raw)
+	buf := buffer.MakeWithData(bytesCopy)
+	injectPkt := gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{
+		Payload: buf,
+	})
+	dstSlice := addrSliceLocal(dst)
+	hostFwdLog("re-injecting %dB on NIC1 v6 (dst=%v, next-hdr=%d)",
+		len(raw), net.IP(dstSlice), raw[6])
+	s.inEp.InjectInbound(gvipv6.ProtocolNumber, injectPkt)
+	injectPkt.DecRef()
+}
+
+func (s *hostForwarderState) ensureTempLocalAddressV6(addr tcpip.Address) {
+	s.tempAddrMu.Lock()
+	defer s.tempAddrMu.Unlock()
+	if s.tempAddrs[addr] {
+		return
+	}
+	s.tempAddrs[addr] = true
+	protoAddr := tcpip.ProtocolAddress{
+		Protocol: gvipv6.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   addr,
+			PrefixLen: 128,
+		},
+	}
+	if err := s.stk.AddProtocolAddress(s.origNICID, protoAddr,
+		gvstack.AddressProperties{Temporary: true}); err != nil {
+		hostFwdLog("AddProtocolAddress v6 (%v) failed: %v", addr, err)
+		return
+	}
+	s.tempAddrN.Add(1)
+	hostFwdLog("registered temp local v6 addr %v", addr)
 }
 
 // redirectViaTempAddress is the TCP/UDP path. Registers dst as
@@ -440,6 +773,63 @@ func (s *hostForwarderState) injectEchoReply(
 		src, dst, ident, seq, len(payload))
 }
 
+// buildIPv6ICMPEchoReply constructs a complete IPv6+ICMPv6 echo
+// reply.  ICMPv6 (RFC 4443 §2.3) requires the checksum to cover
+// the IPv6 pseudo-header (src/dst + length + next-header) in
+// addition to the ICMPv6 message; this is the v6 sibling of
+// [buildIPv4ICMPEchoReply], which only had to checksum the ICMP
+// segment.
+//
+// `src` is the address the joiner pinged (the upstream that
+// "replied"); `dst` is the joiner's own v6 address.  The IPv6
+// header's PayloadLength is the ICMPv6 size (header + payload);
+// HopLimit defaults to 64 — matches gvisor's default for outbound
+// IPv6 + Linux's `net.ipv6.conf.all.hop_limit`.
+func buildIPv6ICMPEchoReply(
+	src, dst net.IP, ident, seq uint16, payload []byte,
+) []byte {
+	src16 := src.To16()
+	dst16 := dst.To16()
+	icmpLen := header.ICMPv6MinimumSize + len(payload)
+	totalLen := header.IPv6MinimumSize + icmpLen
+	pktBytes := make([]byte, totalLen)
+
+	srcAddr := tcpip.AddrFromSlice(src16)
+	dstAddr := tcpip.AddrFromSlice(dst16)
+
+	ip := header.IPv6(pktBytes[:header.IPv6MinimumSize])
+	ip.Encode(&header.IPv6Fields{
+		PayloadLength:     uint16(icmpLen),
+		TransportProtocol: header.ICMPv6ProtocolNumber,
+		HopLimit:          64,
+		SrcAddr:           srcAddr,
+		DstAddr:           dstAddr,
+	})
+
+	icmpStart := header.IPv6MinimumSize
+	icmpBytes := pktBytes[icmpStart:]
+	icmp := header.ICMPv6(icmpBytes[:header.ICMPv6MinimumSize])
+	icmp.SetType(header.ICMPv6EchoReply)
+	icmp.SetCode(0)
+	icmp.SetIdent(ident)
+	icmp.SetSequence(seq)
+	copy(pktBytes[icmpStart+header.ICMPv6MinimumSize:], payload)
+	// ICMPv6 checksum covers the IPv6 pseudo-header + ICMPv6
+	// header + payload.  Compute over the parts excluding the
+	// checksum field itself (gvisor's helper skips bytes 2-3 of
+	// the header internally).
+	icmp.SetChecksum(0)
+	xsum := header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header:      icmp,
+		Src:         srcAddr,
+		Dst:         dstAddr,
+		PayloadCsum: checksum.Checksum(payload, 0),
+		PayloadLen:  len(payload),
+	})
+	icmp.SetChecksum(xsum)
+	return pktBytes
+}
+
 // buildIPv4ICMPEchoReply constructs a complete IPv4+ICMP echo
 // reply. The ICMP checksum covers the full segment (header +
 // payload); see TestBuildIPv4ICMPEchoReplyChecksum.
@@ -527,12 +917,81 @@ func (s *hostForwarderState) handleLocalICMP(
 	return false
 }
 
+// handleLocalICMPv6 — v6 sibling of [handleLocalICMP].  Fires for
+// ICMPv6 packets whose dst is locally assigned on NIC1 (real-local
+// `fd00::1` or a temp-local address registered by
+// [redirectViaTempAddressV6]).
+//
+// gvisor's ICMPv6 module already auto-replies to echo requests
+// for real-local addresses, so we forward only the temp-local
+// case to the upstream-ping path.  Two notable v6 quirks:
+//
+//   - Real ICMPv6 traffic carries lots of non-echo messages
+//     (router advertisements, neighbor solicits, multicast listener
+//     discovery).  We filter to type 128 (EchoRequest) + code 0
+//     so we don't accidentally synthesise a reply for an NDP packet.
+//   - The transport handler's return value is unused by gvisor for
+//     this code path; always false (sibling of v4).
+func (s *hostForwarderState) handleLocalICMPv6(
+	id gvstack.TransportEndpointID, pkt *gvstack.PacketBuffer,
+) bool {
+	if s.closed.Load() {
+		return false
+	}
+	if !pkt.NetworkPacketInfo.LocalAddressTemporary {
+		// Real-local — leave it for gvisor's auto-reply.
+		return false
+	}
+	icmpBytes := pkt.TransportHeader().Slice()
+	if len(icmpBytes) < header.ICMPv6MinimumSize {
+		return false
+	}
+	icmpHdr := header.ICMPv6(icmpBytes)
+	if icmpHdr.Type() != header.ICMPv6EchoRequest || icmpHdr.Code() != 0 {
+		return false
+	}
+	ipBytes := pkt.NetworkHeader().Slice()
+	if len(ipBytes) < header.IPv6MinimumSize {
+		return false
+	}
+	ipHdr := header.IPv6(ipBytes)
+	srcAddr := ipHdr.SourceAddress()
+	dstAddr := ipHdr.DestinationAddress()
+	srcIP := net.IP(addrSliceLocal(srcAddr))
+	dstIP := net.IP(addrSliceLocal(dstAddr))
+	if len(srcIP) != 16 || len(dstIP) != 16 {
+		return false
+	}
+	ident := icmpHdr.Ident()
+	seq := icmpHdr.Sequence()
+	// AsRange().ToSlice(): see [TestEmptyPayloadToSliceVsToView]
+	// for why ToView() is dangerous on empty payloads.
+	payload := pkt.Data().AsRange().ToSlice()
+	hostFwdLog("ICMPv6 echo (temp-local) %v -> %v ident=%d seq=%d payload=%dB",
+		srcIP, dstIP, ident, seq, len(payload))
+	s.pingWg.Add(1)
+	go func() {
+		defer s.pingWg.Done()
+		s.dispatchPingV6(srcIP, dstIP, ident, seq, payload)
+	}()
+	return false
+}
+
 func (s *hostForwarderState) closeForwarder() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
 	s.stop()
+	// V6.H2b: the shared pingWg covers both v4 and v6 ping
+	// goroutines (dispatchPing + dispatchPingV6 both call
+	// `s.pingWg.Add(1)/Done()`).  This Wait() therefore drains
+	// in-flight pings of either family before NIC tear-down.
 	s.pingWg.Wait()
 	s.stk.SetRouteTable(s.origRoutes)
 	s.stk.RemoveNIC(s.outNICID)
+	// Forwarding-enable for ipv4/ipv6 is intentionally NOT reverted
+	// here.  The whole stack dies with `nativeClose` (the bridge is
+	// stack-scoped), so leaving forwarding=true is harmless: there
+	// are no NICs left for traffic to route between.  Re-install
+	// on the same bridge isn't a supported flow.
 }

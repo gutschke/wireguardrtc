@@ -557,3 +557,47 @@ Test additions:
 - Host re-issuing UAPI on a tunnel restart picks up `allowedIpV6` from the persisted `EnrolledPeer.assignedIpV6` — pre-V6.3 peers will have `null` until they re-enrol.  Acceptable: legacy peers stay v4-only and stop traffic on v6 dest from the host's gvisor stack until next enrol.
 
 Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostTunnelSnapshot.kt`, `…/InboundEnrollHandler.kt`, `…/ListenerHub.kt`, `…/HostModeBackend.kt`, `…/HostModeUapi.kt`, `…/HostTunnelSnapshotBuilder.kt`, `…/ManualConfigGenerator.kt`, `…/WormholeHostController.kt`, `…/Tunnel.kt`, `…/MainActivity.kt`, `…/ui/HostModeSection.kt`, tests in matching `src/test` locations.
+
+### V6.H2b — 2026-05-14
+
+ICMPv6 echo through-host forwarder.  V6.H2 brought the catchall TCP/UDP forwarders to dual-stack; V6.H2b finishes the trio with ICMPv6 so a joiner can `ping6 cloudflare.com` from inside the WG tunnel and get a real reply back from the host's OS ICMP socket.
+
+What landed:
+
+- **`buildIPv6ICMPEchoReply(src, dst, ident, seq, payload) []byte`** — RFC 4443 / RFC 2460 compliant echo-reply.  Uses `header.ICMPv6Checksum(ICMPv6ChecksumParams)` so the pseudo-header (src/dst + length + next-header=58) is included in the sum.  TestBuildIPv6ICMPEchoReplyChecksum recomputes the checksum manually over the IPv6 pseudo-header + ICMPv6 segment and verifies the one's-complement sum nets to 0xffff (= -0) for the empty / 56 B / 1 kB payload sizes.
+- **`handleOutboundV6(raw)` + `handleOutboundICMPv6(ip, raw)` + `dispatchPingV6(srcIP, dstIP, ident, seq, payload)` + `injectEchoReplyV6(...)`** — the four-stage pipeline mirroring the v4 path: parse → spawn goroutine → real ICMPv6 ping via `icmpx.ListenPacket("udp6", "::")` → synthesise reply with `WritePackets`.  Ident-preservation across the unprivileged-socket NAT works the same way (kernel rewrites our ident; we re-stamp the joiner's original on the reply).
+- **`redirectViaTempAddressV6(dst, raw)` + `ensureTempLocalAddressV6(addr)`** — v6 sibling for the TCP/UDP through-host path.  Registers `/128` temp-local addresses on NIC1 + re-injects via `inEp.InjectInbound(gvipv6.ProtocolNumber, ...)`.  gvisor's existing transport-level catchalls (V6.PL Layer 2) fire on the next pass.
+- **`handleLocalICMPv6(id, pkt)`** — transport handler registered when the host forwarder is installed with a v6 subnet.  Filters strictly to `Type == EchoRequest && Code == 0` so NDP solicits/advertisements, MLD, Router Discovery, and the ICMPv6 error types (Parameter Problem, Packet Too Big, Time Exceeded, Destination Unreachable) all bounce off without triggering a synthesised echo reply.
+- **`handleOutbound(pkt)` dispatch** — switches on the IP-version nibble (`raw[0] >> 4`), routes to `handleOutboundV4` / `handleOutboundV6`.  Backward compatible: pre-V6.H2b TUN traffic always landed in `handleOutboundV4` via implicit assumption.
+- **`wgbridgeInstallHostForwarder` — comma-separated subnet contract.**  Same wire format as V6.H1: `"10.99.0.0/24,fd00:dead:beef::/64"`.  Per-entry whitespace tolerated on input, never emitted on output.  When a v6 entry is present, the forwarder ALSO: (a) inserts a v6 default route via NIC2, (b) calls `stk.SetForwardingDefaultAndAllNICs(gvipv6.ProtocolNumber, true)`, (c) registers `handleLocalICMPv6` as the `header.ICMPv6ProtocolNumber` transport handler.
+- **`HostModeBackend.toRunnerConfig`** — composes the comma-separated subnet from `canonicalSubnetForAddress(addr)` + `hm.subnetV6` so the new wire format is generated automatically from existing V6.2 state.
+
+Test coverage:
+
+- **Go unit tests (`host_forwarder_test.go`):**
+  - `TestBuildIPv6ICMPEchoReplyChecksum` (3 subcases) — pseudo-header-aware checksum verification for empty / 56 B / 1 kB payloads.
+  - `TestICMPv6EchoReplyConstantIs129` — pins the gvisor constant to RFC 4443 §2.1 values.
+  - `TestTempAddrsV4V6Coexist` — pins `tcpip.Address` length-equality so the shared `tempAddrs` map is safe for both families.
+  - `TestHandleLocalICMPv6FiltersNonEcho` (11 subcases) — every ICMPv6 message type *other than* EchoRequest must bounce off without triggering a synthesised echo reply.  Defends against accidentally answering NDP / MLD / RA / error packets.
+  - `TestCloseForwarderWaitsForV6Pings` — `closeForwarder()` blocks on in-flight v6 pings via the shared `pingWg`.  Pins the v4-v6 unification choice against a future refactor that splits the WaitGroup.
+  - `TestHandleOutboundDispatchesByIPVersion` (4 subcases) — synthetic v4 TCP, v6 TCP, v6 UDP, v6 unknown-next-header packets dispatched through `handleOutbound`; counter assertions verify each lands in the right path.
+
+- **Instrumented tests (`HostNativeV6ForwarderTest`, 4 cases — passes on emulator + ChromeOS ARC):**
+  - `installsDualStackForwarder` — comma-form parsing through JNI.
+  - `installsForwarderWithV6OnlySubnet` — v6-only deployment (rare but supported).
+  - `installsForwarderTolerantOfWhitespace` — `" 10.99.0.0/24 , fd00::/64 "` works.
+  - `rejectsAllMalformedSubnetList` — `"not-a-cidr,also-garbage"` returns -4.
+
+- **V6.PL Layer 3 (`HostNativeV6SelfLoopTest`)** still passes (176 ms emulator / 263 ms ARC), confirming dual-stack WG handshake survives the V6.H2b additions.
+
+**Caveats — what V6.H2b does NOT cover:**
+
+1. **End-to-end `ping6` to a public v6 destination through a real bridge.**  ChromeOS ARC's underlying network only carries site-local `fec0::/10` (deprecated, no public-internet route).  Validating this needs a v6-routable network — V6.E2E territory.  The Go-unit + instrumented tests give high confidence that the in-process plumbing is correct; the open question is whether Android's `protect()` + the unprivileged ICMPv6 socket actually deliver packets to the public v6 internet from the host's underlying network.
+
+2. **IPv6 extension headers (RFC 8200 §4).**  `handleOutboundV6` switches on `ip.NextHeader()` and drops anything other than ICMPv6/TCP/UDP.  Fragment (44) is the most likely encountered one (from a joiner that fragments a large UDP datagram); today we drop it.  Stock Linux/Android `ping6` doesn't fragment, so academic until bulk-UDP workloads land.  TODO comment in code.
+
+3. **ICMPv6 error-message translation back to the joiner.**  `dispatchPingV6` silent-drops any non-EchoReply (Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem).  This breaks PMTU discovery from the joiner (RFC 8201) since the joiner's kernel needs Packet-Too-Big back to size further packets.  Mostly academic until joiners push fragments or large UDP payloads.  TODO comment in code.
+
+4. **Forwarding-enable not reverted on `closeForwarder()`.**  The whole gvisor stack dies with `nativeClose`, so leaving `ipv4/ipv6 forwarding=true` until then is harmless (no NICs to route between).  Documented in code.
+
+Files: `android/wgbridge_native/host_forwarder.go`, `android/wgbridge_native/host_forwarder_test.go`, `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostModeBackend.kt`, `android/app/src/androidTest/kotlin/com/gutschke/wgrtc/data/HostNativeV6ForwarderTest.kt`.
