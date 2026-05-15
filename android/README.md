@@ -11,6 +11,7 @@ For an overview of how this fits into the larger system, see the [top-level READ
 - **Wormhole enrollment.** A 6-letter pronounceable code (PAKE-derived SAS) pairs two devices in seconds without QR codes or copy-paste of keys — handy when both devices are interactive but not co-located.
 - **Foreground service.** Backgrounded long enough for the OS to start killing tasks, the OFFER listener stays alive via a `specialUse` foreground service so endpoint updates keep flowing.
 - **Privacy.** No analytics, no cloud, no third-party sharing. Everything lives in the app's private storage; the only network traffic is the WireGuard tunnel itself plus end-to-end-encrypted signaling messages through whatever broker is configured (intended to be one you run yourself).
+- **Dual-stack IPv6.** Joiners get a v4 + v6 address inside each tunnel; the through-host forwarder relays TCP, UDP, ICMP, and ICMPv6 traffic to both v4 and v6 destinations on the public internet. IPv6-only carriers (T-Mobile US) reach a dual-stack host directly without 464XLAT or a relay.
 
 ## Building
 

@@ -1,3 +1,35 @@
+wireguardrtc (0.2.6-1) unstable; urgency=medium
+
+  * V6 series: dual-stack IPv6 support, end-to-end.  Daemon (V6.D1,
+    V6.D3, V6.D4, V6.D5): production stun_query takes a `family=`
+    kwarg, candidate enumerator emits comma-separated dual-stack
+    `PublicIp` lists, local interface enumeration walks v6 addresses,
+    hole-punching is skipped for v6 endpoints (raw-IP injection is
+    IPv4-only and v6 doesn't typically need NAT traversal).
+  * V6 series joiner (V6.A1, V6.A2, V6.A3): happy-eyeballs prefers
+    v6 within each candidate-kind tier; VpnService accepts `::/0`
+    routes; MTU defaults pick 1400 (v6 outer) vs 1420 (v4 outer)
+    based on the endpoint family.
+  * V6 series host-mode (V6.H1, V6.H2, V6.H2b, V6.H3): gvisor
+    netstack accepts dual-stack address lists; catchall TCP/UDP
+    forwarders bracket v6 destinations; new ICMPv6 echo through-host
+    forwarder with RFC 4443 checksum and gvisor temp-local-address
+    re-injection (validated on real ChromeOS hardware, 7 ms
+    round-trip to Google v6 DNS); DnsProxy v6 wire-format pinned.
+  * V6.2 + V6.3: each host tunnel mints a per-tunnel ULA at creation
+    (`HostSubnetAllocator.generateUlaPrefix`); peer enrolment
+    allocates v4 + v6 simultaneously; enrolment payload carries
+    comma-separated dual-stack `address` and `AllowedIPs`,
+    whitespace-tolerant on input, canonical (no whitespace) on
+    output for ChromeOS compatibility.
+  * Whitespace canonicalisation: every place that emits an
+    `AllowedIPs` line strips spaces (PS18 follow-up).
+  * Documentation: design doc status flipped to "Shipped in v0.2.6",
+    V6 runbook added (`docs/v6-runbook.md`), top-level + Android
+    READMEs mention dual-stack.
+
+ -- Markus Gutschke <gutschke@users.noreply.github.com>  Thu, 15 May 2026 14:00:00 -0700
+
 wireguardrtc (0.2.5-1) unstable; urgency=medium
 
   * D1.10 follow-ups: make a vanilla-Ubuntu install actually work for

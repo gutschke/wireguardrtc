@@ -59,6 +59,11 @@ hole punching for NAT — and we package them so the result is a Debian
 - **No new protocol on the wire.**  It's still kernel WireGuard at
   both ends, the kind that's been audited and shipped in Linux since
   5.6.
+- **No IPv4 dependency.**  Dual-stack throughout: hosts and joiners
+  exchange both v4 and v6 endpoints, allocate v4 + v6 addresses inside
+  the tunnel, and the through-host forwarder relays TCP / UDP / ICMP /
+  ICMPv6 to the public internet.  An IPv6-only joiner reaches a
+  dual-stack host directly, no 464XLAT or relay.
 
 ---
 

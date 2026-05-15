@@ -1,10 +1,10 @@
 # IPv6 Support — Design Document
 
-**Status:** Draft, planning phase.
+**Status:** Shipped in v0.2.6 (2026-05-15).  Daemon, joiner, and host-mode are dual-stack end-to-end and validated on real ChromeOS hardware.  See [V6 runbook](v6-runbook.md) for the validation procedure and the per-section "Implementation log" entries below for what landed when.
 **Author:** wgrtc developers (this doc lives alongside the code).
-**Scope:** What it would take to make wgrtc work end-to-end on IPv6, both as a publisher (host) and as a subscriber (joiner), on both the Python daemon and the Android app.
+**Scope:** What it took to make wgrtc work end-to-end on IPv6, both as a publisher (host) and as a subscriber (joiner), on both the Python daemon and the Android app.
 
-This is a living document.  As implementation progresses, each section should be updated with "what we found when we built this" notes.  Bake new edge cases into the test suite first, then update prose here.
+This is a living document.  Each section captures both the original plan and the "what we found when we built this" notes.
 
 
 ## 1. Why this is worth doing
