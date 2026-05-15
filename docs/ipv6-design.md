@@ -505,3 +505,16 @@ Test additions: `HostSubnetAllocatorV6Test.kt` (11 tests) — generation, dual-s
 After those land, V6.3 will render dual-stack addresses + AllowedIPs in the enrolment payload + manual config invitations.
 
 Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocator.kt`, `android/app/src/test/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocatorV6Test.kt`.
+
+**Step 2 landed: persistence fields + factory wire-in.**
+
+- `HostModeConfig.subnetV6: String?` — nullable for backward-compat with pre-V6.2 tunnels.  When non-null, carries the per-tunnel `/64` minted by [HostSubnetAllocator.generateUlaPrefix].
+- `EnrolledPeer.assignedIpV6: String?` — last in the parameter list so all positional callers (there are several in tests + production) keep compiling unchanged.  Wired up by V6.3 peer enrolment paths.
+- `HostModeFactory.newTunnel()` now mints a ULA on every new host tunnel + writes a second `[Interface] Address = fd...::1/64` line.  Host owns `::1` in its v6 subnet, mirroring the v4 `.1` convention.
+
+4 new V6.2 cases in `HostModeFactoryTest.kt` + 12 v6 allocator tests + 14 pre-existing v4 allocator tests + the entire pre-existing host-mode suite — all green.
+
+**Still pending (V6.2 step 3 + V6.3):**
+
+- Peer enrolment code paths allocate v6 alongside v4 (search for `EnrolledPeer(...)` construction sites — there are 4: `HostModeSection.kt`, `MainActivity.kt`, `WgrtcViewModel.kt`, `ListenerHub.kt`).  Each needs to call `HostSubnetAllocator.nextFreeIpV6(subnetV6, hostV6, inUseV6)` when `subnetV6 != null` and populate `EnrolledPeer.assignedIpV6`.  Backward-compat: tunnels without `subnetV6` keep working v4-only.
+- V6.3: enrolment payload (`SasEnrollInfo`, `JoinerEnrolInfo`, `HostEnrolInfo`, `EnrollOkPlain`) renders the joiner's v6 `[Interface] Address` + the host's v6 in `[Peer]` AllowedIPs.  The wormhole/QR/manual flows all share `buildHostTunnelSnapshot` so the dual-stack rendering lands in one place.

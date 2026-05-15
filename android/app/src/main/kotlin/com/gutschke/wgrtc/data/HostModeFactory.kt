@@ -72,10 +72,24 @@ object HostModeFactory {
         val saltB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(saltBytes)
 
         val prefix = subnet.substringAfter('/').trim()
+
+        // V6.2 — mint a per-tunnel ULA `/64` so the host can advertise
+        // a v6 address alongside its v4 one.  Host owns ::1 in the
+        // generated subnet (convention mirrors v4 .1).  V6.PL pinned
+        // that random ULA routes correctly through the userspace-NAT
+        // architecture; this is the wire-in.
+        val subnetV6 = HostSubnetAllocator.generateUlaPrefix(rng)
+        val v6Net = subnetV6.removeSuffix("/64")
+        val hostIpV6 = v6Net + "1"
+
         val configText = buildString {
             append("[Interface]\n")
             append("PrivateKey = ").append(privB64).append('\n')
             append("Address = ").append(hostIp).append('/').append(prefix).append('\n')
+            // V6.2: second Address line for v6.  Multi-line Address
+            // is the wg-quick canonical form; V6.H1's
+            // parseInterfaceAddresses splits both forms.
+            append("Address = ").append(hostIpV6).append("/64").append('\n')
             append("ListenPort = ").append(listenPort).append('\n')
         }.trimEnd('\n')
 
@@ -89,6 +103,7 @@ object HostModeFactory {
             saltB64 = saltB64,
             hostMode = HostModeConfig(
                 subnet = subnet,
+                subnetV6 = subnetV6,
                 enrolledPeers = emptyList(),
                 advertisedAllowedIps = advertisedAllowedIps,
             ),

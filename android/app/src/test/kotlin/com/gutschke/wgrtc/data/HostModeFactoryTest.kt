@@ -150,6 +150,74 @@ class HostModeFactoryTest {
         }
     }
 
+    // V6.2 — per-tunnel ULA generation lands here.  Every new
+    // host-mode tunnel is now born dual-stack: a v4 subnet from the
+    // user-supplied parameters AND a freshly minted ULA `/64`.
+    // Joiners receive both addresses when they enroll (V6.3).
+
+    @Test fun `V6_2 new tunnel has a v6 ULA subnet populated`() {
+        val t = HostModeFactory.newTunnel(
+            name = "host", subnet = "10.99.0.0/24",
+            hostIp = "10.99.0.1", listenPort = 51820,
+            brokerWss = "wss://x/y", brokerKey = "k", rng = rng,
+        )
+        val v6 = t.hostMode!!.subnetV6
+        assertNotNull(v6, "subnetV6 must be populated for new host tunnels")
+        assertTrue(v6!!.startsWith("fd"), "ULA must start with fd; got $v6")
+        assertTrue(v6.endsWith("/64"), "ULA must be /64; got $v6")
+    }
+
+    @Test fun `V6_2 configText contains v6 Address line alongside v4`() {
+        val t = HostModeFactory.newTunnel(
+            name = "host", subnet = "10.99.0.0/24",
+            hostIp = "10.99.0.1", listenPort = 51820,
+            brokerWss = "wss://x/y", brokerKey = "k", rng = rng,
+        )
+        // V6.H1 helper splits multi-line + comma-separated Address
+        // entries.  Both v4 + v6 must be present.
+        val addrs = parseInterfaceAddresses(t.configText)
+        assertEquals(2, addrs.size,
+            "expected v4 + v6 Address lines; got $addrs")
+        assertEquals("10.99.0.1", addrs[0])
+        assertTrue(addrs[1].startsWith("fd"),
+            "second address must be the v6 ULA host; got ${addrs[1]}")
+    }
+
+    @Test fun `V6_2 v6 host IP is the dot-one of subnetV6`() {
+        // Convention: host owns ::1 in its v6 subnet, mirroring the
+        // v4 .1 convention.  This makes joiner-side rendering of
+        // [Peer] AllowedIPs trivial (always /128 of the host's ::1)
+        // and matches what enterprise WG deployments expect.
+        val t = HostModeFactory.newTunnel(
+            name = "host", subnet = "10.99.0.0/24",
+            hostIp = "10.99.0.1", listenPort = 51820,
+            brokerWss = "wss://x/y", brokerKey = "k", rng = rng,
+        )
+        val v6subnet = t.hostMode!!.subnetV6!!
+        val v6Net = v6subnet.removeSuffix("/64")
+        val v6Host = parseInterfaceAddresses(t.configText)[1]
+        // v6Net is "fdXX:XXXX:XXXX::"; v6Host should be the same with ::1.
+        // Compress: "fdXX:XXXX:XXXX::1".
+        val expected = v6Net + "1"
+        assertEquals(expected, v6Host,
+            "v6 host IP must be subnetV6's network address + 1")
+    }
+
+    @Test fun `V6_2 each new tunnel gets a distinct ULA prefix`() {
+        val a = HostModeFactory.newTunnel(
+            name = "a", subnet = "10.99.0.0/24",
+            hostIp = "10.99.0.1", listenPort = 51820,
+            brokerWss = "wss://x/y", brokerKey = "k", rng = rng,
+        )
+        val b = HostModeFactory.newTunnel(
+            name = "b", subnet = "10.99.0.0/24",
+            hostIp = "10.99.0.1", listenPort = 51820,
+            brokerWss = "wss://x/y", brokerKey = "k", rng = rng,
+        )
+        assertNotEquals(a.hostMode!!.subnetV6, b.hostMode!!.subnetV6,
+            "fresh tunnels must get distinct ULAs (collision odds 1 in 2^40)")
+    }
+
     private fun configValueOf(configText: String, key: String): String? =
         configText.lineSequence()
             .firstOrNull {

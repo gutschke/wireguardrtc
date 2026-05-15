@@ -57,6 +57,14 @@ data class HostModeConfig(
     /** CIDR like `10.99.0.0/24` — pool the [HostSubnetAllocator]
      * draws from. */
     val subnet: String,
+    /** V6.2 — per-tunnel ULA `/64` like `fd1a:2b3c:4d5e::/64`,
+     * minted at tunnel creation time via
+     * [HostSubnetAllocator.generateUlaPrefix].  Null on tunnels
+     * persisted before V6.2 existed; the runtime treats missing-
+     * v6 as a v4-only tunnel.  The host's own v6 address is
+     * `<subnetV6 minus /64>1` (e.g. `fd1a:2b3c:4d5e::1`) by
+     * convention. */
+    val subnetV6: String? = null,
     /** Each enrolled peer keeps its assigned IP stable across
      * re-enrollments (we look it up by pubkey). */
     val enrolledPeers: List<EnrolledPeer> = emptyList(),
@@ -122,6 +130,17 @@ data class EnrolledPeer(
      * (where the host mints both halves) populates this field.
      */
     val manualInvitationText: String? = null,
+    /** V6.2 — per-peer v6 address inside the host's
+     * [HostModeConfig.subnetV6].  Null on peers enrolled before
+     * V6.2 existed OR on tunnels that don't have a v6 subnet
+     * (legacy v4-only).  When present, the enrolment payload
+     * (V6.3) advertises this as the joiner's v6 `[Interface]
+     * Address` and `<ip>/128` is written into the peer's
+     * `[Peer] AllowedIPs` on the host side.
+     *
+     * Last in the parameter list so all pre-V6.2 positional
+     * callers keep working unchanged. */
+    val assignedIpV6: String? = null,
 )
 
 /**
