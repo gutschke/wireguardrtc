@@ -341,9 +341,20 @@ class MainActivity : ComponentActivity() {
                             .nextFreeIp(hm.subnet, addrLine,
                                 com.gutschke.wgrtc.data.allocatedIps(tunnel))
                             ?: return@remember null
+                        // V6.3 — allocate the v6 sibling when the
+                        // tunnel has a subnetV6.  Soft-fail to v4
+                        // only if the v6 alloc returns null.
+                        val v6Cidr = hm.subnetV6?.let { sv6 ->
+                            val v6Host = sv6.removeSuffix("/64") + "1"
+                            com.gutschke.wgrtc.data.HostSubnetAllocator.nextFreeIpV6(
+                                sv6, v6Host,
+                                com.gutschke.wgrtc.data.allocatedIpsV6(tunnel),
+                            )?.let { "$it/128" }
+                        }
                         com.gutschke.wgrtc.data.buildHostTunnelSnapshot(
                             tunnel = tunnel,
                             assignedAddressCidr = "$nextIp/32",
+                            assignedAddressV6Cidr = v6Cidr,
                         )
                     }
                 }

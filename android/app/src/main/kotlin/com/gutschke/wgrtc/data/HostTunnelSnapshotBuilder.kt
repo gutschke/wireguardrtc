@@ -28,6 +28,11 @@ import java.util.Base64
 fun buildHostTunnelSnapshot(
     tunnel: Tunnel,
     assignedAddressCidr: String,
+    /** V6.3 — optional v6 CIDR for the joining client, e.g.
+     * `fd1a:2b3c:4d5e::2/128`.  When non-null, the resulting
+     * snapshot's [HostTunnelSnapshot.assignedAddress] is the
+     * canonical comma-joined form `<v4 CIDR>,<v6 CIDR>`. */
+    assignedAddressV6Cidr: String? = null,
 ): HostTunnelSnapshot? {
     if (tunnel.source != Tunnel.Source.HOST_MODE) return null
     val hm = tunnel.hostMode ?: return null
@@ -66,7 +71,11 @@ fun buildHostTunnelSnapshot(
         // never emit whitespace that ChromeOS's WG client rejects.
         allowedIps = WgAllowedIps.canonicalize(
             hm.advertisedAllowedIps ?: hm.subnet),
-        assignedAddress = assignedAddressCidr,
+        assignedAddress = if (assignedAddressV6Cidr != null) {
+            "$assignedAddressCidr,$assignedAddressV6Cidr"
+        } else {
+            assignedAddressCidr
+        },
         brokerWss = brokerWss,
         brokerKey = brokerKey,
         saltB64 = saltB64,

@@ -83,4 +83,40 @@ class ManualConfigGeneratorTest {
         val r2 = ManualConfigGenerator.generate(snapshot, rng = rng2)
         assertEquals(r1.wgQuickText, r2.wgQuickText)
     }
+
+    // V6.3 — dual-stack Address rendering + joinerIpV6 surfacing.
+
+    @Test fun `V6_3 dual-stack assignedAddress lands on wg-quick Address line`() {
+        // Comma-joined assignedAddress from the snapshot (as produced
+        // by buildHostTunnelSnapshot when subnetV6 is allocated) goes
+        // verbatim onto the Address line — no whitespace inserted, so
+        // ChromeOS's WG client accepts it on import.
+        val dualStack = snapshot.copy(
+            assignedAddress = "10.99.0.7/32,fd00:dead:beef::7/128")
+        val r = ManualConfigGenerator.generate(dualStack)
+        assertTrue(
+            r.wgQuickText.contains(
+                "Address = 10.99.0.7/32,fd00:dead:beef::7/128"),
+            "expected comma-joined Address line; got:\n${r.wgQuickText}")
+        // No double-space or stray whitespace anywhere in the line.
+        val addrLine = r.wgQuickText.lineSequence()
+            .first { it.startsWith("Address = ") }
+        assertTrue(!addrLine.contains(", "),
+            "ChromeOS rule: no whitespace around commas; got `$addrLine`")
+    }
+
+    @Test fun `V6_3 dual-stack populates HostWormholeResult joinerIpV6`() {
+        val dualStack = snapshot.copy(
+            assignedAddress = "10.99.0.7/32,fd00:dead:beef::7/128")
+        val r = ManualConfigGenerator.generate(dualStack)
+        assertEquals("10.99.0.7", r.joinerPeer.joinerIp)
+        assertEquals("fd00:dead:beef::7", r.joinerPeer.joinerIpV6)
+    }
+
+    @Test fun `V6_3 single-CIDR (v4-only) snapshot keeps joinerIpV6 null`() {
+        // Legacy v4-only host produces no v6 on the wire.
+        val r = ManualConfigGenerator.generate(snapshot)
+        assertEquals("10.99.0.7", r.joinerPeer.joinerIp)
+        assertEquals(null, r.joinerPeer.joinerIpV6)
+    }
 }

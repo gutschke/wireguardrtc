@@ -188,10 +188,19 @@ fun HostModeSection(
                         hm.subnet, addrLine,
                         com.gutschke.wgrtc.data.allocatedIps(tunnel))
                 } else null
+                // V6.3 — v6 sibling alloc; soft-fail to v4-only.
+                val v6Cidr = hm.subnetV6?.let { sv6 ->
+                    val v6Host = sv6.removeSuffix("/64") + "1"
+                    com.gutschke.wgrtc.data.HostSubnetAllocator.nextFreeIpV6(
+                        sv6, v6Host,
+                        com.gutschke.wgrtc.data.allocatedIpsV6(tunnel),
+                    )?.let { "$it/128" }
+                }
                 val snapshot = if (nextIp != null) {
                     com.gutschke.wgrtc.data.buildHostTunnelSnapshot(
                         tunnel = tunnel,
                         assignedAddressCidr = "$nextIp/32",
+                        assignedAddressV6Cidr = v6Cidr,
                     )
                 } else null
                 if (snapshot != null) {

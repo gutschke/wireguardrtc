@@ -185,6 +185,12 @@ fun Tunnel.kernelConfigStream(): java.io.InputStream =
 fun allocatedIps(t: Tunnel): Set<String> =
     t.hostMode?.enrolledPeers?.map { it.assignedIp }?.toSet() ?: emptySet()
 
+/** V6.3 — set of currently-allocated v6 IPs in [t].  Empty for
+ * client tunnels and for host tunnels that don't yet have any
+ * v6-assigned peers (legacy v4-only fleet). */
+fun allocatedIpsV6(t: Tunnel): Set<String> =
+    t.hostMode?.enrolledPeers?.mapNotNull { it.assignedIpV6 }?.toSet() ?: emptySet()
+
 /**
  * Returns a copy of this tunnel with [peer] appended to its
  * host-mode enrolledPeers list. Throws when:
@@ -204,6 +210,13 @@ fun Tunnel.withEnrolledPeer(peer: EnrolledPeer): Tunnel {
     if (hm.enrolledPeers.any { it.assignedIp == peer.assignedIp }) {
         throw IllegalStateException(
             "duplicate peer ip ${peer.assignedIp}")
+    }
+    // V6.3 — also guard against duplicate v6.  Null on either
+    // side means no v6 conflict.
+    val v6 = peer.assignedIpV6
+    if (v6 != null && hm.enrolledPeers.any { it.assignedIpV6 == v6 }) {
+        throw IllegalStateException(
+            "duplicate peer v6 ip $v6")
     }
     return copy(hostMode = hm.copy(enrolledPeers = hm.enrolledPeers + peer))
 }

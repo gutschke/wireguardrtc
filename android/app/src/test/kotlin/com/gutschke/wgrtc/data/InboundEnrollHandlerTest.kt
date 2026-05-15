@@ -88,6 +88,11 @@ class InboundEnrollHandlerTest {
         endpoint: String? = "192.0.2.1:51820",
         candidates: List<EndpointCandidate> = emptyList(),
         allocatedIps: Set<String> = emptySet(),
+        // V6.3 — defaults keep legacy tests v4-only.  Pass non-null
+        // subnetV6 + hostIpV6 to exercise dual-stack allocation.
+        subnetV6: String? = null,
+        hostIpV6: String? = null,
+        allocatedIpsV6: Set<String> = emptySet(),
     ) = InboundEnrollHandler.HostState(
         serverPrivBytes = f.serverPriv,
         serverPubB64 = f.serverPubB64,
@@ -98,6 +103,9 @@ class InboundEnrollHandlerTest {
         publicEndpointHint = endpoint,
         candidates = candidates,
         allocatedIps = allocatedIps,
+        subnetV6 = subnetV6,
+        hostIpV6 = hostIpV6,
+        allocatedIpsV6 = allocatedIpsV6,
     )
 
     /** Encrypt a request plaintext using the same key derivation
@@ -360,6 +368,104 @@ class InboundEnrollHandlerTest {
         val result = handler.handle(parsed, hostState(f))
         assertTrue(result is InboundEnrollHandler.Result.Ignore,
             "expired token must yield silent ignore, got $result")
+    }
+
+    // V6.3 — dual-stack enrolment: HostState with subnetV6 allocates
+    // a v6 sibling, emits comma-separated address, and surfaces
+    // assignedIpV6 in the NewPeer result.
+
+    @Test fun `V6_3 dual-stack host emits comma-separated address`(@TempDir dir: Path) {
+        val f = fixture()
+        val s = store(dir)
+        val tok = s.mint("alice-v6", 600_000L, now = 1000L)
+        val ts = 1L
+        val blob = buildRequestBlob(f, tok.tokenSecret, ts)
+        val envJson = buildInboundEnvelopeJson(f, blob)
+        val handler = InboundEnrollHandler(s, nowMs = { 1000L }, nowSec = { ts })
+        val parsed = extractInboundEnroll(Json.parseToJsonElement(envJson))!!
+        val result = handler.handle(parsed, hostState(
+            f,
+            subnetV6 = "fd00:dead:beef::/64",
+            hostIpV6 = "fd00:dead:beef::1",
+        ))
+
+        assertTrue(result is InboundEnrollHandler.Result.Reply, "got $result")
+        result as InboundEnrollHandler.Result.Reply
+        assertNotNull(result.newPeer)
+        // V4 sibling unchanged.
+        assertEquals("10.99.0.2", result.newPeer!!.assignedIp)
+        // V6 sibling populated.
+        assertEquals("fd00:dead:beef::2", result.newPeer.assignedIpV6,
+            "v6 should be allocated when subnetV6 is set")
+
+        // Wire-format payload — assertion against the decoded
+        // EnrollOkPlain.  The `address` field must be the canonical
+        // (no-whitespace) dual-stack comma-joined form so ChromeOS's
+        // WG client accepts the joiner's wg-quick on import.
+        val key = deriveEnrollKey(f.clientPriv, f.serverPub, tok.tokenSecret)
+        val responseEnv = Json.parseToJsonElement(result.envelopeJson) as JsonObject
+        val md = ((responseEnv["payload"] as JsonObject)["metadata"]) as JsonObject
+        val blobOut = (md["blob"] as JsonPrimitive).content
+        val ct = Base64.getDecoder().decode(blobOut)
+        val plain = secretboxDecrypt(ct, key)
+        val ok = Json.decodeFromString(EnrollOkPlain.serializer(),
+            plain!!.toString(Charsets.UTF_8))
+        assertEquals("10.99.0.2/32,fd00:dead:beef::2/128", ok.address,
+            "address must be canonical (no whitespace) comma-joined dual-stack")
+    }
+
+    @Test fun `V6_3 v4-only host (no subnetV6) keeps legacy single-CIDR address`(@TempDir dir: Path) {
+        // Tunnel persisted before V6.2 has subnetV6=null.  Handler
+        // must still emit the single-CIDR form so v4-only joiners
+        // don't see a confusing trailing comma.
+        val f = fixture()
+        val s = store(dir)
+        val tok = s.mint("alice-legacy", 600_000L, now = 1000L)
+        val ts = 1L
+        val blob = buildRequestBlob(f, tok.tokenSecret, ts)
+        val envJson = buildInboundEnvelopeJson(f, blob)
+        val handler = InboundEnrollHandler(s, nowMs = { 1000L }, nowSec = { ts })
+        val parsed = extractInboundEnroll(Json.parseToJsonElement(envJson))!!
+        val result = handler.handle(parsed, hostState(f))
+        assertTrue(result is InboundEnrollHandler.Result.Reply)
+        result as InboundEnrollHandler.Result.Reply
+        assertNull(result.newPeer!!.assignedIpV6,
+            "no subnetV6 → no v6 alloc")
+
+        val key = deriveEnrollKey(f.clientPriv, f.serverPub, tok.tokenSecret)
+        val responseEnv = Json.parseToJsonElement(result.envelopeJson) as JsonObject
+        val md = ((responseEnv["payload"] as JsonObject)["metadata"]) as JsonObject
+        val blobOut = (md["blob"] as JsonPrimitive).content
+        val ct = Base64.getDecoder().decode(blobOut)
+        val plain = secretboxDecrypt(ct, key)
+        val ok = Json.decodeFromString(EnrollOkPlain.serializer(),
+            plain!!.toString(Charsets.UTF_8))
+        assertEquals("10.99.0.2/32", ok.address,
+            "legacy v4-only path stays unchanged")
+    }
+
+    @Test fun `V6_3 v6 alloc skips already-used`(@TempDir dir: Path) {
+        // Allocator policy: linear scan from hostIp + 1.  With ::2
+        // already in use, expect ::3.
+        val f = fixture()
+        val s = store(dir)
+        val tok = s.mint("bob-v6", 600_000L, now = 1000L)
+        val ts = 1L
+        val blob = buildRequestBlob(f, tok.tokenSecret, ts)
+        val envJson = buildInboundEnvelopeJson(f, blob)
+        val handler = InboundEnrollHandler(s, nowMs = { 1000L }, nowSec = { ts })
+        val parsed = extractInboundEnroll(Json.parseToJsonElement(envJson))!!
+        val result = handler.handle(parsed, hostState(
+            f,
+            subnetV6 = "fd00:dead:beef::/64",
+            hostIpV6 = "fd00:dead:beef::1",
+            allocatedIps = setOf("10.99.0.2"),
+            allocatedIpsV6 = setOf("fd00:dead:beef::2"),
+        ))
+        assertTrue(result is InboundEnrollHandler.Result.Reply)
+        result as InboundEnrollHandler.Result.Reply
+        assertEquals("10.99.0.3", result.newPeer!!.assignedIp)
+        assertEquals("fd00:dead:beef::3", result.newPeer.assignedIpV6)
     }
 
     companion object {

@@ -66,6 +66,15 @@ class InboundEnrollHandler(
  val candidates: List<EndpointCandidate> = emptyList(),
  /** Currently-allocated peer IPs (so we don't double-assign). */
  val allocatedIps: Set<String> = emptySet(),
+ /** V6.3 — per-tunnel v6 ULA `/64` (e.g. `fd1a:2b3c:4d5e::/64`).
+  * Null on tunnels persisted before V6.2 existed. */
+ val subnetV6: String? = null,
+ /** V6.3 — host's v6 address inside [subnetV6] (e.g.
+  * `fd1a:2b3c:4d5e::1`).  Null iff [subnetV6] is null. */
+ val hostIpV6: String? = null,
+ /** V6.3 — currently-allocated peer v6 IPs (sibling of
+  * [allocatedIps]). */
+ val allocatedIpsV6: Set<String> = emptySet(),
  /** What the *client* puts in its `[Peer] AllowedIPs` line.
  * Mirror of daemon default — NAT or
  * Cascade both want all client traffic through the tunnel;
@@ -89,6 +98,11 @@ class InboundEnrollHandler(
  * [EnrolledPeer.manualInvitationText] for the security
  * trade-off). */
  val manualInvitationText: String? = null,
+ /** V6.3 — per-peer v6 address inside the host's `subnetV6`.
+  * Null when the host tunnel has no v6 subnet (legacy v4-only)
+  * OR when V6.3 allocation hasn't been wired into the calling
+  * path yet.  Persisted on [EnrolledPeer.assignedIpV6]. */
+ val assignedIpV6: String? = null,
  )
 
  sealed interface Result {
@@ -195,6 +209,16 @@ class InboundEnrollHandler(
  "host-mode subnet ${host.subnet} exhausted", now),
  newPeer = null,
  )
+ // V6.3 — allocate the v6 sibling iff the host advertised
+ // a v6 subnet.  Soft-fail: if v6 allocation fails (only
+ // realistic on a wildly over-subscribed subnet or a
+ // malformed prefix), fall through to v4-only so the
+ // enrollment still succeeds.  The dual-stack joiner just
+ // gets a v4-only tunnel in that pathological case.
+ val clientIpV6: String? = if (host.subnetV6 != null && host.hostIpV6 != null) {
+ HostSubnetAllocator.nextFreeIpV6(
+ host.subnetV6, host.hostIpV6, host.allocatedIpsV6)
+ } else null
 
  // 6. Atomic claim. consume() returns null if some other
  // request raced us between listAll() and here — in that
@@ -211,10 +235,18 @@ class InboundEnrollHandler(
  }
 
  // 6. Build ENROLL_OK plaintext.
+ // V6.3: when a v6 sibling is allocated, emit comma-
+ // separated dual-stack on `address`.  Canonical form (no
+ // whitespace) — see WgAllowedIps for ChromeOS rationale.
+ val addressLine = if (clientIpV6 != null) {
+ "$clientIp/32,$clientIpV6/128"
+ } else {
+ "$clientIp/32"
+ }
  val ok = EnrollOkPlain(
  version = PROTOCOL_VERSION,
  timestamp = now,
- address = "$clientIp/32",
+ address = addressLine,
  allowedIps = host.clientAllowedIps,
  keepalive = host.keepalive,
  serverPubkey = host.serverPubB64,
@@ -236,6 +268,7 @@ class InboundEnrollHandler(
  pubkeyB64 = env.clientPubB64,
  assignedIp = clientIp,
  nameHint = matched.nameHint,
+ assignedIpV6 = clientIpV6,
  ),
  )
  }

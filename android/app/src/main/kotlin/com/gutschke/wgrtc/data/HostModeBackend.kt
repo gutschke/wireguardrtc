@@ -169,6 +169,9 @@ class HostModeBackend(
             HostModeUapi.Peer(
                 publicKeyB64 = ep.pubkeyB64,
                 allowedIp = "${ep.assignedIp}/32",
+                // V6.3 — emit a /128 v6 allowed_ip when the peer
+                // has one.  Null on legacy v4-only peers.
+                allowedIpV6 = ep.assignedIpV6?.let { "$it/128" },
             )
         }
         val sf = egressSelector?.socketFactory()

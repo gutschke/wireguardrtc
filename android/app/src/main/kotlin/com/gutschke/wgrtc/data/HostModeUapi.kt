@@ -56,11 +56,27 @@ object HostModeUapi {
         for (p in peers) {
             sb.append("public_key=").append(b64ToHex(p.publicKeyB64)).append('\n')
             sb.append("allowed_ip=").append(p.allowedIp).append('\n')
+            // V6.3 — emit a second allowed_ip line for the peer's
+            // v6 sibling when present.  wg-go's UAPI accepts
+            // multiple allowed_ip= lines per peer (additive); both
+            // get installed in the kernel WG allowed-IPs filter.
+            p.allowedIpV6?.let {
+                sb.append("allowed_ip=").append(it).append('\n')
+            }
         }
         return sb.toString()
     }
 
-    data class Peer(val publicKeyB64: String, val allowedIp: String)
+    data class Peer(
+        val publicKeyB64: String,
+        val allowedIp: String,
+        /** V6.3 — per-peer v6 CIDR, e.g. `fd00::2/128`.  Null on
+         * peers persisted before V6.2 or on tunnels with no
+         * subnetV6.  When non-null, a second `allowed_ip=` UAPI
+         * line is emitted so wireguard-go's filter accepts both
+         * families from this peer. */
+        val allowedIpV6: String? = null,
+    )
 
     private fun b64ToHex(b64: String): String {
         val bytes = Base64.getDecoder().decode(b64)

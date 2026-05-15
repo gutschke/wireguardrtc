@@ -119,4 +119,24 @@ class HostTunnelSnapshotBuilderTest {
         assertEquals("10.99.0.0/24", s.allowedIps)
         assertEquals("phoneA", s.hostName)
     }
+
+    @Test fun `V6_3 dual-stack assignedAddress is comma-joined verbatim`() {
+        // When the caller passes both v4 + v6 CIDRs, the snapshot's
+        // assignedAddress field combines them with a `,` (no
+        // whitespace per the WgAllowedIps / ChromeOS rule).  The
+        // joiner-side wg-quick rendering writes this to the
+        // `Address = …` line; JoinerVpnConfig.parse splits it back
+        // (V6.A2 pinned).
+        val t = hostTunnel("10.99.0.1/24")
+        val s = buildHostTunnelSnapshot(t, "10.99.0.5/32",
+            assignedAddressV6Cidr = "fd00:dead:beef::5/128")!!
+        assertEquals("10.99.0.5/32,fd00:dead:beef::5/128", s.assignedAddress)
+    }
+
+    @Test fun `V6_3 null v6 keeps legacy single-CIDR assignedAddress`() {
+        val t = hostTunnel("10.99.0.1/24")
+        val s = buildHostTunnelSnapshot(t, "10.99.0.5/32",
+            assignedAddressV6Cidr = null)!!
+        assertEquals("10.99.0.5/32", s.assignedAddress)
+    }
 }

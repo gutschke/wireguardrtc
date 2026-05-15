@@ -206,12 +206,18 @@ class WormholeHostController(
             }
             val joinerInfo = decodeJoinerInfo(peerInfoBlob, key)
                 ?: return failNow("joiner info decode failed — wrong key or stale ts")
-            val ip = tunnelSnapshot.assignedAddress.substringBefore('/')
+            // V6.3 — extract both v4 + v6 from the snapshot's
+            // (possibly comma-joined) assignedAddress.  Falls back
+            // to the legacy v4-only path on snapshots minted before
+            // V6.2 existed.
+            val (ipV4, ipV6) = splitAssignedAddress(tunnelSnapshot.assignedAddress)
+            val ip = ipV4 ?: tunnelSnapshot.assignedAddress.substringBefore('/')
             _wormholeResult.value = HostWormholeResult(
                 tunnelId = tunnelSnapshot.tunnelId,
                 joinerPubkeyB64 = joinerInfo.wgPubkeyB64,
                 joinerIp = ip,
                 joinerNameHint = joinerInfo.deviceName ?: "wormhole-peer",
+                joinerIpV6 = ipV6,
             )
         }
         _state.value = WormholeHostUiState.Succeeded

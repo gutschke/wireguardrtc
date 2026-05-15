@@ -64,7 +64,11 @@ object ManualConfigGenerator {
             }
         }.trimEnd('\n')
 
-        val ip = snapshot.assignedAddress.substringBefore('/')
+        // V6.3 — extract bare v4 + v6 separately so the
+        // EnrolledPeer carries both.  splitAssignedAddress handles
+        // both single-CIDR (v4-only) and comma-joined dual-stack.
+        val (ipV4, ipV6) = splitAssignedAddress(snapshot.assignedAddress)
+        val ip = ipV4 ?: snapshot.assignedAddress.substringBefore('/')
         return Result(
             wgQuickText = configText,
             joinerPeer = HostWormholeResult(
@@ -76,6 +80,7 @@ object ManualConfigGenerator {
                 // so the host UI can re-display it after a process
                 // restart without losing the joiner's privkey.
                 manualInvitationText = configText,
+                joinerIpV6 = ipV6,
             ),
         )
     }

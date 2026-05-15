@@ -518,3 +518,42 @@ Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocator.
 
 - Peer enrolment code paths allocate v6 alongside v4 (search for `EnrolledPeer(...)` construction sites — there are 4: `HostModeSection.kt`, `MainActivity.kt`, `WgrtcViewModel.kt`, `ListenerHub.kt`).  Each needs to call `HostSubnetAllocator.nextFreeIpV6(subnetV6, hostV6, inUseV6)` when `subnetV6 != null` and populate `EnrolledPeer.assignedIpV6`.  Backward-compat: tunnels without `subnetV6` keep working v4-only.
 - V6.3: enrolment payload (`SasEnrollInfo`, `JoinerEnrolInfo`, `HostEnrolInfo`, `EnrollOkPlain`) renders the joiner's v6 `[Interface] Address` + the host's v6 in `[Peer]` AllowedIPs.  The wormhole/QR/manual flows all share `buildHostTunnelSnapshot` so the dual-stack rendering lands in one place.
+
+### V6.3 — 2026-05-14
+
+End-to-end peer enrolment with v6 address allocation + dual-stack wire format.  Wire format choice: **comma-separated single field** (e.g. `"10.99.0.2/32,fd00:dead:beef::2/128"`) — idiomatically aligned with other WG implementations.  Whitespace is *tolerated on input* (`splitAssignedAddress` trims), but *never emitted on output* — ChromeOS's native WG client rejects whitespace inside `Address` / `AllowedIPs` values and silently fails the import.  See `WgAllowedIps` for the precedent established by N12.
+
+Production wire-in (5 callsites):
+
+1. **`InboundEnrollHandler.HostState` + `NewPeer`** — new fields `subnetV6`, `hostIpV6`, `allocatedIpsV6`, `assignedIpV6`.  `handle()` now allocates the v6 sibling via `HostSubnetAllocator.nextFreeIpV6` when `subnetV6 != null`, and emits `EnrollOkPlain.address = "<v4cidr>,<v6cidr>"` canonical-form.  Soft-fail to v4-only if v6 alloc returns null on a pathologically-subscribed subnet.
+2. **`ListenerHub.buildHostState`** — populates the new v6 fields from `HostModeConfig.subnetV6` + the host's `::1` convention + `allocatedIpsV6(tunnel)`.  Also makes `parseAddressIp` v6-tolerant via `extractInterfaceIpv4` (skips v6 entries when picking the v4 hostIp).
+3. **`buildHostTunnelSnapshot(tunnel, assignedAddressCidr, assignedAddressV6Cidr = null)`** — when v6 is non-null, the snapshot's `assignedAddress` becomes the canonical comma-joined dual-stack form.  Goes verbatim onto the joiner's `[Interface] Address = …` line via `EnrollConfigRenderer` (joiner-side) or `ManualConfigGenerator` (manual flow); `JoinerVpnConfig.parse` (V6.A2) splits it back on the joiner.
+4. **`MainActivity.kt` + `HostModeSection.kt`** — the two callsites that invoke `buildHostTunnelSnapshot` for the wormhole / manual paths.  Each now also calls `nextFreeIpV6` against `hm.subnetV6` and passes the resulting CIDR as `assignedAddressV6Cidr`.
+5. **`HostModeUapi.Peer`** + **`HostModeBackend.toRunnerConfig`** — peers carry an optional `allowedIpV6: String?` (e.g. `"fd00::2/128"`).  UAPI rendering emits a second `allowed_ip=` line per peer when set, so wireguard-go's allowed-IPs filter accepts traffic from both families.
+
+Persistence (additive, backward-compat):
+
+- `HostWormholeResult.joinerIpV6: String?` (last in param list).  Populated by `ManualConfigGenerator.generate` + `WormholeHostController.handlePeerConfirmation` via `splitAssignedAddress`.
+- `EnrolledPeer.assignedIpV6: String?` (last in param list, last in `Tunnel.kt`).  Persisted in `tunnels.json`; kotlinx.serialization tolerates the field missing from older snapshots.
+- `withEnrolledPeer` guards against duplicate v6 just like duplicate v4.
+
+Wire format notes:
+
+- **Input tolerance:** `splitAssignedAddress` trims whitespace around commas (it's a host-mode authoring affordance, not a wire format concern).  `WgAllowedIps.canonicalize` strips whitespace from every output line.
+- **Output strictness:** every producer concatenates with `","` (no space).  ChromeOS's WG client and Linux's `wg-quick` (bash) both accept comma-without-space; ChromeOS specifically *rejects* whitespace.
+- **`EnrollOkPlain.address` schema** — no version bump.  Field is still `String`.  v4-only callers continue to send a single CIDR; dual-stack callers send comma-separated.  Joiners that parse a single CIDR happen to handle the comma form correctly because both `JoinerVpnConfig.parse` (V6.A2) and `EnrollConfigRenderer.renderEnrollConfig` are split-aware.
+
+Test additions:
+
+- `InboundEnrollHandlerTest` (+3): dual-stack alloc emits comma-form; v4-only stays single-CIDR; v6 alloc skips already-used.
+- `ManualConfigGeneratorTest` (+3): wg-quick Address line contains comma-joined dual-stack; `joinerIpV6` populated on the result; null `joinerIpV6` on legacy single-CIDR.
+- `HostTunnelSnapshotBuilderTest` (+2): comma-joined `assignedAddress` when `assignedAddressV6Cidr` is non-null; null v6 keeps legacy form.
+
+8 new V6.3 tests + the entire pre-existing host-mode suite (~250 tests) all green.
+
+**Not covered in V6.3 (intentional scope cuts):**
+
+- Daemon-side persistence of `assignedIpV6` per-peer in the Python `peers.d/*.conf` format — the daemon's allocator path is separate from the Android-host path.  When the daemon needs dual-stack, it'll add its own v6 allocator + drop-in config (Python `wireguardrtc` daemon, not this Android tree).
+- Host re-issuing UAPI on a tunnel restart picks up `allowedIpV6` from the persisted `EnrolledPeer.assignedIpV6` — pre-V6.3 peers will have `null` until they re-enrol.  Acceptable: legacy peers stay v4-only and stop traffic on v6 dest from the host's gvisor stack until next enrol.
+
+Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostTunnelSnapshot.kt`, `…/InboundEnrollHandler.kt`, `…/ListenerHub.kt`, `…/HostModeBackend.kt`, `…/HostModeUapi.kt`, `…/HostTunnelSnapshotBuilder.kt`, `…/ManualConfigGenerator.kt`, `…/WormholeHostController.kt`, `…/Tunnel.kt`, `…/MainActivity.kt`, `…/ui/HostModeSection.kt`, tests in matching `src/test` locations.

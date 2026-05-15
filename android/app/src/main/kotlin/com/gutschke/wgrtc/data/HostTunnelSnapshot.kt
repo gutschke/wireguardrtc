@@ -39,8 +39,17 @@ data class HostTunnelSnapshot(
      * CIDR (e.g. `10.99.0.0/24`) so the joiner can reach the host
      * + any other peers; could be `0.0.0.0/0` for full-tunnel. */
     val allowedIps: String,
-    /** Pre-allocated address for the joining client (e.g.
-     * `10.99.0.2/32`). See class kdoc. */
+    /** Pre-allocated address(es) for the joining client.
+     *
+     * V6.3 — content may be a single CIDR (`10.99.0.2/32`, legacy
+     * v4-only flow) OR a comma-separated dual-stack pair
+     * (`10.99.0.2/32,fd00:dead:beef::2/128`).  Canonical (no
+     * whitespace around commas, RFC 5952 compressed v6) — see
+     * [WgAllowedIps] for the ChromeOS compat rationale.  Consumers
+     * that need to extract the bare v4 or v6 use [splitAssignedAddress].
+     *
+     * Goes verbatim onto the joiner's `[Interface] Address = …`
+     * line; [JoinerVpnConfig.parse] handles comma-separated. */
     val assignedAddress: String,
     /** Per-tunnel broker the joiner should subscribe to after
      * enrollment for OFFER traffic. Default broker (from
@@ -80,4 +89,40 @@ data class HostWormholeResult(
      * Null for QR / wormhole enrollments where the host never sees
      * the joiner's privkey. */
     val manualInvitationText: String? = null,
+    /** V6.3 — v6 sibling of [joinerIp], stripped of `/128`.
+     * Null on tunnels without a `subnetV6` (legacy v4-only) and
+     * on the daemon flow when the daemon's HostState had no v6
+     * subnet at allocation time. */
+    val joinerIpV6: String? = null,
 )
+
+/**
+ * V6.3 — split a comma-separated `Address` / `assignedAddress`
+ * value into bare v4 + v6 components (each without their `/N`
+ * suffix).  Tolerates whitespace around commas (as
+ * [WgAllowedIps.canonicalize] strips it).  Returns `(null, null)`
+ * for an empty / unparseable input; either field may be null
+ * individually.  Used by the host-side wormhole + manual-config
+ * paths to derive [HostWormholeResult.joinerIp] /
+ * [HostWormholeResult.joinerIpV6] from
+ * [HostTunnelSnapshot.assignedAddress].
+ */
+internal fun splitAssignedAddress(value: String): Pair<String?, String?> {
+    var v4: String? = null
+    var v6: String? = null
+    for (part in value.split(',')) {
+        val s = part.trim()
+        if (s.isEmpty()) continue
+        val bare = s.substringBefore('/').trim()
+        if (bare.isEmpty()) continue
+        // v6 if it has a colon; v4 if dotted-quad.  Brackets
+        // (`[fd00::1]/128` form) are stripped defensively.
+        val stripped = if (bare.startsWith('[') && bare.endsWith(']'))
+            bare.substring(1, bare.length - 1) else bare
+        when {
+            ':' in stripped -> if (v6 == null) v6 = stripped
+            '.' in stripped -> if (v4 == null) v4 = stripped
+        }
+    }
+    return v4 to v6
+}

@@ -350,6 +350,11 @@ class ListenerHub internal constructor(
             else -> null // symmetric / unknown / null (still classifying)
         }
 
+        // V6.3 — derive host's v6 address from the persisted ULA
+        // (canonical RFC 5952 "fd...::1" suffix).  Null when the
+        // tunnel was minted before V6.2 existed.
+        val subnetV6 = hm.subnetV6
+        val hostIpV6 = subnetV6?.removeSuffix("/64")?.plus("1")
         return InboundEnrollHandler.HostState(
             serverPrivBytes = crypto.privBytes,
             serverPubB64 = crypto.pubB64,
@@ -360,6 +365,9 @@ class ListenerHub internal constructor(
             publicEndpointHint = publicHint,
             candidates = wireCandidates,
             allocatedIps = allocatedIps(tunnel),
+            subnetV6 = subnetV6,
+            hostIpV6 = hostIpV6,
+            allocatedIpsV6 = allocatedIpsV6(tunnel),
         )
     }
 
@@ -561,8 +569,15 @@ class ListenerHub internal constructor(
     private fun parseListenPort(configText: String): Int? =
         configValue(configText, "ListenPort")?.toIntOrNull()
 
-    private fun parseAddressIp(configText: String): String? =
-        configValue(configText, "Address")?.substringBefore('/')?.trim()
+    private fun parseAddressIp(configText: String): String? {
+        // V6.3 — multi-Address-line aware.  Pick the first v4
+        // entry (HostModeFactory writes v4 first; pre-V6.2 tunnels
+        // only have v4).  Falls back to legacy first-line parse on
+        // unparseable input.
+        val v4 = extractInterfaceIpv4(configText)
+        if (v4 != null) return v4
+        return configValue(configText, "Address")?.substringBefore('/')?.trim()
+    }
 
     private fun hostIpFromSubnet(subnet: String): String {
         // Best-effort: assume the host claims .1 of the subnet. This
@@ -687,6 +702,9 @@ class ListenerHub internal constructor(
                 assignedIp = result.joinerIp,
                 nameHint = result.joinerNameHint,
                 manualInvitationText = result.manualInvitationText,
+                // V6.3 — forward the v6 sibling allocated by the
+                // wormhole / manual-config path.
+                assignedIpV6 = result.joinerIpV6,
             ),
             nowMs = nowMs,
             reconfigurer = reconfigurer,
@@ -823,6 +841,10 @@ suspend fun applyEnrollmentToTunnel(
         nameHint = peer.nameHint,
         enrolledAtMs = nowMs,
         manualInvitationText = peer.manualInvitationText,
+        // V6.3 — daemon path: forward the per-peer v6 address
+        // the InboundEnrollHandler allocated (null when the
+        // tunnel has no subnetV6).
+        assignedIpV6 = peer.assignedIpV6,
     ))
     store.save(all.map { if (it.id == tunnelId) updated else it })
     reconfigurer?.reconfigureHostTunnel(tunnelId, renderWgConfig(updated))
