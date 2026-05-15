@@ -3,7 +3,7 @@
   Network-security config for the `agent` buildType ONLY.
 
   Default Android policy (release + debug) denies cleartext HTTP/WS
-  to every domain — correct production behaviour, and exactly what
+  to every domain — correct production behavior, and exactly what
   blocked our first sandbox enrollment attempt against a plain `ws://`
   broker.  The agent buildType is an adb-driven instrumented test
   channel with applicationId `com.gutschke.wgrtc.agent`, never

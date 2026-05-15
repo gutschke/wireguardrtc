@@ -59,7 +59,7 @@ class WormholeUiTest {
             val next = reduceJoin(s, WormholeJoinUiEvent.Cancel)
             assertTrue(next is WormholeJoinUiState.Failed,
                 "Cancel from $s should yield Failed, got $next")
-            assertEquals("cancelled", (next as WormholeJoinUiState.Failed).reason)
+            assertEquals("canceled", (next as WormholeJoinUiState.Failed).reason)
         }
     }
 

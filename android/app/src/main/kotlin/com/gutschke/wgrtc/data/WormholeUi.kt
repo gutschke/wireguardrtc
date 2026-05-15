@@ -92,7 +92,7 @@ fun reduceJoin(
     if (event is WormholeJoinUiEvent.Cancel) {
         return when (state) {
             is WormholeJoinUiState.Succeeded, is WormholeJoinUiState.Failed -> state
-            else -> WormholeJoinUiState.Failed("cancelled")
+            else -> WormholeJoinUiState.Failed("canceled")
         }
     }
     if (event is WormholeJoinUiEvent.Fail) {
@@ -169,7 +169,7 @@ sealed class WormholeHostUiEvent {
     /** Surface an error. */
     data class Fail(val reason: String) : WormholeHostUiEvent()
 
-    /** User cancelled. */
+    /** User canceled. */
     object Cancel : WormholeHostUiEvent()
 }
 
@@ -180,7 +180,7 @@ fun reduceHost(
     if (event is WormholeHostUiEvent.Cancel) {
         return when (state) {
             is WormholeHostUiState.Succeeded, is WormholeHostUiState.Failed -> state
-            else -> WormholeHostUiState.Failed("cancelled")
+            else -> WormholeHostUiState.Failed("canceled")
         }
     }
     if (event is WormholeHostUiEvent.Fail) {

@@ -20,7 +20,7 @@ package com.gutschke.wgrtc.data
  * tunnel — that happens when [WormholeHostController.successResult]
  * fires and the UI calls into the existing
  * [applyEnrollmentToTunnel] path. If the wormhole fails or is
- * cancelled, the IP slot is simply not used; nothing to roll back.
+ * canceled, the IP slot is simply not used; nothing to roll back.
  */
 data class HostTunnelSnapshot(
     /** [Tunnel.id] — used by the UI to know which tunnel to update

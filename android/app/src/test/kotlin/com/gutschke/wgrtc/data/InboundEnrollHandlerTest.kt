@@ -370,7 +370,7 @@ class InboundEnrollHandlerTest {
             "expired token must yield silent ignore, got $result")
     }
 
-    // V6.3 — dual-stack enrolment: HostState with subnetV6 allocates
+    // V6.3 — dual-stack enrollment: HostState with subnetV6 allocates
     // a v6 sibling, emits comma-separated address, and surfaces
     // assignedIpV6 in the NewPeer result.
 

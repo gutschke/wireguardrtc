@@ -129,7 +129,7 @@ func (l *sharedNicLink) WriteNotify() {
 	case l.incomingPacket <- view:
 	default:
 		// Bounded back-pressure: drop on overflow, matching the
-		// kernel TUN's xmit-queue behaviour. wireguard-go is
+		// kernel TUN's xmit-queue behavior. wireguard-go is
 		// behind on this joiner; UDP loses, TCP retransmits.
 		view.Release()
 	}

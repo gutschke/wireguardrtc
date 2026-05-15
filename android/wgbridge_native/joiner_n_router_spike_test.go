@@ -24,7 +24,7 @@
 // design needs a different mechanism (per-flow routing, custom
 // dispatch, etc.). We log failures with enough context that the
 // next person picking this up can tell whether the failure is real
-// gvisor behaviour or our test-harness mistake.
+// gvisor behavior or our test-harness mistake.
 
 package main
 
@@ -457,7 +457,7 @@ func TestSpikeUnroutedDestinationDropsCleanly(t *testing.T) {
 	}
 	// We don't assert any specific error path because gvisor's
 	// internal counter naming has changed across versions; the
-	// behaviour-level invariant ("the packet doesn't leak") is
+	// behavior-level invariant ("the packet doesn't leak") is
 	// the important thing for joiner-N.
 }
 

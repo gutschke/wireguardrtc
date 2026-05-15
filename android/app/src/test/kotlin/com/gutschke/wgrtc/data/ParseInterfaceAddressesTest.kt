@@ -100,7 +100,7 @@ class ParseInterfaceAddressesTest {
     @Test fun `Address lines outside Interface section are ignored`() {
         // wg-quick treats `Address = ...` outside [Interface] as
         // either a parse error or no-op depending on impl; we
-        // mirror parseInterfaceField's section-tracking behaviour.
+        // mirror parseInterfaceField's section-tracking behavior.
         val cfg = """
             [Interface]
             PrivateKey = abc=

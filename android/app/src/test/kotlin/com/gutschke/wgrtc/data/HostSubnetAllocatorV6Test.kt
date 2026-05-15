@@ -151,7 +151,7 @@ class HostSubnetAllocatorV6Test {
 
     @Test fun `nextFreeIpV6 normalises canonical hex (lowercase, no leading zeros)`() {
         // Caller might pass `FD00:1234:5678::1` uppercase.  Allocator
-        // should still recognise it + compare correctly.  Also handles
+        // should still recognize it + compare correctly.  Also handles
         // `0123` vs `123` segment forms.
         val ip = HostSubnetAllocator.nextFreeIpV6(
             "fd00:1234:5678::/64",

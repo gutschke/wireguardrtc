@@ -105,7 +105,7 @@ data class JoinerVpnConfig(
             // V6.A3 — when the user didn't set MTU explicitly,
             // pick 1420 for v4 endpoints and 1400 for v6.  A
             // missing Endpoint (passive peer) falls back to v4 —
-            // matches pre-V6 behaviour.
+            // matches pre-V6 behavior.
             val effectiveMtu = mtu ?: run {
                 val outer = firstPeerEndpoint?.let { MtuMath.inferOuterFamily(it) }
                     ?: MtuMath.OuterFamily.IPV4

@@ -78,7 +78,7 @@ class StunQueryV6Test(unittest.TestCase):
 
     def test_stun_query_v4_default_still_works(self):
         """Back-compat: callers that pass no family flag must get
-        the same IPv4 behaviour they always did."""
+        the same IPv4 behavior they always did."""
         res = _run(wgrtc.stun_query(STUN_V4))
         self.assertIsNotNone(res, "v4 STUN should return a result")
         ip, port = res

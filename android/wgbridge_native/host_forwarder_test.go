@@ -273,7 +273,7 @@ func TestICMPv6EchoReplyConstantIs129(t *testing.T) {
 // pure-byte equality (ignoring length), `tempAddrs[ipv4("0.0.0.0")]`
 // would collide with `tempAddrs[ipv6("::")]` and the forwarder
 // would refuse to re-register an address that's "the same bytes"
-// under the other family.  This test pins the current behaviour
+// under the other family.  This test pins the current behavior
 // so a regression in the upgrade trips the alarm.
 func TestTempAddrsV4V6Coexist(t *testing.T) {
 	// Both addresses have all-zero bytes — the most aggressive
@@ -397,7 +397,7 @@ func TestHandleLocalICMPv6FiltersNonEcho(t *testing.T) {
 // spawn a ping goroutine) for real-local destinations.  Pre-
 // V6.H2b this was implicit ("our handler covers temp-local only,
 // gvisor auto-replies to real-local"); this test pins the
-// behaviour against an accidental refactor that drops the
+// behavior against an accidental refactor that drops the
 // `LocalAddressTemporary` guard.
 func TestHandleLocalICMPv6RealLocalDoesNotPing(t *testing.T) {
 	state := &hostForwarderState{}

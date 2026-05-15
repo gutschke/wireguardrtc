@@ -9,7 +9,7 @@ import kotlinx.coroutines.sync.withLock
  * Kotlin layer to Android's `VpnService.Builder.establish()`
  * lifecycle.
  *
- * **Behaviour**:
+ * **Behavior**:
  *
  *  - Holds the current set of active joiner configs keyed by
  *    tunnel id.
@@ -21,7 +21,7 @@ import kotlinx.coroutines.sync.withLock
  *    on the new stack.
  *  - Apps' kernel TCP sockets survive the swap as long as their
  *    source addresses + routes stay in the new union — D4.P3
- *    confirmed the kernel-level behaviour. wg-go handshake state
+ *    confirmed the kernel-level behavior. wg-go handshake state
  *    does NOT survive (each rebuild reopens all bridges); the
  *    next handshake retransmit cycles bring tunnels back up
  *    within a few seconds.
@@ -32,7 +32,7 @@ import kotlinx.coroutines.sync.withLock
  * "user taps Add three times" pathological case. Add as a small
  * follow-up once the UI flow lands.
  *
- * **Threading**: every method is `suspend` and serialised by
+ * **Threading**: every method is `suspend` and serialized by
  * [mu]. The underlying backend's JNI calls already dispatch via
  * `Dispatchers.IO`; this class only adds orchestration above it.
  */
@@ -134,7 +134,7 @@ class JoinerNController(
      *  by the candidate-race / endpoint-roam path that pushes a
      *  new `[Peer] Endpoint = ...` without changing routes.
      *
-     *  Serialised through [mu] so that a `closeJoiner` /
+     *  Serialized through [mu] so that a `closeJoiner` /
      *  `closeAll` racing against the JNI configureUapi call can't
      *  free the bridge handle out from under us.  An earlier
      *  draft skipped the lock to allow concurrent roams during

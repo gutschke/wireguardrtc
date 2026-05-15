@@ -116,7 +116,7 @@ def test_multiple_external_ips_listed():
     assert_eq(sorted(v.external_ips), ["198.51.100.7", "203.0.113.5"],
               "both ext IPs reported")
     # Note: classifier may or may not call this case viable; either
-    # behaviour is defensible.  Just assert structure is consistent.
+    # behavior is defensible.  Just assert structure is consistent.
     assert_true(v.kind in ("no_nat_or_cone_port_preserving",
                             "cone_not_port_preserving",
                             "symmetric", "no_data"),
@@ -144,7 +144,7 @@ def test_multiple_src_ports_independent():
 
 def test_one_src_symmetric_blocks_verdict():
     # Even if src 51000 looks cone, src 52000 being symmetric is enough
-    # to call the whole thing symmetric — the bad behaviour will bite.
+    # to call the whole thing symmetric — the bad behavior will bite.
     probes = [
         ("stun.a", 51000, "203.0.113.5", 51000),
         ("stun.b", 51000, "203.0.113.5", 51000),

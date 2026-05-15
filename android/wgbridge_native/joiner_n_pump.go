@@ -11,7 +11,7 @@
 //     write the raw IP packet to the fd.
 //
 // Both pumps cancel cleanly when:
-//   - Their `ctx` is cancelled (the joiner-N controller is
+//   - Their `ctx` is canceled (the joiner-N controller is
 //     shutting down).
 //   - The fd is closed by another goroutine (`Read` / `Write`
 //     return `os.ErrClosed`).
@@ -38,7 +38,7 @@ import (
 
 // kernelTunPump reads framed IP packets off [src], demuxes by IP
 // version, injects into [ep]'s inbound queue. Stops when [ctx] is
-// cancelled or [src] is closed (EOF / "file already closed" both
+// canceled or [src] is closed (EOF / "file already closed" both
 // normalised to nil return). Returns the count of injected
 // packets and the final error if any.
 //
@@ -95,7 +95,7 @@ func kernelTunPump(
 }
 
 // kernelTunWriter drains [ep]'s outbound queue and writes each
-// packet to [dst]. Stops when [ctx] is cancelled or [dst] is
+// packet to [dst]. Stops when [ctx] is canceled or [dst] is
 // closed.
 func kernelTunWriter(
 	ctx context.Context,
@@ -109,7 +109,7 @@ func kernelTunWriter(
 		}
 		pkt := ep.ReadContext(ctx)
 		if pkt == nil {
-			return written, nil // context cancelled
+			return written, nil // context canceled
 		}
 		v := pkt.ToView()
 		raw := make([]byte, v.Size())

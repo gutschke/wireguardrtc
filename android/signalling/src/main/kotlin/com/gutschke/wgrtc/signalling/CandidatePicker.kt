@@ -8,7 +8,7 @@ import java.net.NetworkInterface
  * v2 design.
  *
  * Responsibilities (the pure-JVM half):
- * 1. **Same-subnet detection.** For each LAN-flavour candidate,
+ * 1. **Same-subnet detection.** For each LAN-flavor candidate,
  * check whether any of the receiver's local interfaces has an IP
  * in the same subnet (using the *receiver's* netmask, not
  * /24-by-assumption). Same-subnet candidates rank above

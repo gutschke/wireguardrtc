@@ -236,7 +236,7 @@ fun SettingsScreen(
 
             // Version string — read once from PackageInfo at
             // composition. Saves us a BuildConfig.gen build flag
-            // and works for both debug + release flavours.
+            // and works for both debug + release flavors.
             val ctx = androidx.compose.ui.platform.LocalContext.current
             val versionName = remember {
                 try {

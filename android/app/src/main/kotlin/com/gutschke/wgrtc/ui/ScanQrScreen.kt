@@ -57,7 +57,7 @@ fun ScanQrScreen(
         if (result?.contents != null) {
             onScanned(result.contents)
         } else {
-            // User cancelled scan — return to chooser.
+            // User canceled scan — return to chooser.
             onBack()
         }
     }

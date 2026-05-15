@@ -11,7 +11,7 @@
 #  - the broker accepts our envelope shapes (the public broker is
 #    finicky — see project_peerjs_public_broker_gate).
 #  - both sides arrive at the same SAS phrase over the real wire.
-#  - enrol payload round-trips through secretbox.
+#  - enroll payload round-trips through secretbox.
 
 import asyncio
 import base64

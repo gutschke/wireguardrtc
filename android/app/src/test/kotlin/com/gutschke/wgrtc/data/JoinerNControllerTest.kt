@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * D4.J4 controller tests — exercise rebuild semantics across
  * add / remove / replace cycles using an in-process fake JNI
  * surface and a fake [TunFdProvider]. End-to-end VpnService
- * behaviour is out of scope (consent dialog blocks autonomous
+ * behavior is out of scope (consent dialog blocks autonomous
  * testing per `feedback_vpn_consent_per_buildtype.md`); this
  * file's job is the rebuild state machine.
  */

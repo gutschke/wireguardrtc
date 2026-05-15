@@ -2,7 +2,7 @@
   debug buildType launcher background — amber tint so the debug
   install is visually distinct from the release variant when both
   are present on a device.  Same shape, same teal hexagon
-  foreground; only the background colour changes.
+  foreground; only the background color changes.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"

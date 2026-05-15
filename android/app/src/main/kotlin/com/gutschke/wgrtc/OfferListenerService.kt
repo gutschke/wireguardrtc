@@ -69,7 +69,7 @@ class OfferListenerService : Service() {
             startForegroundCompat(buildNotification(0))
             // Cancel the activeCountFlow collector explicitly —
             // otherwise it can keep running long enough to fire a
-            // new notify() AFTER we've cancelled the notification,
+            // new notify() AFTER we've canceled the notification,
             // creating a brief flicker / re-post race.  scope.cancel
             // in onDestroy only runs after stopSelf's async teardown.
             watchJob?.cancel()

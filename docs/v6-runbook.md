@@ -9,7 +9,7 @@ before relying on it.
 
 Three independent properties:
 
-1. **Wire format.**  Enrolment payloads, candidate lists, and
+1. **Wire format.**  Enrollment payloads, candidate lists, and
    AllowedIPs entries carry both v4 and v6 addresses without
    silently dropping the v6 half.  Pinned by the V6.3 unit tests +
    the `HostNativeV6SelfLoopTest` instrumented test.
@@ -108,7 +108,7 @@ traffic end-to-end.
    <iface>` should list both an `Address` and a v6 `Address` in
    `wireguardrtc.conf`.
 
-2. Mint an enrolment for your phone (`sudo wireguardrtc
+2. Mint an enrollment for your phone (`sudo wireguardrtc
    --enroll-token "phone" --expires 600` or wormhole).  The
    resulting QR / wormhole payload includes a v6 `AllowedIPs`
    entry — verify with the app's "Show last invitation" action.
@@ -137,7 +137,7 @@ which pinpoint where the v6 path is breaking.
   ConnectionRunner, MtuMath}.kt` (V6.A1, V6.A2, V6.A3).
 - Host v6: `android/wgbridge_native/host_forwarder.go` (V6.H1,
   V6.H2, V6.H2b) and `android/app/src/main/kotlin/.../HostModeBackend.kt`.
-- Enrolment wire format: `signalling/.../EnrollOkPlain.kt`,
+- Enrollment wire format: `signalling/.../EnrollOkPlain.kt`,
   `daemon/wireguardrtc` (V6.3).
 - ULA allocation: `HostSubnetAllocator.kt` (V6.2).
 

@@ -140,7 +140,7 @@ class WormholeJoinController(
     /** User pressed back / aborted. Best-effort teardown. */
     fun cancel() {
         if (terminal()) return
-        _state.value = WormholeJoinUiState.Failed("cancelled")
+        _state.value = WormholeJoinUiState.Failed("canceled")
         teardown()
     }
 

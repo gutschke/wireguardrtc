@@ -42,7 +42,7 @@ CALL_LIKE_ATTRS = frozenset({
     # asyncio
     "new_event_loop", "run", "close", "run_until_complete", "run_forever",
     "stop", "create_task",
-    "done", "cancel", "cancelled", "closed",
+    "done", "cancel", "canceled", "closed",
     # subprocess.Process
     "communicate", "wait", "poll", "terminate", "kill",
     # file-likes

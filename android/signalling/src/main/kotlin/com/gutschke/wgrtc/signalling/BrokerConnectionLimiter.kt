@@ -44,7 +44,7 @@ import kotlinx.coroutines.sync.withLock
  * that registered the wake under a broker id the daemon couldn't
  * dispatch on, so the daemon silently dropped wakes.
  *
- * The limiter is best-effort: it serialises slot allocation under
+ * The limiter is best-effort: it serializes slot allocation under
  * a mutex and uses `delay()` to wait, which is cooperatively
  * cancellable. Tests inject a fake [nowMs] to verify the
  * rate-limiting math without sleeping.

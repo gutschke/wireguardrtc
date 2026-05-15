@@ -126,7 +126,7 @@ Attach both `wgrtc-vX.Y.Z.apk` and `wgrtc-vX.Y.Z.apk.sha256` to the GitHub Relea
 |---|---|---|
 | ABIs in the APK | `arm64-v8a`, `x86_64` | What `wgbridge_native/build.sh` produces. Covers ≈100% of in-warranty phones + ChromeOS + emulator. |
 | `minSdk` | 26 (Android 8.0) | Matches what the codebase already requires; older Androids lack APIs we lean on. |
-| `targetSdk` | 35 (Android 15) | Current Play floor; sets the runtime behaviour the app is tested against. |
+| `targetSdk` | 35 (Android 15) | Current Play floor; sets the runtime behavior the app is tested against. |
 
 `armeabi-v7a` is intentionally omitted: every phone shipped since 2019 is arm64, and dropping the 32-bit slice halves the JNI payload.  If a user reports a 32-bit-only device, build from source — `wgbridge_native/build.sh` will produce a v7a slice with `ABI_v7a=1`.
 

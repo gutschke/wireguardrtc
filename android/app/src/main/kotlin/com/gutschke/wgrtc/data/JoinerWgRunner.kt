@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicReference
  *
  * Threading: `start` / `reconfigure` / `close` are NOT thread-safe
  * relative to each other; the caller (typically a foreground
- * service) should serialise them through one supervisor coroutine.
+ * service) should serialize them through one supervisor coroutine.
  */
 class JoinerWgRunner(
     private val backendFactory: (fd: Int, mtu: Int) -> WgBridgeBackend,

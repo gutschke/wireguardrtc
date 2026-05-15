@@ -30,7 +30,7 @@ import javax.net.SocketFactory
  * [IOException]; runtime stream errors close both sides and let
  * [forward] return normally (the peer sees EOF).
  *
- * Cancellation: cancelling the calling coroutine's job cleanly
+ * Cancellation: canceling the calling coroutine's job cleanly
  * tears down both sockets.
  */
 class TcpFlowForwarder(
@@ -89,7 +89,7 @@ class TcpFlowForwarder(
                 // throw IOException internally, hit their own
                 // finally / catch, and complete. coroutineScope
                 // then awaits them and returns (with the original
-                // CancellationException, if cancelled).
+                // CancellationException, if canceled).
                 try { socket.close() } catch (_: Exception) {}
                 try { conn.close() } catch (_: Exception) {}
             }

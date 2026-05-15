@@ -122,7 +122,7 @@ class D4P3TcpSurvivesRebuildTest {
             assertNotNull("second establish() returned null", pfd2)
 
             // Bind a fresh socket — confirms the address is still
-            // recognised post-swap.
+            // recognized post-swap.
             DatagramSocket(InetSocketAddress("10.250.0.1", 0)).use { sock2 ->
                 assertNotNull("socket bound after rebuild has no local address",
                     sock2.localAddress)

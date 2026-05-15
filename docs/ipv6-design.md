@@ -20,7 +20,7 @@ This is a living document.  Each section captures both the original plan and the
 
 The signaling wire format already accepts addresses as opaque strings.  `assigned_address`, `wg_endpoint`, and `allowed_ips` in `SasEnrollInfo` are strings.  wg-quick's own config accepts comma-separated dual-stack values (`Address = 10.99.0.2, fd00::2`, `AllowedIPs = 0.0.0.0/0, ::/0`).  We piggyback on that — **no protocol-version bump required** unless we hit a structural roadblock.
 
-If we need to bump it (e.g., to add explicit per-family slots for IPv6-only enrolment), we go to `PROTOCOL_LABEL = b"wg-peerjs/v2/sigbox"`.  Keep that option in reserve.
+If we need to bump it (e.g., to add explicit per-family slots for IPv6-only enrollment), we go to `PROTOCOL_LABEL = b"wg-peerjs/v2/sigbox"`.  Keep that option in reserve.
 
 ### 2.2 Hole-punching stays IPv4-only
 
@@ -101,7 +101,7 @@ Captured here so future readers can diff against §4.
 1. **Accept v6 endpoints in `--use-wormhole` output.**  The wg-quick config printed by the joiner CLI already supports v6 endpoints via correct bracketing; just make sure the daemon publishes them.
 2. **Joiner-side broker reachability over v6.**  When dialling `wss://0.peerjs.com/peerjs`, Android's networking stack honours happy-eyeballs.  Smoke-test on a v6-only network (T-Mobile, or a NAT64-only emulator config).
 3. **Android: ensure v6 isn't dropped at the joiner's VpnService route table.**  `AllowedIPs = ::/0` needs an explicit `addRoute(IPv6.ANY, 0)` call on `VpnService.Builder`; check it's there.
-4. **Android joiner `pickHostEndpoint`.**  Accept v6 candidates from the host's enrolment payload; don't filter on family.  Currently filters live in `IfaceCandidates`; widen them.
+4. **Android joiner `pickHostEndpoint`.**  Accept v6 candidates from the host's enrollment payload; don't filter on family.  Currently filters live in `IfaceCandidates`; widen them.
 
 ### 4.3 Host-mode (Android-as-host)
 
@@ -437,7 +437,7 @@ Files: `android/app/src/test/kotlin/com/gutschke/wgrtc/data/DnsProxyTest.kt` (re
 
 **Not addressed in V6.H3:**
 
-- The joiner has to actually USE the host's v6 address as DNS in its wg-quick `DNS = …` line for the v6 path to fire.  Today host enrolment renders `DNS = <host's v4 WG-side address>` (`buildHostTunnelSnapshot` derives one address).  When V6.2 lands v6 host addresses, the enrolment payload should emit `DNS = <v4-host>, <v6-host>` so the joiner has both.  V6.2 / V6.3 territory.
+- The joiner has to actually USE the host's v6 address as DNS in its wg-quick `DNS = …` line for the v6 path to fire.  Today host enrollment renders `DNS = <host's v4 WG-side address>` (`buildHostTunnelSnapshot` derives one address).  When V6.2 lands v6 host addresses, the enrollment payload should emit `DNS = <v4-host>, <v6-host>` so the joiner has both.  V6.2 / V6.3 territory.
 - ICMPv6 from joiner → host's gvisor stack (e.g. `ping6 fd00::1`) — still v4-only via `host_forwarder.go`'s ICMP path.  Same H2-deferred work.
 
 ### V6.PL — 2026-05-14
@@ -500,28 +500,28 @@ Test additions: `HostSubnetAllocatorV6Test.kt` (11 tests) — generation, dual-s
 
 - `HostModeConfig.subnetV6: String?` field (nullable for backward compat) and `EnrolledPeer.assignedIpV6: String?`.
 - `HostModeFactory.newTunnel()` generates a fresh ULA + writes a second `[Interface] Address = fd...::1/64` line into `configText`.
-- Peer enrolment code paths (`MainActivity`, `WgrtcViewModel`, `HostModeSection`, `ListenerHub`) allocate a v6 alongside the v4 when adding a new peer.
+- Peer enrollment code paths (`MainActivity`, `WgrtcViewModel`, `HostModeSection`, `ListenerHub`) allocate a v6 alongside the v4 when adding a new peer.
 
-After those land, V6.3 will render dual-stack addresses + AllowedIPs in the enrolment payload + manual config invitations.
+After those land, V6.3 will render dual-stack addresses + AllowedIPs in the enrollment payload + manual config invitations.
 
 Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocator.kt`, `android/app/src/test/kotlin/com/gutschke/wgrtc/data/HostSubnetAllocatorV6Test.kt`.
 
 **Step 2 landed: persistence fields + factory wire-in.**
 
 - `HostModeConfig.subnetV6: String?` — nullable for backward-compat with pre-V6.2 tunnels.  When non-null, carries the per-tunnel `/64` minted by [HostSubnetAllocator.generateUlaPrefix].
-- `EnrolledPeer.assignedIpV6: String?` — last in the parameter list so all positional callers (there are several in tests + production) keep compiling unchanged.  Wired up by V6.3 peer enrolment paths.
+- `EnrolledPeer.assignedIpV6: String?` — last in the parameter list so all positional callers (there are several in tests + production) keep compiling unchanged.  Wired up by V6.3 peer enrollment paths.
 - `HostModeFactory.newTunnel()` now mints a ULA on every new host tunnel + writes a second `[Interface] Address = fd...::1/64` line.  Host owns `::1` in its v6 subnet, mirroring the v4 `.1` convention.
 
 4 new V6.2 cases in `HostModeFactoryTest.kt` + 12 v6 allocator tests + 14 pre-existing v4 allocator tests + the entire pre-existing host-mode suite — all green.
 
 **Still pending (V6.2 step 3 + V6.3):**
 
-- Peer enrolment code paths allocate v6 alongside v4 (search for `EnrolledPeer(...)` construction sites — there are 4: `HostModeSection.kt`, `MainActivity.kt`, `WgrtcViewModel.kt`, `ListenerHub.kt`).  Each needs to call `HostSubnetAllocator.nextFreeIpV6(subnetV6, hostV6, inUseV6)` when `subnetV6 != null` and populate `EnrolledPeer.assignedIpV6`.  Backward-compat: tunnels without `subnetV6` keep working v4-only.
-- V6.3: enrolment payload (`SasEnrollInfo`, `JoinerEnrolInfo`, `HostEnrolInfo`, `EnrollOkPlain`) renders the joiner's v6 `[Interface] Address` + the host's v6 in `[Peer]` AllowedIPs.  The wormhole/QR/manual flows all share `buildHostTunnelSnapshot` so the dual-stack rendering lands in one place.
+- Peer enrollment code paths allocate v6 alongside v4 (search for `EnrolledPeer(...)` construction sites — there are 4: `HostModeSection.kt`, `MainActivity.kt`, `WgrtcViewModel.kt`, `ListenerHub.kt`).  Each needs to call `HostSubnetAllocator.nextFreeIpV6(subnetV6, hostV6, inUseV6)` when `subnetV6 != null` and populate `EnrolledPeer.assignedIpV6`.  Backward-compat: tunnels without `subnetV6` keep working v4-only.
+- V6.3: enrollment payload (`SasEnrollInfo`, `JoinerEnrolInfo`, `HostEnrolInfo`, `EnrollOkPlain`) renders the joiner's v6 `[Interface] Address` + the host's v6 in `[Peer]` AllowedIPs.  The wormhole/QR/manual flows all share `buildHostTunnelSnapshot` so the dual-stack rendering lands in one place.
 
 ### V6.3 — 2026-05-14
 
-End-to-end peer enrolment with v6 address allocation + dual-stack wire format.  Wire format choice: **comma-separated single field** (e.g. `"10.99.0.2/32,fd00:dead:beef::2/128"`) — idiomatically aligned with other WG implementations.  Whitespace is *tolerated on input* (`splitAssignedAddress` trims), but *never emitted on output* — ChromeOS's native WG client rejects whitespace inside `Address` / `AllowedIPs` values and silently fails the import.  See `WgAllowedIps` for the precedent established by N12.
+End-to-end peer enrollment with v6 address allocation + dual-stack wire format.  Wire format choice: **comma-separated single field** (e.g. `"10.99.0.2/32,fd00:dead:beef::2/128"`) — idiomatically aligned with other WG implementations.  Whitespace is *tolerated on input* (`splitAssignedAddress` trims), but *never emitted on output* — ChromeOS's native WG client rejects whitespace inside `Address` / `AllowedIPs` values and silently fails the import.  See `WgAllowedIps` for the precedent established by N12.
 
 Production wire-in (5 callsites):
 
@@ -554,7 +554,7 @@ Test additions:
 **Not covered in V6.3 (intentional scope cuts):**
 
 - Daemon-side persistence of `assignedIpV6` per-peer in the Python `peers.d/*.conf` format — the daemon's allocator path is separate from the Android-host path.  When the daemon needs dual-stack, it'll add its own v6 allocator + drop-in config (Python `wireguardrtc` daemon, not this Android tree).
-- Host re-issuing UAPI on a tunnel restart picks up `allowedIpV6` from the persisted `EnrolledPeer.assignedIpV6` — pre-V6.3 peers will have `null` until they re-enrol.  Acceptable: legacy peers stay v4-only and stop traffic on v6 dest from the host's gvisor stack until next enrol.
+- Host re-issuing UAPI on a tunnel restart picks up `allowedIpV6` from the persisted `EnrolledPeer.assignedIpV6` — pre-V6.3 peers will have `null` until they re-enroll.  Acceptable: legacy peers stay v4-only and stop traffic on v6 dest from the host's gvisor stack until next enroll.
 
 Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/HostTunnelSnapshot.kt`, `…/InboundEnrollHandler.kt`, `…/ListenerHub.kt`, `…/HostModeBackend.kt`, `…/HostModeUapi.kt`, `…/HostTunnelSnapshotBuilder.kt`, `…/ManualConfigGenerator.kt`, `…/WormholeHostController.kt`, `…/Tunnel.kt`, `…/MainActivity.kt`, `…/ui/HostModeSection.kt`, tests in matching `src/test` locations.
 

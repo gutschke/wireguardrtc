@@ -146,7 +146,7 @@ def test_aborted_sas_raises():
         # Responder side: expect counter-party to abort.  We don't
         # know if the inbound abort arrives as a missing confirm or
         # something else; in our in-memory transport it just means
-        # we get cancelled.  Wrap in shielded close.
+        # we get canceled.  Wrap in shielded close.
         try:
             await asyncio.wait_for(flow.run_host(
                 host_info=dict(

@@ -292,7 +292,7 @@ object HostSubnetAllocator {
                 (bytes[i * 2 + 1].toInt() and 0xff)
         }
         // RFC 5952 §4.2: replace the longest run of zero segments
-        // (length ≥ 2) with `::`.  Ties broken in favour of the
+        // (length ≥ 2) with `::`.  Ties broken in favor of the
         // first such run.
         var bestStart = -1
         var bestLen = 0

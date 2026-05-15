@@ -167,7 +167,7 @@ class OfferListener {
      * 32-byte X25519+BLAKE2b key derived via [deriveSigboxKey].
      *
      * The supplied [parentScope] owns the listener's coroutines —
-     * cancelling the scope (or calling [stop]) terminates the
+     * canceling the scope (or calling [stop]) terminates the
      * websocket and the heartbeat loop cleanly.
      */
     suspend fun start(
@@ -408,7 +408,7 @@ class OfferListener {
             // exactly the SAS_CONFIRM-loss bug we're fixing. close() is
             // a no-op when the socket is already closing, so back-to-back
             // close + invokeOnCancellation is safe.
-            try { socket.close(1000, "cancelled") } catch (_: Throwable) {}
+            try { socket.close(1000, "canceled") } catch (_: Throwable) {}
             ws = null
         }
     }

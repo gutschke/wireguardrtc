@@ -488,7 +488,7 @@ class ConnectionRunnerTest {
         // Simulates ARC fast-path: the controller's
         // latestHandshakeMs is already > 0 at the moment connect()
         // is invoked (binding.service.start triggered the handshake
-        // synchronously). Default behaviour would capture that
+        // synchronously). Default behavior would capture that
         // value as the baseline and never short-circuit. With
         // baselineHandshakeMs=0L the runner accepts the standing
         // handshake immediately and skips the race entirely.

@@ -187,7 +187,7 @@ class TunnelOverlapGuardTest {
     }
 
     @Test fun `tunnel without AllowedIPs lines contributes no claim`() {
-        // configText with [Interface] only (e.g. partial enrolment
+        // configText with [Interface] only (e.g. partial enrollment
         // state).  Should not block anything.
         val partial = Tunnel(
             id = "partial", name = "partial",

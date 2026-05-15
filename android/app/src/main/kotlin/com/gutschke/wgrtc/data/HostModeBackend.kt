@@ -29,7 +29,7 @@ import java.util.concurrent.ConcurrentHashMap
  * `feedback_jni_calls_off_main_thread.md`.
  *
  * `start` / `stop` / `reconfigure` are not mutually thread-safe per
- * slot; the view-model serialises them through
+ * slot; the view-model serializes them through
  * `viewModelScope.launch`. The slot map itself is a
  * [ConcurrentHashMap] so cross-slot operations don't trample each
  * other.
@@ -71,10 +71,10 @@ class HostModeBackend(
     private val slots: ConcurrentHashMap<String, Slot> = ConcurrentHashMap()
 
     /**
-     * Serialises [start] across the whole backend so two concurrent
+     * Serializes [start] across the whole backend so two concurrent
      * cold-start calls for the same `tunnel.id` can't both win the
      * map-miss race and leak a duplicate bridge.  Class-level (not
-     * per-slot) because [start] is rare and the cost of serialising
+     * per-slot) because [start] is rare and the cost of serializing
      * different-id starts is negligible compared with the JNI work
      * each one does.  The docstring still permits cross-slot
      * concurrency on stop / teardown / reconfigure — they don't take

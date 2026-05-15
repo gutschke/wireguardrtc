@@ -23,7 +23,7 @@ import java.net.DatagramSocket
  * - "watchdog": closes both if no traffic in [idleTtlMs]
  *
  * Returns when the flow is closed by the peer, the idle TTL fires,
- * or the calling coroutine is cancelled. Always tears down both
+ * or the calling coroutine is canceled. Always tears down both
  * sides on the way out.
  *
  * **Idle TTL**: UDP is connectionless, so we conservatively close

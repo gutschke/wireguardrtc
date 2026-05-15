@@ -84,7 +84,7 @@ wireguardrtc`, or browse the auto-generated Markdown mirrors here:
   config file format, peer modes, security model.
 - [`docs/provision-scripts.md`](docs/provision-scripts.md) — how to
   write a custom `ProvisionScript` that integrates the daemon's
-  enrolment + wormhole-pairing flows with your peer-management
+  enrollment + wormhole-pairing flows with your peer-management
   system (Ansible inventory, `wg-quick` configs, an IPAM, an
   `add-peer`/`del-peer` script family, …).
 

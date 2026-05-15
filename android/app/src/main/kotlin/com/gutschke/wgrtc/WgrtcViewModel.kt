@@ -702,7 +702,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  return t
  }
 
- /** Common path for adding either flavour: append, persist, and
+ /** Common path for adding either flavor: append, persist, and
  * fire up the OFFER listener if the tunnel has the broker
  * coordinates needed for it. */
  private fun persistAndStart(t: Tunnel) {
@@ -1299,7 +1299,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * calls [HostModeBackend.stop] which suspends the slot but leaves
  * the wireguard-go device alive (the F16 pause-not-close
  * decision, avoids the close+reopen JNI panic that bit us
- * earlier).  That's the right behaviour for a user tapping a
+ * earlier).  That's the right behavior for a user tapping a
  * row's Disconnect, but [disconnectAll] runs at app-exit /
  * panic, so we route the host side through
  * [HostModeBackend.teardownAll] instead — a full close that
@@ -1328,7 +1328,7 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  //    nothing is left up.  Throughput sampler stops itself
  //    via stopThroughputSampler when both per-tunnel maps go
  //    empty; the sampler also writes empty maps before its
- //    job is cancelled, which would wake any per-id throughput
+ //    job is canceled, which would wake any per-id throughput
  //    subscribers with null exactly once.
  _throughput.value = emptyMap()
  _peerStats.value = emptyMap()

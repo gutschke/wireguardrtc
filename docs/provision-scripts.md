@@ -105,7 +105,7 @@ ProvisionScript = /usr/sbin/wireguardrtc-provision-client
 
 The broker (`wireguardrtc-provision-broker(8)`) reads
 `/etc/wireguardrtc/provision-broker.conf` for the actual command to
-execute on each enrolment.  Set yours there:
+execute on each enrollment.  Set yours there:
 
 ```ini
 # /etc/wireguardrtc/provision-broker.conf
@@ -119,7 +119,7 @@ of `wireguardrtc(8)`.
 
 ## Idempotency
 
-The daemon's enrol-token logic guarantees a token is one-shot, but
+The daemon's enroll-token logic guarantees a token is one-shot, but
 edge cases (broker retransmits, daemon restart mid-flow) can cause
 the same `(IFACE, NAME, PUBKEY)` triplet to arrive twice.  Make the
 script idempotent: re-running it for an already-known peer must
@@ -147,7 +147,7 @@ flock 9
 # ... mutex-protected body ...
 ```
 
-The shipped `wireguardrtc-provision-broker` already serialises
+The shipped `wireguardrtc-provision-broker` already serializes
 requests across its Unix-socket clients, so the lock is only
 necessary if you call the script outside the broker (e.g. directly,
 or from an admin helper like `add-peer`).
@@ -171,7 +171,7 @@ for both paths:
 
 ```bash
 if [ -n "${WIREGUARDRTC_PROVISION_TOKEN:-}" ]; then
-    # Token-based enrol; look up admin-supplied parameters by token.
+    # Token-based enroll; look up admin-supplied parameters by token.
     parameters="$(lookup_pending_token "$WIREGUARDRTC_PROVISION_TOKEN")"
 else
     # Wormhole-pair; admin parameters were typed on the host CLI
@@ -197,7 +197,7 @@ pending="/etc/wireguard/${ifc}.pending-rtc/${name}"
 parameters=
 [ -r "$pending" ] && parameters="$(grep '^parameters=' "$pending" | cut -d= -f2-)"
 
-# Append under flock so concurrent enrols can't garble the file.
+# Append under flock so concurrent enrolls can't garble the file.
 exec 9<>"/run/wireguardrtc/provision.lock"
 flock 9
 printf '%s %s %s\n' "$name" "$pubkey" "$parameters" >> "$peers"
@@ -244,7 +244,7 @@ sudo wireguardrtc --mint-wormhole --iface wg0
 # Type the 6-letter code on the joiner.
 ```
 
-Watch `journalctl -fu wireguardrtc` while the joiner enrols — the
+Watch `journalctl -fu wireguardrtc` while the joiner enrolls — the
 ProvisionScript's stderr is forwarded there with the prefix
 `provision:`.
 

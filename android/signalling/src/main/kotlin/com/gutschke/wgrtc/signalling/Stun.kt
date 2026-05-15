@@ -367,7 +367,7 @@ fun discoverLocalAddress(family: IpFamily): String? {
  *
  * Reuses one source port across all probes within the family to keep
  * the comparison apples-to-apples (matches the daemon's
- * tests/01_stun_nat.py behaviour).
+ * tests/01_stun_nat.py behavior).
  *
  * v4 and v6 are routed independently — callers that want a complete
  * picture of the network should call this twice with different

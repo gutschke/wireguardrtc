@@ -133,7 +133,7 @@ data class EnrolledPeer(
     /** V6.2 — per-peer v6 address inside the host's
      * [HostModeConfig.subnetV6].  Null on peers enrolled before
      * V6.2 existed OR on tunnels that don't have a v6 subnet
-     * (legacy v4-only).  When present, the enrolment payload
+     * (legacy v4-only).  When present, the enrollment payload
      * (V6.3) advertises this as the joiner's v6 `[Interface]
      * Address` and `<ip>/128` is written into the peer's
      * `[Peer] AllowedIPs` on the host side.

@@ -139,7 +139,7 @@ class WormholeHostController(
 
     fun cancel() {
         if (terminal()) return
-        _state.value = WormholeHostUiState.Failed("cancelled")
+        _state.value = WormholeHostUiState.Failed("canceled")
         teardown()
     }
 

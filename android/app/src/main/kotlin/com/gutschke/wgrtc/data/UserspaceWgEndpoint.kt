@@ -101,7 +101,7 @@ class UserspaceWgEndpoint(
      *
      * The listener itself is owned by the bridge — when [close] is
      * called, the bridge tears the listener down (and any in-flight
-     * [onConnection] coroutines die when [scope] is cancelled).
+     * [onConnection] coroutines die when [scope] is canceled).
      *
      * Errors from [onConnection] are caught and ignored so one
      * misbehaving connection cannot cascade to the listener. The

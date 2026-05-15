@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * Uses [runTest] with virtual time so the test scheduler controls
  * dispatch — no real wall clock, no [kotlinx.coroutines.Dispatchers.Default].  The
- * listener scope is `backgroundScope`, which is auto-cancelled
+ * listener scope is `backgroundScope`, which is auto-canceled
  * when the test finishes, so there's no need for a manual
  * `SupervisorJob` + `tearDown`.  Bullet-proofs the suite against
  * host-CPU starvation that previously caused intermittent

@@ -291,7 +291,7 @@ class JoinerVpnConfigTest {
     @Test fun `V6_A2 bare v6 host address defaults to slash-128`() {
         // The existing v4 test (`bare IP without prefix defaults to
         // 32 (v4) or 128 (v6)`) covers /128 for [Interface] Address;
-        // this test pins the same behaviour for [Peer] AllowedIPs so
+        // this test pins the same behavior for [Peer] AllowedIPs so
         // a refactor that touches one branch can't desync the other.
         val cfg = """
             [Interface]
@@ -438,7 +438,7 @@ class JoinerVpnConfigTest {
         // The host may omit Endpoint in some edge cases (passive
         // hosts that wait for joiner to dial in via signalling).
         // Treat as v4 — that's the safer default and matches
-        // pre-V6 behaviour.  No regression on legacy configs.
+        // pre-V6 behavior.  No regression on legacy configs.
         val cfg = """
             [Interface]
             PrivateKey = $privB64

@@ -66,7 +66,7 @@ fun interface RoamLogger {
  * [NetworkChangeMonitor] callback — multiple times, freely.
  * - [stop] is called by the ViewModel on user-initiated
  * disconnect (or tunnel teardown). After [stop] this instance
- * becomes inert; all pending checks are cancelled and further
+ * becomes inert; all pending checks are canceled and further
  * [onNetworkChanged] calls are ignored.
  */
 class RoamController(
@@ -138,7 +138,7 @@ class RoamController(
         logger.log(
             'I',
             "onNetworkChanged: scheduling staleness check in ${settleDelayMs}ms" +
-                if (hadPending) " (cancelled previous pending)" else "",
+                if (hadPending) " (canceled previous pending)" else "",
         )
         pendingJob = scope.launch(dispatcher) {
             logger.log('D', "staleness check job started; sleeping ${settleDelayMs}ms")

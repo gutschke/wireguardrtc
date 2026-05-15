@@ -84,7 +84,7 @@ class BrokerConnectionLimiterTest {
         val l = limiter(clock, intervalMs = 1_500L)
         coroutineScope {
             // Launch three async acquires; the mutex inside acquire
-            // serialises slot allocation.
+            // serializes slot allocation.
             (1..3).map {
                 async { l.acquire("ws://broker.example/peerjs") }
             }.awaitAll()

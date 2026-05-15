@@ -60,7 +60,7 @@ data class HostEnrollInfo(
     @SerialName("host_name") val hostName: String? = null,
 )
 
-/** Round-trip codec: serialise to JSON, encrypt with [sharedKey] via
+/** Round-trip codec: serialize to JSON, encrypt with [sharedKey] via
  * NaCl secretbox. The result is suitable for the `encryptedInfo`
  * field of [buildSasConfirmEnvelope]. */
 fun encodeJoinerInfo(info: JoinerEnrollInfo, sharedKey: ByteArray): ByteArray {
@@ -124,7 +124,7 @@ private fun isValidWgPubkey(s: String): Boolean = try {
 } catch (_: Exception) { false }
 
 /** JSON for SAS info — encodeDefaults so optional fields with
- * default values still serialise (matches the existing ENROLL
+ * default values still serialize (matches the existing ENROLL
  * plaintext convention). */
 private val SAS_INFO_JSON = Json {
     ignoreUnknownKeys = true

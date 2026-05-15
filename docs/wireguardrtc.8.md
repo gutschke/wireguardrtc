@@ -462,7 +462,7 @@ The state is refreshed every <b>POLL_INTERVAL</b> seconds (30 s).
 ## SIGNALS
 
 - <b>SIGTERM</b>, <b>SIGINT</b>
-  Initiates a clean shutdown: the PeerJS WebSocket is closed, all asyncio tasks are cancelled, and the process exits with status 0.
+  Initiates a clean shutdown: the PeerJS WebSocket is closed, all asyncio tasks are canceled, and the process exits with status 0.
 
 There is no <b>SIGHUP</b> reload; restart the daemon with <b>systemctl restart wireguardrtc</b> to pick up configuration changes.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# build_man_md.py — render groff/troff man pages into GitHub-flavoured
+# build_man_md.py — render groff/troff man pages into GitHub-flavored
 # Markdown so the same content can be browsed both with `man wireguardrtc`
 # and from the GitHub UI.
 #
@@ -196,7 +196,7 @@ def _inline(s):
 
 def _render_tbl(buf):
     """Render a tbl(1) table body (the lines between .TS and .TE) into
-    a GitHub-flavoured Markdown table.  The subset of tbl(1) we handle
+    a GitHub-flavored Markdown table.  The subset of tbl(1) we handle
     matches what wireguardrtc(8) uses: a single format-spec line
     (`l l lx.`), an optional `_` divider acting as a header separator,
     and rows whose cells are tab-separated.  A trailing column whose
@@ -544,7 +544,7 @@ def convert(text, source_name="man"):
 
         if macro == "TQ":
             # Continuation tag for the previous .TP — append to the
-            # tag of the same bullet.  Simplest correct behaviour:
+            # tag of the same bullet.  Simplest correct behavior:
             # emit the previous tag, then start a fresh sibling
             # bullet for this one.
             flush_para()
