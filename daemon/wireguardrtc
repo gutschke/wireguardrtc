@@ -65,7 +65,7 @@ PEERS_DIR = CONFIG_DIR / "peers.d"
 LOCK_FILE = Path(os.environ.get("WIREGUARDRTC_LOCK_FILE",
                                  "/run/wireguardrtc/lock"))
 
-__version__ = "0.2.6"          # unified across daemon + Android app
+__version__ = "0.2.7"          # unified across daemon + Android app
 PROTOCOL_VERSION = 1
 PROTOCOL_LABEL = b"wg-peerjs/v1/sigbox"  # wire format is locked; do not change
 PROTOCOL_FRESHNESS_WINDOW = 90.0  # seconds; reject older or further-in-future

@@ -1,3 +1,21 @@
+wireguardrtc (0.2.7-1) unstable; urgency=medium
+
+  * Android: host-N landed.  HostModeBackend now supports N concurrent
+    host tunnels per device via a slot map keyed by tunnel id.  Per
+    tunnel: independent peer set, listen-port collision guard, isolated
+    stats.  ViewModel + UI surface every tunnel's state through a
+    unified flow.  FGS notification expands to enumerate the active
+    set when more than one host is up.
+  * Android: joiner-N foundation (Go-side + Kotlin controller).  New
+    `wgbridge_native` shared-stack architecture lets one VpnService
+    TUN carry N joiner-mode wireguard-go bridges, demuxed by gvisor's
+    longest-prefix-match.  Not yet wired into the UI — the new
+    `JoinerNVpnService` runs in parallel to the legacy
+    `JoinerVpnService` pending an opt-in flag (planned for v0.2.8).
+  * No daemon-side changes in this release.
+
+ -- Markus Gutschke <markus@claude.gutschke.com>  Fri, 15 May 2026 12:00:00 -0800
+
 wireguardrtc (0.2.6-1) unstable; urgency=medium
 
   * V6 series: dual-stack IPv6 support, end-to-end.  Daemon (V6.D1,
