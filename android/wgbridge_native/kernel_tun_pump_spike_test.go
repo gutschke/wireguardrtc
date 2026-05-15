@@ -47,8 +47,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"errors"
-	"io"
 	"net/netip"
 	"os"
 	"sync/atomic"
@@ -63,130 +61,25 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
-// kernelTunPump models the production goroutine. Reads framed IP
-// packets off [src], demuxes by IP version, injects into [ep]'s
-// inbound queue. Stops when [ctx] is cancelled OR when [src]
-// returns EOF / "file already closed". Returns the number of
-// packets injected and the last error seen (io.EOF and
-// os.ErrClosed are normalised to nil since they're the expected
-// shutdown signals).
-func kernelTunPump(
-	ctx context.Context,
-	src *os.File,
-	stk *stack.Stack,
-	ep *channel.Endpoint,
-	mtu int,
-	dropCounter *atomic.Uint64,
-) (int, error) {
-	_ = stk // reserved for future iptables / per-NIC stats
-	buf := make([]byte, mtu)
-	injected := 0
-	for {
-		if ctx.Err() != nil {
-			return injected, nil
-		}
-		n, err := src.Read(buf)
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-				return injected, nil
-			}
-			return injected, err
-		}
-		if n == 0 {
-			continue
-		}
-		// IP version is the upper nibble of byte 0.
-		version := buf[0] >> 4
-		var proto tcpip.NetworkProtocolNumber
-		switch version {
-		case 4:
-			proto = header.IPv4ProtocolNumber
-		case 6:
-			proto = header.IPv6ProtocolNumber
-		default:
-			// Non-IP frame on a TUN. Real TUN devices in TUN
-			// (vs TAP) mode shouldn't deliver these, but log
-			// defensively rather than panicking.
-			if dropCounter != nil {
-				dropCounter.Add(1)
-			}
-			continue
-		}
-		// Copy into a fresh buffer — InjectInbound retains the
-		// underlying memory.
-		pktBytes := make([]byte, n)
-		copy(pktBytes, buf[:n])
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(pktBytes),
-		})
-		ep.InjectInbound(proto, pkt)
-		pkt.DecRef()
-		injected++
-	}
-}
+// kernelTunPump + kernelTunWriter were moved to production in
+// `joiner_n_pump.go` (D4.J2). Tests in this file now call the
+// production functions directly.
 
-// kernelTunWriter models the WRITE side of the pump — outbound
-// packets gvisor wants to send out the kernel TUN. Reads from
-// the channel endpoint, frames as raw IP, writes to [dst]. The
-// production version will batch and back-pressure; the spike
-// version is a one-packet-at-a-time loop.
-func kernelTunWriter(
-	ctx context.Context,
-	dst *os.File,
-	ep *channel.Endpoint,
-) (int, error) {
-	written := 0
-	for {
-		if ctx.Err() != nil {
-			return written, nil
-		}
-		pkt := ep.ReadContext(ctx)
-		if pkt == nil {
-			return written, nil // context cancelled
-		}
-		v := pkt.ToView()
-		raw := make([]byte, v.Size())
-		_, _ = v.Read(raw)
-		v.Release()
-		pkt.DecRef()
-		if _, err := dst.Write(raw); err != nil {
-			if errors.Is(err, os.ErrClosed) {
-				return written, nil
-			}
-			return written, err
-		}
-		written++
-	}
-}
-
-// newSharedNetstack mirrors what production joiner-N would build:
-// one gvisor stack with forwarding enabled, ready to attach NICs.
-// Returns the stack + a sink for cleanup.
+// newSharedNetstack — a thin wrapper around the production
+// `newSharedStack` helper from joiner_n_stack.go.  Returns the
+// raw `*stack.Stack` for compatibility with tests written before
+// the `sharedStackState` type existed; new tests should use
+// `newSharedStack` directly.
 func newSharedNetstack(t *testing.T) *stack.Stack {
 	t.Helper()
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol, ipv6.NewProtocol,
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol, udp.NewProtocol,
-			icmp.NewProtocol4, icmp.NewProtocol6,
-		},
-		HandleLocal: false,
-	})
-	if err := s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true); err != nil {
-		t.Fatalf("SetForwarding v4: %v", err)
+	ss, err := newSharedStack(1500)
+	if err != nil {
+		t.Fatalf("newSharedStack: %v", err)
 	}
-	if err := s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true); err != nil {
-		t.Fatalf("SetForwarding v6: %v", err)
-	}
-	t.Cleanup(func() { s.Destroy() })
-	return s
+	t.Cleanup(ss.close)
+	return ss.stack
 }
 
 // seqpacketPair returns a `*os.File` pair representing the "kernel
@@ -246,7 +139,7 @@ func TestP2SpikeSingleV4PacketRoundTrips(t *testing.T) {
 		err      error
 	}, 1)
 	go func() {
-		n, err := kernelTunPump(ctx, tunRead, stk, ep, 1500, &drops)
+		n, err := kernelTunPump(ctx, tunRead, ep, 1500, &drops)
 		pumpDone <- struct {
 			injected int
 			err      error
@@ -328,7 +221,7 @@ func TestP2SpikePumpDemuxesV4AndV6(t *testing.T) {
 	tunRead, tunWrite := seqpacketPair(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go kernelTunPump(ctx, tunRead, stk, ep, 1500, nil)
+	go kernelTunPump(ctx, tunRead, ep, 1500, nil)
 
 	v4Packet := craftIPv4UDP(
 		netip.MustParseAddr("192.0.2.1"),
@@ -374,7 +267,7 @@ func TestP2SpikePumpDropsNonIpFrames(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	drops := atomic.Uint64{}
-	go kernelTunPump(ctx, tunRead, stk, ep, 1500, &drops)
+	go kernelTunPump(ctx, tunRead, ep, 1500, &drops)
 
 	// Write garbage whose first byte is neither 0x4* nor 0x6*.
 	_, err := tunWrite.Write([]byte{0xee, 0xff, 0xaa})
@@ -406,7 +299,7 @@ func TestP2SpikePumpExitsOnTunClose(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := kernelTunPump(ctx, r, stk, ep, 1500, nil)
+		_, err := kernelTunPump(ctx, r, ep, 1500, nil)
 		done <- err
 	}()
 	// Close the write side → reader gets the equivalent of EOF on
@@ -452,7 +345,7 @@ func TestP2SpikePumpExitsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := kernelTunPump(ctx, tunRead, stk, ep, 1500, nil)
+		_, err := kernelTunPump(ctx, tunRead, ep, 1500, nil)
 		done <- err
 	}()
 
@@ -553,7 +446,7 @@ func TestP2SpikePumpHandlesBurstWithoutReorder(t *testing.T) {
 	tunRead, tunWrite := seqpacketPair(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go kernelTunPump(ctx, tunRead, stk, ep, 1500, nil)
+	go kernelTunPump(ctx, tunRead, ep, 1500, nil)
 
 	const N = 64
 	for i := 0; i < N; i++ {
