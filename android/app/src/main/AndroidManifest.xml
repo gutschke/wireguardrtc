@@ -98,6 +98,20 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+        <!-- D4.J4 — joiner-N VpnService.  Owns ONE kernel TUN fd
+             shared across N joiner-mode tunnels via the
+             userspace gvisor netstack (see cascade-n-design.md).
+             Parallel to JoinerVpnService for the single-joiner
+             case; ViewModel routes between them based on a
+             user-facing flag landing with D4.J7. -->
+        <service
+            android:name=".service.JoinerNVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>
