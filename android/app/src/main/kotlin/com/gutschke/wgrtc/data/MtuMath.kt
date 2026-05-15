@@ -91,8 +91,61 @@ object MtuMath {
      * by [Tunnel] when nothing tunnel-specific is set. Equals
      * `safeWgMtu(1500, IPv4)` — pinned redundantly so a casual
      * edit to one hits a test failure at the other.
+     *
+     * For outer-family-aware defaults, see [defaultWgMtu] — the
+     * v6-outer answer is 1400, not 1420, because the IPv6 header
+     * eats 20 more bytes than v4.
      */
     const val DEFAULT_WG_MTU: Int = 1420
+
+    /**
+     * V6.A3 — outer-family-aware default inner MTU for a 1500-byte
+     * physical path.  Returns the same as `safeWgMtu(1500, outer)`
+     * but expressed as a one-place lookup so callers can pick the
+     * right default at config-parse time without needing to know
+     * the path MTU yet.
+     *
+     * v4 outer → 1420 (preserves the 20-byte safety margin against
+     * surprise mid-path encapsulation).  v6 outer → 1400 (same
+     * margin, plus the 20 extra bytes of v6 outer header).
+     */
+    fun defaultWgMtu(outer: OuterFamily): Int = when (outer) {
+        OuterFamily.IPV4 -> DEFAULT_WG_MTU
+        OuterFamily.IPV6 -> 1400
+    }
+
+    /**
+     * V6.A3 — classify an endpoint string by family.  Accepts:
+     *
+     *  - dotted-quad v4 with or without `:port` (`203.0.113.5`,
+     *    `203.0.113.5:51820`),
+     *  - bare v6 (`2001:db8::5`, `fd00::1`, `::1`),
+     *  - bracketed v6 with port (`[2001:db8::5]:51820`).
+     *
+     * Returns [OuterFamily.IPV4] for malformed / DNS-name input
+     * — the safer default at the call sites we have (a 1420-byte
+     * inner MTU still fits inside a 1500-byte path for a v6 outer
+     * with the safety margin absorbed; no v4 path is harmed).
+     * Don't use this for actual address parsing; it's a coarse
+     * heuristic just precise enough to pick the MTU default.
+     */
+    fun inferOuterFamily(endpoint: String): OuterFamily {
+        if (endpoint.isEmpty()) return OuterFamily.IPV4
+        // Bracketed v6 is unambiguous.
+        if (endpoint.startsWith("[")) return OuterFamily.IPV6
+        // Bare v6 has at least two colons (one address segment
+        // separator and one closer, or `::`).  A v4:port string
+        // has exactly one colon AND dots before it.  A bare
+        // hostname (`vpn.example.org:51820`) likewise has exactly
+        // one colon with dots before it.
+        val firstColon = endpoint.indexOf(':')
+        val lastColon = endpoint.lastIndexOf(':')
+        if (firstColon < 0) return OuterFamily.IPV4  // no colon, no port → v4 or DNS
+        if (firstColon != lastColon) return OuterFamily.IPV6
+        // Exactly one colon — could be v4:port or hostname:port.
+        // Either way we treat as v4 for MTU purposes.
+        return OuterFamily.IPV4
+    }
 
     /** Floor below which we refuse to compute a tunnel MTU.
      * 576 is IPv4's minimum-reassembly-buffer guarantee from

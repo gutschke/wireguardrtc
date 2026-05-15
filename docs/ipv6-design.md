@@ -322,3 +322,29 @@ What V6.A2 adds: six new tests in `JoinerVpnConfigTest.kt` documenting the v6-ro
 Files: `android/app/src/test/kotlin/com/gutschke/wgrtc/data/JoinerVpnConfigTest.kt` (regression pins).  Production code untouched.
 
 **Followup if instrumented coverage becomes warranted:** add `V6JoinerVpnRoutingTest.kt` under `androidTest/` that calls `JoinerVpnService.establishTunForTest` with a synthetic v6 config and asserts the returned PFD points at a tun whose `ip -6 route` includes `::/0` — but that needs the seccomp `ip(8)` workaround (the SIGSYS-killed-iproute2 memory entry) and a dedicated emulator harness, which isn't paying its way until we hit a real v6-route bug.
+
+### V6.A3 — 2026-05-13
+
+Outer-family-aware default inner MTU for the joiner.  Pre-V6.A3 the wg-quick parser hard-coded `MtuMath.DEFAULT_WG_MTU = 1420` when the user didn't write an explicit `MTU = …` line — that's correct for v4 outer but eats the entire 20-byte safety margin for v6 (1420 inner + 80 v6 outer = 1500 exactly; one PPPoE-style mid-path header and we're in a silent PMTU black hole).
+
+What changed:
+
+- **`MtuMath.defaultWgMtu(OuterFamily): Int`** (new) — returns 1420 for v4 / 1400 for v6.  Pinned redundantly to `safeWgMtu(1500, …)` so a drift on one side trips the test on the other.
+- **`MtuMath.inferOuterFamily(endpoint: String): OuterFamily`** (new) — coarse heuristic that accepts bare dotted-quad, `v4:port`, bare v6 (`2001:db8::5`, `::1`, `fd00::1`), and bracketed v6 with port (`[2001:db8::5]:51820`).  Returns `IPV4` for malformed input and for DNS-name endpoints (`vpn.example.org:51820`) — at MTU-pick time we don't know the family yet, and 1420 is the safer fallback for the dual-stack-but-resolves-v4 case.  Don't mistake this for an address parser; it's a one-decision classifier.
+- **`JoinerVpnConfig.parse(wgQuickText)`** — when `[Interface] MTU = …` is absent, scans `[Peer] Endpoint = …` (first occurrence) and calls `defaultWgMtu(inferOuterFamily(endpoint))`.  An explicit MTU line always wins.  Missing Endpoint → v4 default (legacy compat).
+
+Why this is JVM-only: the MTU defaulting happens at config-parse time, well before any networking.  No instrumented coverage is needed.  The math itself has been pinned since N2; V6.A3 just adds the wire-in.
+
+Test additions:
+
+- `MtuMathV6Test.kt` (new, 10 tests): pins both `defaultWgMtu` values, the safeWgMtu agreement, and the seven `inferOuterFamily` classification cases.
+- `JoinerVpnConfigTest.kt` (extended): 6 V6.A3 cases — v4 endpoint → 1420, bracketed v6 → 1400, bare v6 (no port) → 1400, explicit `MTU = 1380` wins over family default, missing Endpoint → 1420 (v4 fallback), DNS-name → 1420.
+
+17/17 V6.A3 tests pass.  No regression in the 14 pre-existing MtuMathTest / 17 pre-existing JoinerVpnConfigTest cases.  One pre-existing flake (`UserspaceWgEndpointTcpTest.forwarder errors are caught and don't kill the listener` — coroutine 2 s timeout under concurrent test load) reproduced once but passes on isolated rerun; unrelated.
+
+Files: `android/app/src/main/kotlin/com/gutschke/wgrtc/data/MtuMath.kt`, `android/app/src/main/kotlin/com/gutschke/wgrtc/data/JoinerVpnConfig.kt`, tests in the matching `src/test` locations.
+
+**Not addressed (deferred):**
+
+- Host-side wgbridge / `HostModeRunner.defaultMtu` still uses `MtuMath.DEFAULT_WG_MTU` directly.  Host mode owns its own gvisor netstack, so the inner MTU is governed by the userspace NIC, not by an Android Builder.  The v6-outer adjustment lands when V6.H1 wires up the v6 NIC.
+- Runtime path-MTU detection / PMTU black-hole mitigation past the conservative-defaults strategy is still future work — see `wireguard-runtime-architecture.md` §5.

@@ -350,6 +350,129 @@ class JoinerVpnConfigTest {
         assertEquals("::", parsed.routes.single().address)
     }
 
+    // V6.A3 — default MTU adjusts when Endpoint is v6.
+    //
+    // wg-quick `MTU = …` is optional. When absent, JoinerVpnConfig
+    // previously defaulted to `MtuMath.DEFAULT_WG_MTU` (1420 — the
+    // v4-outer answer) regardless of whether the Endpoint was a
+    // v4 dotted-quad or a bracketed v6 address. That meant a v6
+    // endpoint with no MTU directive got 1420 = (1500 - 60 - 20)
+    // worth of v4 headroom, which leaves *zero* safety margin for
+    // a real v6 outer (1420 inner + 80 v6 outer = 1500 exactly).
+    // Surprise mid-path encapsulation (PPPoE, GRE, NAT64) is then
+    // a silent PMTU black hole.
+    //
+    // V6.A3 makes parse inspect the [Peer] Endpoint line and pick
+    // `MtuMath.defaultWgMtu(OuterFamily.IPV6) = 1400` when the
+    // endpoint is v6. Explicit `MTU = …` lines are honored
+    // verbatim (the user / host overrides knows-best).
+
+    @Test fun `V6_A3 v4 endpoint defaults to 1420`() {
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.2/32
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = 203.0.113.5:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(1420, parsed.mtu)
+    }
+
+    @Test fun `V6_A3 bracketed v6 endpoint defaults to 1400`() {
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = ::/0
+            Endpoint = [2001:db8::5]:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(1400, parsed.mtu,
+            "v6 endpoint without explicit MTU must default to 1400 (safeWgMtu(1500, v6))")
+    }
+
+    @Test fun `V6_A3 bare v6 endpoint (no port) defaults to 1400`() {
+        // Some tools elide the port when it equals 51820. Still
+        // pick v6 default.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = ::/0
+            Endpoint = 2001:db8::5
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(1400, parsed.mtu)
+    }
+
+    @Test fun `V6_A3 explicit MTU wins over family-derived default`() {
+        // User / host can override.  An explicit `MTU = 1380` on
+        // a v6 endpoint stays 1380 — operators sometimes know
+        // their own carrier headers better than we do.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = fd00::2/128
+            MTU = 1380
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = ::/0
+            Endpoint = [2001:db8::5]:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(1380, parsed.mtu)
+    }
+
+    @Test fun `V6_A3 missing Endpoint falls back to v4 default`() {
+        // The host may omit Endpoint in some edge cases (passive
+        // hosts that wait for joiner to dial in via signalling).
+        // Treat as v4 — that's the safer default and matches
+        // pre-V6 behaviour.  No regression on legacy configs.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.2/32
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 0.0.0.0/0
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(1420, parsed.mtu)
+    }
+
+    @Test fun `V6_A3 hostname endpoint falls back to v4 default`() {
+        // `Endpoint = vpn.example.org:51820` — family is only known
+        // at resolve-time.  Defaulting to v4 keeps the safety margin
+        // wide enough for either family (1420 v4 outer = 1500 path,
+        // 1420 + 80 v6 outer = exactly 1500, no margin).  See the
+        // `inferOuterFamily defaults to v4 on malformed input` note
+        // in MtuMathV6Test.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+            Address = 10.99.0.2/32
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = vpn.example.org:51820
+        """.trimIndent()
+        val parsed = JoinerVpnConfig.parse(cfg)
+        assertEquals(1420, parsed.mtu)
+    }
+
     @Test fun `V6_A2 v6 Address line on Interface section survives parse`() {
         // Companion to the AllowedIPs tests: the joiner needs a v6
         // local address on its TUN before any v6 route is useful.

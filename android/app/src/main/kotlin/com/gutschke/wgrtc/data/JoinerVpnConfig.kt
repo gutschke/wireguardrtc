@@ -58,6 +58,11 @@ data class JoinerVpnConfig(
             val routes = mutableListOf<Cidr>()
             val dnsServers = mutableListOf<String>()
             var mtu: Int? = null
+            // V6.A3: first [Peer] Endpoint line we see — used to
+            // pick the family-aware default MTU when the user
+            // didn't override.  We don't try to handle multi-peer
+            // configs with mixed-family endpoints; pick the first.
+            var firstPeerEndpoint: String? = null
 
             for (rawLine in wgQuickText.lineSequence()) {
                 val line = rawLine.trim().substringBefore('#').trim()
@@ -87,6 +92,9 @@ data class JoinerVpnConfig(
                             val s = part.trim()
                             if (s.isNotEmpty()) routes += parseCidr(s)
                         }
+                        "endpoint" -> if (firstPeerEndpoint == null) {
+                            firstPeerEndpoint = value
+                        }
                     }
                 }
             }
@@ -94,10 +102,19 @@ data class JoinerVpnConfig(
             if (addresses.isEmpty()) {
                 throw IllegalArgumentException("[Interface] Address is required")
             }
+            // V6.A3 — when the user didn't set MTU explicitly,
+            // pick 1420 for v4 endpoints and 1400 for v6.  A
+            // missing Endpoint (passive peer) falls back to v4 —
+            // matches pre-V6 behaviour.
+            val effectiveMtu = mtu ?: run {
+                val outer = firstPeerEndpoint?.let { MtuMath.inferOuterFamily(it) }
+                    ?: MtuMath.OuterFamily.IPV4
+                MtuMath.defaultWgMtu(outer)
+            }
             return JoinerVpnConfig(
                 addresses = addresses,
                 routes = routes,
-                mtu = mtu ?: DEFAULT_MTU,
+                mtu = effectiveMtu,
                 dnsServers = dnsServers,
             )
         }
