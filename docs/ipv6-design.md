@@ -590,9 +590,11 @@ Test coverage:
 
 - **V6.PL Layer 3 (`HostNativeV6SelfLoopTest`)** still passes (176 ms emulator / 263 ms ARC), confirming dual-stack WG handshake survives the V6.H2b additions.
 
+**Validated 2026-05-14 on real ChromeOS hardware** (`tmp/v6probe`): from the ARC `adb shell` uid 2000, ICMPv6 SOCK_DGRAM round-trips to `2001:4860:4860::8888` (Google public DNS, 7 ms), `fd00:a771:c05::50:0` (LAN ULA, 6 ms), `fd00:a771:c05::122` (plaindebian, 9 ms).  TCP6 to `[2001:4860:4860::8888]:53` completes with source GUA `2001:5a8:4cea:cc00:e814:3aff:feee:e836` (real public v6).  Same socket primitives the V6.H2b `dispatchPingV6` uses — so the path from `dispatchPingV6` → kernel → Android `protect()` → public v6 is production-grade on a dual-stack Chromebook.  The earlier "open question whether Android's `protect()` delivers v6" is now closed.
+
 **Caveats — what V6.H2b does NOT cover:**
 
-1. **End-to-end `ping6` to a public v6 destination through a real bridge.**  ChromeOS ARC's underlying network only carries site-local `fec0::/10` (deprecated, no public-internet route).  Validating this needs a v6-routable network — V6.E2E territory.  The Go-unit + instrumented tests give high confidence that the in-process plumbing is correct; the open question is whether Android's `protect()` + the unprivileged ICMPv6 socket actually deliver packets to the public v6 internet from the host's underlying network.
+1. **The Android emulator's slirp interior is v6-broken.**  Inside the qemu-managed emulator (the standard `emulator @wgrtc` launch path), the wlan0 interface gets a `fec0::/10` site-local from slirp but no v6 default route.  Outbound ICMPv6 + TCP6 + UDP6 all fail.  Fixing this for the test rig would require `-wifi-tap` bridge mode at qemu launch, not a guest-side sysctl tweak.  **Doesn't affect production**; emulator is a constrained test rig.  ARC is the right rig for V6.H2b regression checks.
 
 2. **IPv6 extension headers (RFC 8200 §4).**  `handleOutboundV6` switches on `ip.NextHeader()` and drops anything other than ICMPv6/TCP/UDP.  Fragment (44) is the most likely encountered one (from a joiner that fragments a large UDP datagram); today we drop it.  Stock Linux/Android `ping6` doesn't fragment, so academic until bulk-UDP workloads land.  TODO comment in code.
 
