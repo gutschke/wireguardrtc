@@ -584,6 +584,85 @@ class HostModeBackendTest {
         be.activeTunnelIds.first { it.isEmpty() }
     }
 
+    // ───────────────── D4.H4 port-collision guard ─────────────────
+
+    @Test
+    fun `start fails when another active tunnel already bound the listen port`() = runBlocking<Unit> {
+        val factory = HookedFactory { HookedBackend() }
+        val be = HostModeBackend(factory, parentScope)
+        be.start(hostTunnel(id = "t1", listenPort = 51820))
+        val ex = assertThrows(PortCollisionException::class.java) {
+            runBlocking { be.start(hostTunnel(id = "t2", listenPort = 51820)) }
+        }
+        assertEquals("t2", ex.newTunnelId)
+        assertEquals("t1", ex.existingTunnelId)
+        assertEquals(51820, ex.port)
+        // The second bridge must NOT have been opened.
+        assertEquals(1, factory.opens.size)
+        assertEquals(setOf("t1"), be.activeTunnelIds.value)
+    }
+
+    @Test
+    fun `paused tunnel does not collide with a fresh start on the same port`() = runBlocking<Unit> {
+        // Paused slots are bound to listen_port=0 — the kernel-level
+        // conflict only fires once they resume, so a different tunnel
+        // is free to claim the port in the meantime.
+        val factory = HookedFactory { HookedBackend() }
+        val be = HostModeBackend(factory, parentScope)
+        be.start(hostTunnel(id = "t1", listenPort = 51820))
+        be.stop("t1")
+        be.start(hostTunnel(id = "t2", listenPort = 51820))
+        assertEquals(setOf("t2"), be.activeTunnelIds.value)
+        assertEquals(2, factory.opens.size)
+    }
+
+    @Test
+    fun `resuming a paused tunnel fails when another tunnel grabbed its port`() = runBlocking<Unit> {
+        val factory = HookedFactory { HookedBackend() }
+        val be = HostModeBackend(factory, parentScope)
+        be.start(hostTunnel(id = "t1", listenPort = 51820))
+        be.stop("t1")
+        // t2 takes over port 51820 while t1 was paused.
+        be.start(hostTunnel(id = "t2", listenPort = 51820))
+        // Now the user tries to resume t1 with its original port.
+        val ex = assertThrows(PortCollisionException::class.java) {
+            runBlocking { be.start(hostTunnel(id = "t1", listenPort = 51820)) }
+        }
+        assertEquals("t1", ex.newTunnelId)
+        assertEquals("t2", ex.existingTunnelId)
+        assertEquals(51820, ex.port)
+        // t1 stays paused; t2 stays active.
+        assertEquals(setOf("t2"), be.activeTunnelIds.value)
+    }
+
+    @Test
+    fun `same-id reconfigure that does not change port stays valid`() = runBlocking<Unit> {
+        val factory = HookedFactory { HookedBackend() }
+        val be = HostModeBackend(factory, parentScope)
+        be.start(hostTunnel(id = "t1", listenPort = 51820))
+        // Starting the same id again is the idempotent-reconfigure
+        // path; the collision check must not flag the slot against
+        // itself.
+        be.start(hostTunnel(id = "t1", listenPort = 51820))
+        assertEquals(setOf("t1"), be.activeTunnelIds.value)
+    }
+
+    @Test
+    fun `editing an active tunnel's port frees the original for another tunnel`() = runBlocking<Unit> {
+        // After resume on a new ListenPort, the slot's recorded port
+        // must follow — otherwise the old (stale) port stays in the
+        // collision set and locks out other tunnels.
+        val factory = HookedFactory { HookedBackend() }
+        val be = HostModeBackend(factory, parentScope)
+        be.start(hostTunnel(id = "t1", listenPort = 51820))
+        be.stop("t1")
+        // User edits t1's ListenPort to 51830 and resumes.
+        be.start(hostTunnel(id = "t1", listenPort = 51830))
+        // 51820 is now free; t2 should be able to claim it.
+        be.start(hostTunnel(id = "t2", listenPort = 51820))
+        assertEquals(setOf("t1", "t2"), be.activeTunnelIds.value)
+    }
+
     @Test
     fun `two concurrent start calls for the same id only open one bridge`() = runTest {
         val sharedBackend = HookedBackend()

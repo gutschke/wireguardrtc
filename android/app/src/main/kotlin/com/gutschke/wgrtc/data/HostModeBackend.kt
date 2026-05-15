@@ -54,10 +54,18 @@ class HostModeBackend(
      * not counted in [activeTunnelIds]. Keeping the slot around
      * across pause/resume cycles avoids the wireguard-go
      * close+reopen panic.
+     *
+     * [listenPort] tracks the outer UDP bind port the slot is
+     * actively listening on (or, when paused, the port it would
+     * re-bind to on the next resume). D4.H4 uses it to detect
+     * cross-slot port collisions before they reach wireguard-go's
+     * `Bind.Open`, which would otherwise fail with an opaque
+     * EADDRINUSE deep inside the JNI call.
      */
     private data class Slot(
         val runner: HostModeRunner,
         @Volatile var paused: Boolean = false,
+        @Volatile var listenPort: Int = 0,
     )
 
     private val slots: ConcurrentHashMap<String, Slot> = ConcurrentHashMap()
@@ -105,11 +113,32 @@ class HostModeBackend(
     suspend fun start(tunnel: Tunnel) {
         val cfg = tunnel.toRunnerConfig()
         startMutex.withLock {
+            // D4.H4 — refuse to bring a slot up on a listen port that
+            // another live slot is already using.  Paused slots are
+            // bound to listen_port=0 so they don't collide today; when
+            // the user resumes them, the same check fires again on
+            // that start() and surfaces the conflict before wireguard-go
+            // returns EADDRINUSE through the JNI boundary.
+            val collision = slots.entries.firstOrNull { (id, slot) ->
+                id != tunnel.id && !slot.paused && slot.listenPort == cfg.listenPort
+            }
+            if (collision != null) {
+                throw PortCollisionException(
+                    newTunnelId = tunnel.id,
+                    existingTunnelId = collision.key,
+                    port = cfg.listenPort,
+                )
+            }
             withContext(Dispatchers.IO) {
                 val existing = slots[tunnel.id]
                 if (existing != null) {
                     existing.runner.reconfigureUapi(cfg.renderUapi())
                     existing.paused = false
+                    // The user may have edited ListenPort between
+                    // pause and resume; keep the slot's record in
+                    // sync so future collision checks reflect the
+                    // live port.
+                    existing.listenPort = cfg.listenPort
                     refreshActiveIds()
                     return@withContext
                 }
@@ -121,7 +150,11 @@ class HostModeBackend(
                     // failure, so we just drop the reference here.
                     throw t
                 }
-                slots[tunnel.id] = Slot(runner = r, paused = false)
+                slots[tunnel.id] = Slot(
+                    runner = r,
+                    paused = false,
+                    listenPort = cfg.listenPort,
+                )
                 refreshActiveIds()
             }
         }
@@ -364,3 +397,25 @@ class HostModeBackend(
         }
     }
 }
+
+/**
+ * Thrown by [HostModeBackend.start] when the requested tunnel's
+ * `ListenPort` is already bound by another active host tunnel in the
+ * same process.  wireguard-go's UDP bind would otherwise fail deep
+ * inside the JNI call with an opaque EADDRINUSE; the typed exception
+ * lets the view-model surface a user-actionable message ("pause the
+ * other tunnel or pick a different port").
+ *
+ * Paused slots are bound to listen_port=0 and don't conflict at the
+ * kernel level; the same check fires again when the user resumes
+ * them, so this exception captures both cold-start and resume races.
+ */
+class PortCollisionException(
+    val newTunnelId: String,
+    val existingTunnelId: String,
+    val port: Int,
+) : IllegalStateException(
+    "Host tunnel '$newTunnelId' cannot bind UDP port $port — tunnel " +
+        "'$existingTunnelId' is already using it. Pause that tunnel or " +
+        "choose a different ListenPort.",
+)

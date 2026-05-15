@@ -924,6 +924,19 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _lastError.value = null
  startThroughputSampler()
  Log.i("wgrtc-vm", "connect: host tunnel $id is up")
+ } catch (e: com.gutschke.wgrtc.data.PortCollisionException) {
+ Log.w("wgrtc-vm", "host start refused: port collision", e)
+ // D4.H4 — resolve the other tunnel's id to its display
+ // name so the snackbar is human-readable.  Falls back
+ // to the raw id if the tunnel was deleted between the
+ // collision check and the catch.
+ val otherName = _tunnels.value
+ .firstOrNull { it.id == e.existingTunnelId }
+ ?.name ?: e.existingTunnelId
+ _lastError.value = "Can't start \"${t.name}\" — UDP port " +
+ "${e.port} is already used by \"$otherName\". " +
+ "Disconnect that tunnel or pick a different ListenPort."
+ throw e
  } catch (e: Throwable) {
  Log.e("wgrtc-vm", "host start failed", e)
  // Don't touch `_liveState` here — other tunnels may be
