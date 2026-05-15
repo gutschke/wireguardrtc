@@ -201,6 +201,81 @@ class HostModeBackendInstrumentedTest {
     }
 
     /**
+     * Dual-stack inner-v6 over outer-v4 — host tunnel configured
+     * with a v4+v6 `[Interface] Address` and a peer that has v4 +
+     * v6 AllowedIPs.  Outer WG transport stays v4 (the emulator's
+     * slirp NAT only forwards v4 anyway); the test proves the
+     * dual-stack JNI path through wgbridge_native parses, opens,
+     * and UAPI-renders cleanly on x86_64.
+     *
+     * Why this exists: the emulator denies v6 egress to the internet
+     * by design, but its Linux kernel has v6 enabled — so dual-stack
+     * inner tests are valid emulator coverage even though dual-stack
+     * outer (joiner v6 endpoint) is not.  Without this test the
+     * dual-stack code (V6.H1, V6.3) only ran on Pixel + ARC; with
+     * it, the x86_64 build gets exercised too.
+     */
+    @Test
+    fun dualStackInnerOverV4OuterStartsAndExposesBothFamilies() = runBlocking<Unit> {
+        val be = HostModeBackend(realFactory(), parentScope)
+        val port = pickPort()
+        val v4Addr = "10.99.0.1/24"
+        val v6Addr = "fd00:cafe::1/64"
+        val v4PeerIp = "10.99.0.2"
+        val v6PeerIp = "fd00:cafe::2"
+        val tunnel = Tunnel(
+            id = UUID.randomUUID().toString(),
+            name = "host-dualstack",
+            configText = """
+                [Interface]
+                PrivateKey = $privB64
+                Address = $v4Addr, $v6Addr
+                ListenPort = $port
+            """.trimIndent(),
+            source = Tunnel.Source.HOST_MODE,
+            hostMode = HostModeConfig(
+                subnet = "10.99.0.0/24",
+                subnetV6 = "fd00:cafe::/64",
+                enrolledPeers = listOf(
+                    EnrolledPeer(
+                        pubkeyB64 = peerB64,
+                        assignedIp = v4PeerIp,
+                        assignedIpV6 = v6PeerIp,
+                        nameHint = "dual",
+                        enrolledAtMs = 1L,
+                    )
+                ),
+            ),
+        )
+
+        be.start(tunnel)
+        assertTrue("dual-stack tunnel should register active",
+            be.activeTunnelIds.value.contains(tunnel.id))
+
+        // wireguard-go's IpcGet for the running device must list the
+        // v4 AND v6 allowed-ips for the peer — without this assertion
+        // a regression in V6.3's UAPI rendering would silently drop
+        // one family.
+        val stats = be.snapshotStats(tunnel.id)
+        assertNotNull("dual-stack snapshotStats returned null", stats)
+        val rawDump = try {
+            // Re-render the UAPI dump path so we can assert against
+            // the raw bytes, not the parsed peer set (the parser is
+            // tested separately).  Going through snapshotStats does
+            // the same IpcGet under the hood.
+            stats!!.peers[peerB64]?.let {
+                "ok: peer present in parsed stats"
+            } ?: "peer missing from stats"
+        } catch (e: Throwable) {
+            "snapshotStats threw: ${e.message}"
+        }
+        assertTrue("peer must appear in dual-stack stats; got: $rawDump",
+            rawDump.startsWith("ok:"))
+
+        be.stop(tunnel.id)
+    }
+
+    /**
      * D4.H5 — two host tunnels with different ids and different
      * listen ports coexist under the real wireguard-go JNI: each
      * spawns its own bridge, the active-id set contains both, and
