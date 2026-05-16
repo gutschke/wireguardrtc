@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Legacy Android 11 and earlier backup rules.  See
+    https://developer.android.com/guide/topics/data/autobackup.
+
+    Even though `android:allowBackup="false"` is set, ship explicit
+    exclude rules so any backup transport that interprets
+    fullBackupContent before checking allowBackup also gets the
+    "don't touch our keys" signal.
+-->
+<full-backup-content>
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+</full-backup-content>

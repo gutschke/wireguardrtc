@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 12+ backup rules.  See
+    https://developer.android.com/about/versions/12/backup-restore.
+
+    wgrtc holds WireGuard private keys, peer pairing material, and
+    enrollment credentials in app-private storage.  Backing any of
+    this up to Google Drive (cloud-backup) or restoring it onto a
+    new device (device-transfer) would (a) upload cryptographic
+    material to a third party, (b) silently re-instantiate a user's
+    tunnels on a different device — making the "two ghost tunnels
+    appeared on a fresh install" footgun.
+
+    Both transports are therefore fully excluded.  Users who migrate
+    devices re-pair / re-import; that matches every other VPN client
+    that takes private-key custody seriously.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>
