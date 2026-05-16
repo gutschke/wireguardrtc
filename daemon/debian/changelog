@@ -1,3 +1,29 @@
+wireguardrtc (0.2.9-1) unstable; urgency=medium
+
+  * Android: RoamController is now wired into the joiner-N path —
+    each active joiner re-races candidates in place when the
+    phone's underlying network changes (Wi-Fi to cellular and
+    similar). Previously only the legacy single-joiner path got
+    automatic re-race; joiner-N relied on the daemon volunteering
+    a fresh OFFER and could sit on a dead endpoint until then.
+  * Test infrastructure: `HostCatchallForwarderE2ETest.udpThroughCatchallRoundTrips`
+    UDP echo no longer flakes ~1-in-4 (now 20/20 across 10
+    sequential runs on both emulator and ARC). Two fixes: a
+    500 ms post-handshake settle before the first send (gvisor
+    netstack route-table propagation race), and proper retransmit
+    semantics for UDP (every 200 ms for up to 15 s).
+  * Instrumented test rig: new `VpnConsentHelper` dismisses the
+    Android 14+ VPN consent dialog via UI Automator so
+    `JoinerNVpnServiceInstrumentedTest.twoJoinersCoexistOnSharedStack`
+    runs end-to-end against real Builder.establish() instead of
+    skipping.
+  * Adversarial stress: 13-scenario JVM stress suite for
+    `JoinerNController` covering concurrent add, mid-rebuild
+    reconfigure, mutex correctness, failure injection, and
+    use-after-close detection.
+
+ -- wireguardrtc maintainers <maintainers@wgrtc.invalid>  Fri, 16 May 2026 04:30:00 +0000
+
 wireguardrtc (0.2.8-1) unstable; urgency=medium
 
   * Android: opt-in multi-joiner shared-tunnel path.  Settings →
