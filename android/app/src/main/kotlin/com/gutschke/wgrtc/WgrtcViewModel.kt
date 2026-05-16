@@ -1781,20 +1781,27 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
 
  /** Convert one parsed wg-quick + tunnel id into a JoinerConfig
-  * the [JoinerNController] can swallow. */
- private fun buildJoinerNConfig(
+  * the [JoinerNController] can swallow.  Suspending because we
+  * resolve hostname Endpoints to IP literals here — wireguard-go's
+  * UAPI accepts only `netip.ParseAddr`-shaped strings, so an
+  * imported `Endpoint = host.example:51820` would otherwise fail
+  * with `IPC error -22` and the bridge would refuse to come up. */
+ private suspend fun buildJoinerNConfig(
  id: String,
  configText: String,
  parsed: JoinerVpnConfig,
- ): JoinerNController.JoinerConfig =
- JoinerNController.JoinerConfig(
+ ): JoinerNController.JoinerConfig {
+ val rendered = WgQuickUapi.render(configText)
+ val resolved = WgQuickUapi.resolveEndpoints(rendered)
+ return JoinerNController.JoinerConfig(
  tunnelId = id,
  addresses = parsed.addresses,
  routes = parsed.routes,
  mtu = parsed.mtu,
- wgQuickUapi = WgQuickUapi.render(configText),
+ wgQuickUapi = resolved,
  dnsServers = parsed.dnsServers,
  )
+ }
 
  // ---------------------------- HostModeReconfigurer
 

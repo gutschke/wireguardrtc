@@ -1,5 +1,10 @@
 package com.gutschke.wgrtc.data
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.UnknownHostException
 import java.util.Base64
 
 /**
@@ -139,6 +144,120 @@ object WgQuickUapi {
     }
 
     private const val DEFAULT_KEEPALIVE_SECONDS = 25
+
+    /**
+     * Rewrites every `endpoint=host:port` line in [uapi] so the
+     * host component is an IP literal that wireguard-go's
+     * `netip.ParseAddrPort` will accept.  IP literals pass through
+     * unchanged; hostnames go through [resolver].
+     *
+     * Why this exists: kernel WireGuard's `wg set endpoint` resolves
+     * hostnames natively, but wireguard-go's UAPI handler does not
+     * — it rejects anything that isn't a parseable `netip.Addr` with
+     * `IPC error -22: ParseAddr(...): unexpected character`.
+     * Imported wg-quick configs with `Endpoint = host.example:51820`
+     * therefore can't reach `wireguard-go` without this step.
+     *
+     * Throws if any endpoint hostname fails to resolve.  Multiple
+     * `endpoint=` lines (one per peer) are resolved sequentially in
+     * the same dispatcher; the call returns when all are done.
+     */
+    suspend fun resolveEndpoints(
+        uapi: String,
+        resolver: EndpointResolver = SystemDnsEndpointResolver,
+    ): String {
+        if (!uapi.contains("endpoint=")) return uapi
+        val lines = uapi.split('\n')
+        val out = ArrayList<String>(lines.size)
+        for (line in lines) {
+            if (line.startsWith("endpoint=")) {
+                val hostPort = line.substring(ENDPOINT_PREFIX.length)
+                out += ENDPOINT_PREFIX + resolver.resolve(hostPort)
+            } else {
+                out += line
+            }
+        }
+        return out.joinToString("\n")
+    }
+
+    private const val ENDPOINT_PREFIX = "endpoint="
+
+    /** Strategy for turning the `host:port` form of a wg-quick
+     *  Endpoint into an `ip:port` form (with v6 bracketed) suitable
+     *  for wireguard-go's UAPI.  Pluggable so tests can inject a
+     *  deterministic mapping and the production path can use
+     *  [SystemDnsEndpointResolver]. */
+    interface EndpointResolver {
+        /** @throws IllegalArgumentException if [hostPort] is malformed
+         *  or resolution fails. */
+        suspend fun resolve(hostPort: String): String
+    }
+
+    /** Resolver that uses Android's `InetAddress.getAllByName`.
+     *  IP literals (v4 / bracketed-v6) are returned as-is by the
+     *  JVM; hostnames go through the Android DNS resolver.  v6
+     *  results are preferred over v4 when both families resolve,
+     *  matching the joiner-side within-kind preference in
+     *  [JoinerVpnConfig]. */
+    object SystemDnsEndpointResolver : EndpointResolver {
+        override suspend fun resolve(hostPort: String): String =
+            withContext(Dispatchers.IO) {
+                val (host, port) = splitHostPort(hostPort)
+                val addrs = try {
+                    InetAddress.getAllByName(host)
+                } catch (e: UnknownHostException) {
+                    throw IllegalArgumentException(
+                        "endpoint '$hostPort': could not resolve host '$host': ${e.message}",
+                        e,
+                    )
+                }
+                if (addrs.isEmpty()) {
+                    throw IllegalArgumentException(
+                        "endpoint '$hostPort': no addresses returned for host '$host'")
+                }
+                val preferred = addrs.firstOrNull { it is Inet6Address } ?: addrs.first()
+                formatHostPort(preferred, port)
+            }
+    }
+
+    /** Split `host:port` (v4 or hostname) or `[v6]:port` into its
+     *  two components.  Throws on malformed input. */
+    internal fun splitHostPort(hostPort: String): Pair<String, String> {
+        if (hostPort.startsWith("[")) {
+            val end = hostPort.indexOf("]:")
+            if (end < 0) {
+                throw IllegalArgumentException(
+                    "endpoint '$hostPort': malformed bracketed form, expected '[v6]:port'")
+            }
+            val host = hostPort.substring(1, end)
+            val port = hostPort.substring(end + 2)
+            if (host.isEmpty() || port.isEmpty()) {
+                throw IllegalArgumentException(
+                    "endpoint '$hostPort': empty host or port")
+            }
+            return host to port
+        }
+        val colon = hostPort.lastIndexOf(':')
+        if (colon < 0) {
+            throw IllegalArgumentException(
+                "endpoint '$hostPort': missing ':port'")
+        }
+        val host = hostPort.substring(0, colon)
+        val port = hostPort.substring(colon + 1)
+        if (host.isEmpty() || port.isEmpty()) {
+            throw IllegalArgumentException(
+                "endpoint '$hostPort': empty host or port")
+        }
+        return host to port
+    }
+
+    private fun formatHostPort(addr: InetAddress, port: String): String {
+        // hostAddress may include "%scope" suffix for link-local v6;
+        // wireguard-go's UAPI rejects those, so strip it.
+        val literal = (addr.hostAddress ?: error("InetAddress with null hostAddress"))
+            .substringBefore('%')
+        return if (addr is Inet6Address) "[$literal]:$port" else "$literal:$port"
+    }
 
     private data class PeerUapi(
         val publicKeyB64: String,

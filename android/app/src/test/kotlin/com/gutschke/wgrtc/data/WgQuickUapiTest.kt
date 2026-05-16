@@ -1,5 +1,6 @@
 package com.gutschke.wgrtc.data
 
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -210,6 +211,172 @@ class WgQuickUapiTest {
         assertTrue(firstIdx > 0)
         assertTrue(secondIdx > firstIdx,
             "second peer must come after first; got firstIdx=$firstIdx secondIdx=$secondIdx")
+    }
+
+    // ----- resolveEndpoints / EndpointResolver -----------------------
+
+    /** Test resolver that returns deterministic results from a map.
+     *  Throws IllegalArgumentException if the input hostPort isn't
+     *  registered, so unhandled cases fail the test loudly. */
+    private class FakeResolver(private val mapping: Map<String, String>) : WgQuickUapi.EndpointResolver {
+        var calls: Int = 0
+            private set
+        override suspend fun resolve(hostPort: String): String {
+            calls++
+            return mapping[hostPort]
+                ?: throw IllegalArgumentException("unmapped endpoint in test: '$hostPort'")
+        }
+    }
+
+    @Test fun `resolveEndpoints rewrites hostname to IP literal`() = runTest {
+        // The exact bug v0.2.10 hit: a wg-quick config with
+        // Endpoint = host:port produces UAPI that wireguard-go's
+        // IpcSet rejects ("ParseAddr: unexpected character").
+        // resolveEndpoints must substitute an IP literal in place
+        // before the UAPI is pushed.
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = sonic.gutschke.com:22111
+            PersistentKeepalive = 25
+        """.trimIndent()
+        val uapi = WgQuickUapi.render(cfg)
+        val resolver = FakeResolver(mapOf(
+            "sonic.gutschke.com:22111" to "203.0.113.42:22111",
+        ))
+        val resolved = WgQuickUapi.resolveEndpoints(uapi, resolver)
+        assertTrue(
+            resolved.contains("endpoint=203.0.113.42:22111"),
+            "expected resolved IP in UAPI, got:\n$resolved",
+        )
+        assertTrue(
+            !resolved.contains("sonic.gutschke.com"),
+            "raw hostname should be gone from UAPI, got:\n$resolved",
+        )
+        assertEquals(1, resolver.calls)
+    }
+
+    @Test fun `resolveEndpoints passes IPv4 literals through unchanged`() = runTest {
+        val uapi = "private_key=$privHex\n" +
+                   "public_key=$pubHex\n" +
+                   "endpoint=192.0.2.1:51820\n"
+        val resolver = FakeResolver(mapOf(
+            // SystemDnsEndpointResolver would happily echo a v4 literal back;
+            // we mirror that here.
+            "192.0.2.1:51820" to "192.0.2.1:51820",
+        ))
+        val out = WgQuickUapi.resolveEndpoints(uapi, resolver)
+        assertEquals(uapi, out)
+    }
+
+    @Test fun `resolveEndpoints passes bracketed IPv6 literals through unchanged`() = runTest {
+        val uapi = "private_key=$privHex\n" +
+                   "public_key=$pubHex\n" +
+                   "endpoint=[2001:db8::1]:51820\n"
+        val resolver = FakeResolver(mapOf(
+            "[2001:db8::1]:51820" to "[2001:db8::1]:51820",
+        ))
+        val out = WgQuickUapi.resolveEndpoints(uapi, resolver)
+        assertEquals(uapi, out)
+    }
+
+    @Test fun `resolveEndpoints handles UAPI with no endpoint line`() = runTest {
+        // A peer with no Endpoint (passive-only) emits no endpoint=
+        // line.  resolveEndpoints must be a no-op, including not
+        // invoking the resolver at all.
+        val uapi = "private_key=$privHex\n" +
+                   "public_key=$pubHex\n" +
+                   "replace_allowed_ips=true\n" +
+                   "allowed_ip=10.0.0.0/24\n"
+        val resolver = FakeResolver(emptyMap())
+        val out = WgQuickUapi.resolveEndpoints(uapi, resolver)
+        assertEquals(uapi, out)
+        assertEquals(0, resolver.calls)
+    }
+
+    @Test fun `resolveEndpoints handles multiple peers each with hostname`() = runTest {
+        val cfg = """
+            [Interface]
+            PrivateKey = $privB64
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 10.1.0.0/24
+            Endpoint = host-a.example.com:51820
+
+            [Peer]
+            PublicKey = $pubB64
+            AllowedIPs = 10.2.0.0/24
+            Endpoint = host-b.example.com:51821
+        """.trimIndent()
+        val uapi = WgQuickUapi.render(cfg)
+        val resolver = FakeResolver(mapOf(
+            "host-a.example.com:51820" to "203.0.113.10:51820",
+            "host-b.example.com:51821" to "[2001:db8::b]:51821",
+        ))
+        val out = WgQuickUapi.resolveEndpoints(uapi, resolver)
+        assertTrue(out.contains("endpoint=203.0.113.10:51820"))
+        assertTrue(out.contains("endpoint=[2001:db8::b]:51821"))
+        assertEquals(2, resolver.calls)
+    }
+
+    @Test fun `resolveEndpoints propagates resolver failure`() = runTest {
+        val uapi = "endpoint=does-not-resolve.invalid:51820\n"
+        val resolver = FakeResolver(emptyMap())  // any lookup throws
+        val e = assertThrows(IllegalArgumentException::class.java) {
+            kotlinx.coroutines.runBlocking {
+                WgQuickUapi.resolveEndpoints(uapi, resolver)
+            }
+        }
+        assertTrue(
+            e.message!!.contains("does-not-resolve.invalid"),
+            "expected error to mention failing host, got: ${e.message}",
+        )
+    }
+
+    @Test fun `splitHostPort handles plain host port`() {
+        val (host, port) = WgQuickUapi.splitHostPort("example.com:51820")
+        assertEquals("example.com", host)
+        assertEquals("51820", port)
+    }
+
+    @Test fun `splitHostPort handles IPv4 literal`() {
+        val (host, port) = WgQuickUapi.splitHostPort("192.0.2.1:51820")
+        assertEquals("192.0.2.1", host)
+        assertEquals("51820", port)
+    }
+
+    @Test fun `splitHostPort handles bracketed IPv6 literal`() {
+        val (host, port) = WgQuickUapi.splitHostPort("[2001:db8::1]:51820")
+        assertEquals("2001:db8::1", host)
+        assertEquals("51820", port)
+    }
+
+    @Test fun `splitHostPort rejects missing port`() {
+        val e = assertThrows(IllegalArgumentException::class.java) {
+            WgQuickUapi.splitHostPort("example.com")
+        }
+        assertTrue(e.message!!.contains("missing"))
+    }
+
+    @Test fun `splitHostPort rejects malformed bracketed form`() {
+        val e = assertThrows(IllegalArgumentException::class.java) {
+            WgQuickUapi.splitHostPort("[2001:db8::1")  // no closing bracket
+        }
+        assertTrue(e.message!!.contains("bracketed") || e.message!!.contains("malformed"))
+    }
+
+    @Test fun `splitHostPort rejects empty host or port`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            WgQuickUapi.splitHostPort(":51820")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            WgQuickUapi.splitHostPort("host.example.com:")
+        }
     }
 
     @Test fun `replace_peers and replace_allowed_ips are present`() {
