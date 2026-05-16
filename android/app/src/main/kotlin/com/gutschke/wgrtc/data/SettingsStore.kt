@@ -48,7 +48,12 @@ class SettingsStore internal constructor(private val backing: Backing) {
     private val _hideListenerNotification = MutableStateFlow(
         backing.getString(K_HIDE_LISTENER_NOTIFICATION) == "true")
     private val _joinerNEnabled = MutableStateFlow(
-        backing.getString(K_JOINER_N_ENABLED) == "true")
+        // Default ON since v0.2.10: fresh installs and existing
+        // installs that never touched the toggle both get the
+        // shared-stack path. Users who explicitly set the toggle
+        // off (the persisted value is the literal string "false")
+        // keep their preference across upgrades.
+        backing.getString(K_JOINER_N_ENABLED) != "false")
 
     val defaultBrokerWssFlow: StateFlow<String> = _wss.asStateFlow()
     val defaultBrokerKeyFlow: StateFlow<String> = _key.asStateFlow()
@@ -66,12 +71,13 @@ class SettingsStore internal constructor(private val backing: Backing) {
     val hideListenerNotificationFlow: StateFlow<Boolean> =
         _hideListenerNotification.asStateFlow()
 
-    /** When true, joiner-mode tunnels share one VpnService TUN
-     * through a userspace gvisor netstack (see
-     * `docs/cascade-n-design.md`). Default false — single-joiner
-     * path is the legacy behavior that ships unchanged across
-     * upgrades. Marked experimental in the UI until V1 real-device
-     * validation. */
+    /** When true (default since v0.2.10), joiner-mode tunnels share
+     * one VpnService TUN through a userspace gvisor netstack so the
+     * device can keep more than one joiner up simultaneously (see
+     * `docs/cascade-n-design.md`). When off, the legacy single-
+     * joiner path takes over — at most one joiner active at a time.
+     * Users who hit a regression specific to the shared stack can
+     * toggle off and the previous behaviour is preserved. */
     val joinerNEnabledFlow: StateFlow<Boolean> = _joinerNEnabled.asStateFlow()
 
     var defaultBrokerWss: String
@@ -139,7 +145,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         _key.value = WormholeDefaults.BROKER_KEY
         _egress.value = EgressPolicy.OsDefault
         _hideListenerNotification.value = false
-        _joinerNEnabled.value = false
+        _joinerNEnabled.value = true
     }
 
     data class Snapshot(val brokerWss: String, val brokerKey: String)

@@ -207,7 +207,7 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.outlineVariant,
             )
             Spacer(Modifier.height(16.dp))
-            ExperimentalSection(settings)
+            JoinerModeSection(settings)
 
             Spacer(Modifier.height(24.dp))
             androidx.compose.material3.HorizontalDivider(
@@ -311,15 +311,14 @@ private fun NotificationSection(settings: SettingsStore) {
 }
 
 /**
- * Experimental-features section. Holds opt-in flags for code paths
- * that are functionally complete but not yet validated on real-
- * world workloads. Each toggle should ship behind a "(experimental)"
- * label and concrete prose so the user knows what changes.
+ * Joiner-mode behaviour section. Currently one toggle: whether
+ * joiner tunnels share a single VpnService slot (default on, since
+ * v0.2.10) or run one-at-a-time via the legacy path.
  */
 @Composable
-private fun ExperimentalSection(settings: SettingsStore) {
+private fun JoinerModeSection(settings: SettingsStore) {
     val joinerN by settings.joinerNEnabledFlow.collectAsState()
-    Text("Experimental", style = MaterialTheme.typography.titleMedium)
+    Text("Joiner mode", style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(8.dp))
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -327,16 +326,16 @@ private fun ExperimentalSection(settings: SettingsStore) {
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                "Multi-joiner shared tunnel",
+                "Allow multiple joiner tunnels at once",
                 style = MaterialTheme.typography.bodyLarge,
             )
             Text(
-                "Lets the app keep more than one joiner-mode tunnel " +
-                    "up at the same time by sharing one Android VPN " +
-                    "slot across all of them. The default single-" +
-                    "joiner path is unchanged when this is off. Turn " +
-                    "it off again if joining a tunnel ever fails after " +
-                    "an upgrade.",
+                "When on (the default), wgrtc can keep several joiner-" +
+                    "mode tunnels up at the same time by sharing one " +
+                    "Android VPN slot across all of them. Turn this off " +
+                    "to fall back to the legacy single-joiner path — at " +
+                    "most one joiner tunnel active at a time. Host-mode " +
+                    "tunnels are unaffected.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -47,6 +47,15 @@ hole punching for NAT — and we package them so the result is a Debian
   Long-lived WireGuard tunnels keep humming as the underlying network
   roams; wgrtc's signaling automatically follows.
 
+- **Several tunnels at once.**  Run home + work + a friend's network
+  side-by-side on the same phone.  Android caps a process at one
+  `VpnService` slot, so wgrtc shares that single slot across every
+  joiner tunnel you've enrolled — per-tunnel routing stays separate
+  in-process via a userspace netstack.  When you roam from Wi-Fi to
+  cellular, every tunnel re-races its endpoint candidates
+  independently, so all the tunnels stay reachable without a manual
+  reconnect.  Host-mode tunnels are similarly N-at-a-time.
+
 ## What you DON'T need
 
 - **No port forwarding.**  The NAT discovers itself.

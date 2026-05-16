@@ -93,28 +93,40 @@ class SettingsStoreTest {
         assertEquals(EgressPolicy.OsDefault, s.egressPolicy)
     }
 
-    @Test fun `joinerNEnabled defaults to false`() {
+    @Test fun `joinerNEnabled defaults to true`() {
+        // Default flipped to ON in v0.2.10.  Existing installs
+        // without any persisted preference see the new behaviour;
+        // installs that explicitly set the toggle off keep their
+        // preference (covered by the "false reads back" case).
         val s = SettingsStore.forTestInMemory()
-        assertEquals(false, s.joinerNEnabled)
-        assertEquals(false, s.joinerNEnabledFlow.value)
+        assertEquals(true, s.joinerNEnabled)
+        assertEquals(true, s.joinerNEnabledFlow.value)
     }
 
     @Test fun `joinerNEnabled round-trips through persistence`() {
         val s = SettingsStore.forTestInMemory()
+        s.joinerNEnabled = false
+        assertEquals(false, s.joinerNEnabled)
+        assertEquals(false, s.joinerNEnabledFlow.value)
         s.joinerNEnabled = true
         assertEquals(true, s.joinerNEnabled)
         assertEquals(true, s.joinerNEnabledFlow.value)
     }
 
-    @Test fun `joinerNEnabled reads back persisted value on construction`() {
+    @Test fun `joinerNEnabled honours explicit false from older installs`() {
+        val s = SettingsStore.forTestInMemory(mapOf("joiner_n_enabled" to "false"))
+        assertEquals(false, s.joinerNEnabled)
+    }
+
+    @Test fun `joinerNEnabled reads back persisted true on construction`() {
         val s = SettingsStore.forTestInMemory(mapOf("joiner_n_enabled" to "true"))
         assertEquals(true, s.joinerNEnabled)
     }
 
-    @Test fun `resetToDefaults clears joinerNEnabled`() {
+    @Test fun `resetToDefaults restores joinerNEnabled to true`() {
         val s = SettingsStore.forTestInMemory()
-        s.joinerNEnabled = true
+        s.joinerNEnabled = false
         s.resetToDefaults()
-        assertEquals(false, s.joinerNEnabled)
+        assertEquals(true, s.joinerNEnabled)
     }
 }

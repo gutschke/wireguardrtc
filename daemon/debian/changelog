@@ -1,3 +1,22 @@
+wireguardrtc (0.2.10-1) unstable; urgency=medium
+
+  * Android: multi-joiner shared-tunnel path is now the default.
+    Each phone can keep several joiner-mode tunnels (home, work,
+    a friend's network) up at the same time, sharing Android's
+    single VpnService slot across all of them via a userspace
+    gvisor netstack.  Users who hit a regression specific to the
+    shared stack can flip Settings → "Joiner mode" → "Allow
+    multiple joiner tunnels at once" off and get the legacy
+    single-joiner path.  RoamController already handles network
+    changes (Wi-Fi ↔ cellular) on a per-tunnel basis so each
+    joiner re-races its candidates independently.
+  * README: surfaces the multi-tunnel use case for first-time
+    visitors and clarifies what's actually shipping today
+    (dual-stack IPv6, N concurrent tunnels, daemon + Android
+    interop, wormhole-pairing parity between phone and daemon).
+
+ -- wireguardrtc maintainers <maintainers@wgrtc.invalid>  Fri, 16 May 2026 06:00:00 +0000
+
 wireguardrtc (0.2.9-1) unstable; urgency=medium
 
   * Android: RoamController is now wired into the joiner-N path —
