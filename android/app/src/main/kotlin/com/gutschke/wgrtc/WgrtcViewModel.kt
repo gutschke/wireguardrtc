@@ -319,12 +319,27 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  return v
  }
 
- /** tracks the in-flight connect coroutine so [disconnect]
- * can cancel it. Without this, disconnect's setState(DOWN) and
- * the race's next setEndpoint/setState(UP) interleave and the
- * user observes "Disconnect didn't disconnect". Stored as
- * `coroutineContext[Job]` from inside connect's body. */
- @Volatile private var connectJob: Job? = null
+ /** Per-tunnel in-flight connect coroutines. Disconnect of
+  * tunnel X cancels `connectJobs[X]` so the race teardown is
+  * the last backend mutation, not racing the next setEndpoint
+  * /setState(UP) of an unfinished candidate sweep.
+  *
+  * Keyed by tunnel id because joiner-N (and the host slot
+  * group) allows multiple concurrent connects. The legacy
+  * single-joiner path used a scalar field; carrying that into
+  * joiner-N would let a disconnect on one tunnel cancel the
+  * unrelated connect coroutine of another, silently failing
+  * the second one — the J7b code-review caught this. */
+ private val connectJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
+
+ /** Joiner-N connects in flight, used by [maybeUnbindJoinerN]
+  * to keep the shared service binding alive across a connect
+  * that hasn't yet reached its success/failure branch. Without
+  * this, an early-failing first connect could unbind the
+  * service while a second concurrent connect is still inside
+  * `addJoiner`, dropping the underlying LocalBinder out from
+  * under wireguard-go. */
+ private val joinerNConnectsInFlight = java.util.concurrent.atomic.AtomicInteger(0)
 
  /** roam handler. Constructed in the joiner-mode connect
  * success path; stopped on disconnect. Listens (via
@@ -943,10 +958,12 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * that, Disconnect during the race interleaves with the next
  * setEndpoint and the user sees the tunnel come back up. */
  suspend fun connect(id: String) {
- // Register this coroutine as the active connect job; clear
- // on exit (success or failure) so the next disconnect doesn't
- // try to cancel a finished job.
- connectJob = currentCoroutineContext()[Job]
+ // Register this coroutine as the active connect job for [id];
+ // cleared on exit (success or failure) so the next disconnect
+ // doesn't try to cancel a finished job, and keyed by tunnel
+ // id so a disconnect on one tunnel never cancels another's
+ // in-flight connect.
+ currentCoroutineContext()[Job]?.let { connectJobs[id] = it }
  // Mark the tunnel as "connecting" immediately so the UI can
  // show a per-row spinner. Cleared in the finally block at
  // the bottom of this function.
@@ -969,7 +986,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  Log.w("wgrtc-vm", msg)
  _lastError.value = msg
  _connectingTunnelId.value = null
- if (connectJob == currentCoroutineContext()[Job]) connectJob = null
+ val myJob = currentCoroutineContext()[Job]
+ connectJobs.compute(id) { _, v -> if (v == myJob) null else v }
  throw IllegalStateException(msg)
  }
  // ─── Host () short-circuit ────────────────────────
@@ -1011,7 +1029,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  throw e
  } finally {
  if (_connectingTunnelId.value == id) _connectingTunnelId.value = null
- if (connectJob == currentCoroutineContext()[Job]) connectJob = null
+ val myJob = currentCoroutineContext()[Job]
+ connectJobs.compute(id) { _, v -> if (v == myJob) null else v }
  }
  return
  }
@@ -1309,7 +1328,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  } finally {
  // Only clear if WE are still the registered job (not a
  // later connect that overtook us).
- if (connectJob == currentCoroutineContext()[Job]) connectJob = null
+ val myJob = currentCoroutineContext()[Job]
+ connectJobs.compute(id) { _, v -> if (v == myJob) null else v }
  // Same guard for the connecting indicator: don't clear
  // a different tunnel's pending connect.
  if (_connectingTunnelId.value == id) _connectingTunnelId.value = null
@@ -1443,11 +1463,10 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * `_liveState`/throughput-sampler collapse afterwards. */
  private suspend fun tearDownJoinerInternal() {
  val joinerId = _activeJoinerTunnelId.value ?: return
- connectJob?.let {
+ connectJobs.remove(joinerId)?.let {
  try { it.cancelAndJoin() }
  catch (e: Throwable) { Log.w("wgrtc-vm", "connect cancel failed", e) }
  }
- connectJob = null
  networkChangeMonitor.stop()
  activeRoamController?.stop()
  activeRoamController = null
@@ -1480,6 +1499,12 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  t: Tunnel,
  candidates: List<EndpointUpdate>,
  ) {
+ // Increment BEFORE ensuring the binding, decrement only in
+ // finally. Two concurrent connectViaJoinerN calls then can't
+ // drop each other's binding through maybeUnbindJoinerN — the
+ // helper checks both the active set AND this counter.
+ joinerNConnectsInFlight.incrementAndGet()
+ try {
  val binding = ensureJoinerNBinding()
  val service = binding.service
  val parsed = try { JoinerVpnConfig.parse(t.configText) }
@@ -1548,6 +1573,9 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  throw RuntimeException(msg)
  }
  }
+ } finally {
+ joinerNConnectsInFlight.decrementAndGet()
+ }
  }
 
  /** Joiner-N no-candidates fallback — bring the joiner up with
@@ -1555,6 +1583,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
   * the bottom of [connect] but routes through the shared
   * service. */
  private suspend fun connectViaJoinerNNoCandidates(id: String, t: Tunnel) {
+ joinerNConnectsInFlight.incrementAndGet()
+ try {
  val binding = ensureJoinerNBinding()
  val service = binding.service
  val parsed = try { JoinerVpnConfig.parse(t.configText) }
@@ -1574,17 +1604,32 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _lastError.value = null
  startThroughputSampler()
  networkChangeMonitor.start()
+ } finally {
+ joinerNConnectsInFlight.decrementAndGet()
+ }
  }
 
- /** If the joiner-N active set is empty, drop the binding (the
-  * shared stack is fully torn down by [JoinerNVpnService.stopAll],
-  * but the binding itself still keeps the service process pinned).
+ /** If the joiner-N active set is empty AND no other connect
+  * is currently in flight, drop the binding (the shared stack
+  * is fully torn down by [JoinerNVpnService.stopAll], but the
+  * binding itself still keeps the service process pinned).
+  *
+  * The in-flight check matters when two concurrent
+  * [connectViaJoinerN] calls race: connect A can fail before
+  * landing in [_activeJoinerNTunnelIds] (and so the active set
+  * is empty from A's perspective), but connect B is still
+  * partway through `addJoiner` against the same binding. Without
+  * the counter, A would unbind the service while B is mid-JNI.
+  *
   * Called only from the error paths in [connectViaJoinerN] /
   * [connectViaJoinerNNoCandidates] — the success-then-disconnect
   * path goes through [tearDownJoinerNInternal] which has its own
   * empty-set guard. */
  private fun maybeUnbindJoinerN(binding: JoinerNVpnBinding) {
- if (_activeJoinerNTunnelIds.value.isEmpty()) {
+ // > 1 because the current caller is itself counted; only
+ // drop the binding when WE are the last in-flight connect.
+ if (_activeJoinerNTunnelIds.value.isEmpty()
+ && joinerNConnectsInFlight.get() <= 1) {
  binding.unbind()
  if (activeJoinerNBinding === binding) {
  activeJoinerNBinding = null
@@ -1600,14 +1645,15 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
   * path was used, and from the connect-failure paths below. */
  private suspend fun tearDownJoinerNInternal(tunnelId: String) {
  if (!_activeJoinerNTunnelIds.value.contains(tunnelId)) return
- // Cancel any in-flight connect that targets this id so the
- // disconnect's removeJoiner is the last service mutation,
- // not racing the next setEndpoint of an unfinished race.
- connectJob?.let {
+ // Cancel any in-flight connect for THIS id only — the
+ // per-tunnel job map means a disconnect on tunnel A never
+ // cancels the unrelated in-flight connect of tunnel B
+ // (a regression the code-review on commit 1744ea79 caught
+ // when connectJob was still a process-wide scalar).
+ connectJobs.remove(tunnelId)?.let {
  try { it.cancelAndJoin() }
  catch (e: Throwable) { Log.w("wgrtc-vm", "connect cancel failed", e) }
  }
- connectJob = null
  activeJoinerNBinding?.let { binding ->
  try { withContext(Dispatchers.IO) { binding.service.removeJoiner(tunnelId) } }
  catch (t: Throwable) {
@@ -1619,7 +1665,14 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _peerStats.update { it - tunnelId }
  _liveEndpoints.update { it - tunnelId }
  if (_activeJoinerNTunnelIds.value.isEmpty()) {
+ // Only stop the network-change monitor if neither joiner
+ // group has anything left. Without this guard, tearing
+ // down the last joiner-N tunnel while a legacy single
+ // joiner is still up would unsubscribe wakes for the
+ // surviving tunnel.
+ if (_activeJoinerTunnelId.value == null) {
  networkChangeMonitor.stop()
+ }
  activeJoinerNBinding?.let { binding ->
  try { withContext(Dispatchers.IO) { binding.service.stopAll() } }
  catch (t: Throwable) {
