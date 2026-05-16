@@ -92,7 +92,13 @@ class JoinerVpnService : VpnService() {
         // fine. Host advertises its WG-side IP as DNS (see
         // [buildHostTunnelSnapshot]); UDP/53 to that IP is intercepted
         // by the host's gvisor catchall and routed to [DnsProxy].
-        for (d in config.dnsServers) {
+        // If the config has v6 addresses but only v4 DNS, append a
+        // synthesized v6 DNS so Android's resolver stops filtering
+        // AAAA records via AI_ADDRCONFIG.  See
+        // [JoinerVpnConfig.dnsWithV6Fallback] for the rationale.
+        val effectiveDns = JoinerVpnConfig.dnsWithV6Fallback(
+            config.addresses, config.dnsServers)
+        for (d in effectiveDns) {
             try {
                 builder.addDnsServer(d)
             } catch (t: Throwable) {

@@ -187,7 +187,18 @@ class JoinerNVpnService : VpnService() {
                 .setMtu(mtu)
             for (a in addresses) builder.addAddress(a.address, a.prefixLen)
             for (r in routes) builder.addRoute(r.address, r.prefixLen)
-            for (d in dnsServers) {
+            // If the config has v6 addresses but only v4 DNS, append
+            // a synthesized v6 DNS so Android's resolver stops
+            // filtering AAAA records via AI_ADDRCONFIG.  See
+            // [JoinerVpnConfig.dnsWithV6Fallback] for the
+            // rationale.
+            val effectiveDns = com.gutschke.wgrtc.data.JoinerVpnConfig.dnsWithV6Fallback(
+                addresses, dnsServers)
+            if (effectiveDns.size != dnsServers.size) {
+                Log.i(TAG, "synthesized v6 DNS for dual-stack VPN " +
+                    "(original=$dnsServers effective=$effectiveDns)")
+            }
+            for (d in effectiveDns) {
                 try {
                     builder.addDnsServer(d)
                 } catch (t: Throwable) {

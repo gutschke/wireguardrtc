@@ -119,6 +119,57 @@ data class JoinerVpnConfig(
             )
         }
 
+        /**
+         * If the joiner's `addresses` include any IPv6 entry but
+         * `dnsServers` is v4-only, return a copy of `dnsServers`
+         * with a synthesized v6 DNS appended.  Otherwise return
+         * `dnsServers` unchanged.
+         *
+         * **Why this exists.**  Android's resolver applies
+         * `AI_ADDRCONFIG`-style filtering to `getaddrinfo` results:
+         * when the active network has no v6 DNS server, AAAA records
+         * are silently dropped even if the underlying transport
+         * does carry v6.  A wg-quick config that lists
+         * `DNS = 1.1.1.1` plus a dual-stack
+         * `Address = 10.x/32, fd00::6/128` therefore loses v6 name
+         * resolution from inside the tunnel — the user sees
+         * "no v6" even though `nc -6 <literal>` works end-to-end.
+         * Surfaced by a real-device test from a Pixel hotspot.
+         *
+         * **Choice of v6 DNS.**  We pick a server in the same
+         * provider family as the user's existing v4 DNS so we don't
+         * silently introduce a new third party.  Cloudflare /
+         * Google / Quad9 mappings are hard-coded; the fallback for
+         * unknown providers is Cloudflare's `2606:4700:4700::1111`,
+         * matching wgrtc's existing `1.1.1.1` baseline.
+         *
+         * If the user already has a v6 DNS in their config, we
+         * touch nothing.
+         */
+        fun dnsWithV6Fallback(
+            addresses: List<Cidr>,
+            dnsServers: List<String>,
+        ): List<String> {
+            val hasV6Address = addresses.any { it.address.contains(':') }
+            if (!hasV6Address) return dnsServers
+            val hasV6Dns = dnsServers.any { it.contains(':') }
+            if (hasV6Dns) return dnsServers
+            if (dnsServers.isEmpty()) return dnsServers  // user opted out entirely
+            return dnsServers + synthesizeV6Dns(dnsServers)
+        }
+
+        private fun synthesizeV6Dns(existingDns: List<String>): String = when {
+            existingDns.any { it == "1.1.1.1" || it == "1.0.0.1" } ->
+                "2606:4700:4700::1111"
+            existingDns.any { it == "8.8.8.8" || it == "8.8.4.4" } ->
+                "2001:4860:4860::8888"
+            existingDns.any { it == "9.9.9.9" || it == "149.112.112.112" } ->
+                "2620:fe::fe"
+            // Unknown provider — fall back to Cloudflare, matching
+            // wgrtc's de-facto v4 default of 1.1.1.1.
+            else -> "2606:4700:4700::1111"
+        }
+
         /** Tolerant CIDR parser. `1.2.3.4/24` → Cidr(...,24).
          * Bare `1.2.3.4` → /32. Bare `fd00::1` → /128. */
         private fun parseCidr(s: String): Cidr {

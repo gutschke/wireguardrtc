@@ -491,4 +491,62 @@ class JoinerVpnConfigTest {
         val parsed = JoinerVpnConfig.parse(cfg)
         assertEquals(listOf(Cidr("fd00::2", 128)), parsed.addresses)
     }
+
+    // ----- dnsWithV6Fallback ------------------------------------------
+
+    @Test fun `dnsWithV6Fallback appends v6 sibling for 1_1_1_1`() {
+        // Regression for v0.2.12 — Pixel-hotspot test where the
+        // user's wg-quick has Address = v4 + v6 but DNS = 1.1.1.1
+        // (v4 only).  Android's resolver then filters AAAA records
+        // via AI_ADDRCONFIG and `ping ipv6.google.com` says
+        // "unknown host" even though `nc -6 <literal>` works.
+        val addrs = listOf(Cidr("10.10.80.6", 32), Cidr("fd00::6", 128))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(addrs, listOf("1.1.1.1"))
+        assertEquals(listOf("1.1.1.1", "2606:4700:4700::1111"), out)
+    }
+
+    @Test fun `dnsWithV6Fallback appends v6 sibling for 8_8_8_8`() {
+        val addrs = listOf(Cidr("10.10.80.6", 32), Cidr("fd00::6", 128))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(addrs, listOf("8.8.8.8"))
+        assertEquals(listOf("8.8.8.8", "2001:4860:4860::8888"), out)
+    }
+
+    @Test fun `dnsWithV6Fallback appends v6 sibling for 9_9_9_9`() {
+        val addrs = listOf(Cidr("10.10.80.6", 32), Cidr("fd00::6", 128))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(addrs, listOf("9.9.9.9"))
+        assertEquals(listOf("9.9.9.9", "2620:fe::fe"), out)
+    }
+
+    @Test fun `dnsWithV6Fallback defaults unknown v4 DNS to Cloudflare v6`() {
+        // The user's v4 DNS is some obscure provider — we don't
+        // know its v6 sibling, so fall back to Cloudflare's
+        // 2606:4700:4700::1111 (matches wgrtc's de-facto baseline).
+        val addrs = listOf(Cidr("10.10.80.6", 32), Cidr("fd00::6", 128))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(addrs, listOf("192.0.2.53"))
+        assertEquals(listOf("192.0.2.53", "2606:4700:4700::1111"), out)
+    }
+
+    @Test fun `dnsWithV6Fallback is a no-op when config already has v6 DNS`() {
+        val addrs = listOf(Cidr("10.10.80.6", 32), Cidr("fd00::6", 128))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(
+            addrs, listOf("1.1.1.1", "2606:4700:4700::1111"))
+        // Already complete — leave it alone, don't duplicate.
+        assertEquals(listOf("1.1.1.1", "2606:4700:4700::1111"), out)
+    }
+
+    @Test fun `dnsWithV6Fallback is a no-op for v4-only configs`() {
+        // No v6 address in the joiner's tunnel — nothing for the
+        // resolver to filter, no synth needed.
+        val addrs = listOf(Cidr("10.10.80.6", 32))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(addrs, listOf("1.1.1.1"))
+        assertEquals(listOf("1.1.1.1"), out)
+    }
+
+    @Test fun `dnsWithV6Fallback respects user opt-out (empty DNS list)`() {
+        // User deliberately set no DNS — they don't want the VPN to
+        // override their resolver.  Don't push anything.
+        val addrs = listOf(Cidr("10.10.80.6", 32), Cidr("fd00::6", 128))
+        val out = JoinerVpnConfig.dnsWithV6Fallback(addrs, emptyList())
+        assertEquals(emptyList<String>(), out)
+    }
 }
