@@ -1,3 +1,29 @@
+wireguardrtc (0.2.8-1) unstable; urgency=medium
+
+  * Android: opt-in multi-joiner shared-tunnel path.  Settings →
+    Experimental → "Multi-joiner shared tunnel" lets the app keep
+    more than one joiner-mode tunnel up at the same time by sharing
+    one Android VPN slot across all of them (one userspace gvisor
+    netstack, N wireguard-go bridges).  Default off — the legacy
+    single-joiner path is unchanged when the toggle is off.  Real-
+    device validation: emulator (API 34) + ARC ChromeOS, settings
+    persistence + on/off cycle.  End-to-end two-joiner handshake
+    needs VPN consent and is the next instrumented test step.
+  * Code review pass on the joiner-N ViewModel path caught three
+    concurrent-access bugs: shared connectJob scalar (fixed by a
+    per-tunnel-id Map), maybeUnbindJoinerN dropping the binding
+    under a racing sibling connect (fixed by an in-flight counter),
+    and an unrelated-tunnel NetworkChangeMonitor.stop().
+  * Documentation: US English spelling sweep (53 files) — joiner-
+    side enrolment/behaviour/colour/serialise consistently use the
+    American forms.  Codename pruning in production comments (24
+    files, 51 references) — internal D4.*/V6.*/PS* task tags
+    removed from places where they no longer carried signal.
+    User-facing docs (v6-runbook.md, cascade-n-design.md) lost
+    their internal task-stream framing.
+
+ -- wireguardrtc maintainers <maintainers@wgrtc.invalid>  Thu, 15 May 2026 16:00:00 +0000
+
 wireguardrtc (0.2.7-1) unstable; urgency=medium
 
   * Android: host-N landed.  HostModeBackend now supports N concurrent
