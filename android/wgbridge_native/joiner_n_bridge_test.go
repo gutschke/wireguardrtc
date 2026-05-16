@@ -9,6 +9,8 @@ package main
 
 import (
 	"net/netip"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -293,4 +295,49 @@ func TestJ2EndToEndJoinerToApp(t *testing.T) {
 	// drop the import in CI builds that skip route-only paths.
 	var _ = (*channel.Endpoint)(nil)
 	_ = tcpip.NICID(0)
+}
+
+// Regression for v0.2.12 protect-bind fix: openJoinerBridge MUST
+// use newJoinerBind() (the protect-aware bind on Android), not
+// conn.NewDefaultBind().  Otherwise wireguard-go's outbound UDP
+// socket is subject to VpnService routing — full-tunnel configs
+// loop wg-go's own handshakes back through tun0 and the bridge
+// stops handshaking after the first squeak-through.
+//
+// We can't easily black-box the bind choice (it's wired into
+// device.Device, which doesn't expose the Bind it was given), so
+// this test is a *source-lint* on joiner_n_bridge.go.  It is
+// deliberately fragile: any change to the line that constructs
+// the device must keep newJoinerBind() in the second argument.
+func TestJoinerNBridgeUsesProtectAwareBind(t *testing.T) {
+	raw, err := os.ReadFile("joiner_n_bridge.go")
+	if err != nil {
+		t.Fatalf("read joiner_n_bridge.go: %v", err)
+	}
+	codeOnly := stripGoLineComments(string(raw))
+	if strings.Contains(codeOnly, "conn.NewDefaultBind()") {
+		t.Fatalf("joiner_n_bridge.go must not use conn.NewDefaultBind() — " +
+			"call newJoinerBind() instead so VpnService.protect() runs " +
+			"on the bridge socket.  See v0.2.12 commit message.")
+	}
+	if !strings.Contains(codeOnly, "newJoinerBind()") {
+		t.Fatalf("joiner_n_bridge.go must call newJoinerBind() to obtain " +
+			"the protect-aware bind on Android.")
+	}
+}
+
+// stripGoLineComments returns src with everything from "//" to
+// end-of-line removed on every line.  Crude (doesn't handle /* */
+// blocks, doesn't respect strings), but adequate for matching
+// against well-known Go identifiers in joiner_n_bridge.go.
+func stripGoLineComments(src string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(src, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

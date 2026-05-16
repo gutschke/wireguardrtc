@@ -1886,6 +1886,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  val hostIds = hostBackend.activeTunnelIds.value
  val joinerId = _activeJoinerTunnelId.value
  val joinerBinding = activeJoinerBinding
+ val joinerNIds = _activeJoinerNTunnelIds.value
+ val joinerNBinding = activeJoinerNBinding
  val now = System.nanoTime()
  val tps = mutableMapOf<String, ThroughputStats>()
  val pps = mutableMapOf<String, Map<String, com.gutschke.wgrtc.data.PeerStats>>()
@@ -1907,9 +1909,27 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  recordSample(joinerId, stats, now, seeding, baselines, tps, pps)
  }
  }
+ // Joiner-N: every active shared-stack tunnel reads its own
+ // per-bridge UAPI snapshot.  Until this iteration was added
+ // the sampler quietly skipped them — joinerId is null for
+ // joiner-N, so the legacy branch above never fires — and the
+ // UI showed zero bytes / "no handshake yet" forever even
+ // though the data plane was healthy.  Pinned by a real-device
+ // test where wireguard-go logged steady periodic handshakes
+ // while the app's UI claimed nothing was happening.
+ if (joinerNBinding != null) {
+ for (id in joinerNIds) {
+ val stats = try { joinerNBinding.service.snapshotStats(id) } catch (t: Throwable) {
+ if (seeding) Log.w("wgrtc-vm", "initial joinerN sample $id failed", t)
+ else Log.w("wgrtc-vm", "joinerN sample $id failed; retrying", t)
+ null
+ } ?: continue
+ recordSample(id, stats, now, seeding, baselines, tps, pps)
+ }
+ }
  // Prune baselines for tunnels that are no longer active so
  // the next start-cycle reseeds cleanly.
- val activeIds = hostIds + listOfNotNull(joinerId)
+ val activeIds = hostIds + listOfNotNull(joinerId) + joinerNIds
  baselines.keys.retainAll(activeIds)
  _throughput.value = tps
  _peerStats.value = pps

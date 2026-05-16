@@ -121,6 +121,18 @@ class JoinerNVpnService : VpnService() {
      *  when no slot exists or the snapshot call returned null. */
     fun snapshotUapi(tunnelId: String): String? = controller.snapshotUapi(tunnelId)
 
+    /** Same as [snapshotUapi] but parses the UAPI text into the
+     *  structured [UapiStats] the throughput sampler consumes.  The
+     *  legacy single-joiner runner has the same shape on the
+     *  non-shared-stack path; the sampler reads via this method for
+     *  joiner-N tunnels.  Returns null when no slot exists for
+     *  [tunnelId] or the snapshot was empty. */
+    fun snapshotStats(tunnelId: String): com.gutschke.wgrtc.data.UapiStats? {
+        val raw = controller.snapshotUapi(tunnelId) ?: return null
+        if (raw.isEmpty()) return null
+        return com.gutschke.wgrtc.data.UapiStatsParser.parse(raw)
+    }
+
     /** Full teardown — close every joiner, close the shared stack,
      *  detach the kernel TUN. Idempotent. */
     fun stopAll() {
