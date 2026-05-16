@@ -161,13 +161,39 @@ class HostCatchallForwarderE2ETest {
             }
         }, joinerSink)
 
+        // Wait a beat AFTER the handshake before the first send.
+        // Empirically, the gvisor netstack on the joiner side
+        // finishes setting up the per-NIC route table a few hundred
+        // ms after `mostRecentHandshakeEpochMs` first crosses zero;
+        // sending before that lands datagrams in the netstack
+        // before it has a return path, and they're silently dropped.
+        Thread.sleep(500)
+
         // Dial 10.99.0.1:echoPort over UDP. Same catchall semantics
         // as TCP — host's UdpForwarderHandler opens a per-flow OS
         // socket to 127.0.0.1:echoPort, pumps bytes both ways.
+        //
+        // Retransmit because UDP IS allowed to drop datagrams.
+        // The test previously flaked ~1-in-4 with a single send +
+        // 5 s poll. Retransmitting every 200 ms for up to 15 s
+        // covers both single-packet drops AND the rare case where
+        // the host's UdpForwarderHandler races our send: the
+        // per-flow socket isn't bound yet when the first datagram
+        // arrives, the host drops it, but the second arrives once
+        // the socket is up and gets echoed normally. Real apps
+        // retransmit too (DNS, QUIC) or accept loss (RTP), so the
+        // test isn't simulating anything users don't have to do.
         val payload = ByteArray(48).also { SecureRandom().nextBytes(it) }
-        joinerSink.sendTo("10.99.0.1:$echoPort", payload)
-        val reply = rxQueue.poll(5, TimeUnit.SECONDS)
-        assertTrue("no echoed datagram within 5s", reply != null)
+        val deadline = System.currentTimeMillis() + 15_000
+        var reply: ByteArray? = null
+        var sends = 0
+        while (reply == null && System.currentTimeMillis() < deadline) {
+            joinerSink.sendTo("10.99.0.1:$echoPort", payload)
+            sends++
+            reply = rxQueue.poll(200, TimeUnit.MILLISECONDS)
+        }
+        assertTrue("no echoed datagram within 15s ($sends retransmits)",
+            reply != null)
         assertArrayEquals("UDP echo mismatch", payload, reply)
     }
 
