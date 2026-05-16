@@ -351,6 +351,17 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  @Volatile private var activeRoamController:
  com.gutschke.wgrtc.signalling.RoamController? = null
 
+ /** Per-tunnel roam controllers for the joiner-N path. Keyed by
+  * tunnel id because joiner-N permits N active joiners and each
+  * needs its own roam state. The legacy single-joiner path keeps
+  * the [activeRoamController] singleton above — the two coexist
+  * because joiner-N tunnels never share a controller with the
+  * single-joiner slot (the active sets are mutually exclusive
+  * by design). */
+ private val activeJoinerNRoamControllers =
+  java.util.concurrent.ConcurrentHashMap<
+   String, com.gutschke.wgrtc.signalling.RoamController>()
+
  /** Step G: network-change monitor active only while a tunnel is
  * UP. Fires a force-wake at the daemon when the routing topology
  * shifts (Wi-Fi joined/lost, hotspot toggled, etc.) so a fresh
@@ -396,15 +407,16 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  "network change → force-wake joiner-N tunnel $it")
  hub.wake(it, force = true)
  }
- // also notify the roam handler so it can
- // re-race candidates if the network change made the
- // current live endpoint unreachable.
- // RoamController is single-joiner only; joiner-N's
- // listener-driven endpoint rewrite path catches the
- // network change indirectly (the wake above triggers a
- // fresh OFFER, which fires endpointUpdates, which
- // reconfigures via JoinerNEndpointReconfigurer).
+ // Notify roam handlers so they can re-race candidates
+ // if the network change made the current live endpoint
+ // unreachable.  Legacy single-joiner uses a scalar
+ // controller; joiner-N keys controllers by tunnel id so
+ // each active joiner re-races independently against its
+ // own candidate list.
  activeRoamController?.onNetworkChanged()
+ for (rc in activeJoinerNRoamControllers.values) {
+ rc.onNetworkChanged()
+ }
  }
  }
 
@@ -1553,6 +1565,59 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _tunnels.value = withContext(Dispatchers.IO) { hub.loadTunnels() }
  startThroughputSampler()
  networkChangeMonitor.start()
+ // Per-tunnel RoamController.  Mirrors the legacy
+ // single-joiner wiring at line ~1200 but the
+ // joiner-N path stores one per tunnel id so two
+ // joiners on different underlying networks can
+ // roam independently.
+ activeJoinerNRoamControllers.remove(id)?.stop()
+ activeJoinerNRoamControllers[id] =
+ com.gutschke.wgrtc.signalling.RoamController(
+ tunnelId = id,
+ controller = controller,
+ runner = runner,
+ candidateProvider = {
+ val cached = hub.latestCandidates(id)
+ if (cached.isNotEmpty()) cached
+ else parseLiteralEndpointAsCandidate(
+ _tunnels.value
+ .firstOrNull { it.id == id }
+ ?.configText ?: t.configText
+ )?.let { listOf(it) } ?: emptyList()
+ },
+ ifaceProvider = {
+ withContext(Dispatchers.IO) {
+ enumerateLocalInterfaces()
+ }
+ },
+ scope = viewModelScope,
+ onResult = { result ->
+ when (result) {
+ is ConnectAttemptResult.Success -> {
+ Log.i("wgrtc-vm",
+ "roam: joiner-N $id re-race succeeded on " +
+ "${result.finalEndpoint.ip}:" +
+ "${result.finalEndpoint.port} " +
+ "(egress=${result.egressInterface
+ ?: "default"})")
+ _liveEndpoints.update { ep ->
+ ep + (id to result.finalEndpoint)
+ }
+ }
+ is ConnectAttemptResult.Failed ->
+ Log.w("wgrtc-vm",
+ "roam: joiner-N $id re-race failed " +
+ "(${result.reason})")
+ }
+ },
+ logger = com.gutschke.wgrtc.signalling.RoamLogger { level, msg ->
+ when (level) {
+ 'W' -> Log.w("wgrtc-roam", msg)
+ 'D' -> Log.d("wgrtc-roam", msg)
+ else -> Log.i("wgrtc-roam", msg)
+ }
+ },
+ ).also { it.startPolling() }
  }
  is ConnectAttemptResult.Failed -> {
  val tried = r.triedCandidates.size
@@ -1654,6 +1719,10 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  try { it.cancelAndJoin() }
  catch (e: Throwable) { Log.w("wgrtc-vm", "connect cancel failed", e) }
  }
+ // Stop the per-tunnel roam controller before service-side
+ // teardown so its in-flight re-race (if any) doesn't see a
+ // freshly-removed joiner.
+ activeJoinerNRoamControllers.remove(tunnelId)?.stop()
  activeJoinerNBinding?.let { binding ->
  try { withContext(Dispatchers.IO) { binding.service.removeJoiner(tunnelId) } }
  catch (t: Throwable) {
