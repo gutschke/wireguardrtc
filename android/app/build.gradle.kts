@@ -169,6 +169,11 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.junit4)
     androidTestImplementation(libs.kotlinx.coroutines.test)
+    // UI Automator drives the system VPN-consent dialog from inside
+    // instrumented tests. Without this, tests that exercise a
+    // VpnService.Builder.establish() path have to skip on a clean
+    // device (Android 14+ ignores `appops set ACTIVATE_VPN allow`).
+    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
 }
 
 // Belt-and-suspenders gate for the agent buildType: the source-set

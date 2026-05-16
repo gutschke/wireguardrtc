@@ -10,6 +10,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.gutschke.wgrtc.data.Cidr
 import com.gutschke.wgrtc.data.JoinerNController
+import com.gutschke.wgrtc.testing.VpnConsentHelper
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -62,15 +63,20 @@ class JoinerNVpnServiceInstrumentedTest {
 
     @Before
     fun grantVpnConsentBestEffort() {
-        // The appops set is INEFFECTIVE on Android 14+ (consent
-        // model changed) but harmless on earlier APIs. Still call
-        // it as a documentation hint of intent + so older builds
-        // keep working.  On API 34+ the user must tap the dialog
-        // manually once per applicationId.
+        // Two layers because neither alone is sufficient on every
+        // Android version we ship to:
+        //   - `appops set ACTIVATE_VPN allow` is enough on API <= 33
+        //     but ineffective on API 34+ (the consent model moved
+        //     into ConnectivityService).
+        //   - UI Automator drives the system consent dialog on
+        //     API 34+. It's a no-op on earlier APIs where appops
+        //     already granted access (the prepare() check returns
+        //     null and the helper short-circuits).
         val auto = InstrumentationRegistry.getInstrumentation().uiAutomation
         auto.executeShellCommand(
             "appops set com.gutschke.wgrtc.debug ACTIVATE_VPN allow"
         ).close()
+        VpnConsentHelper.grantConsentIfNeeded(ctx)
     }
 
     @After
