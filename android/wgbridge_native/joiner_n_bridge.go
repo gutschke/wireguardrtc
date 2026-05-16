@@ -46,7 +46,6 @@ import (
 	"os"
 	"sync"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -250,7 +249,19 @@ func openJoinerBridge(
 	}
 	link := newSharedNicLink(ss, nicID, ep, mtu)
 	logger := makeWgLogger()
-	dev := device.NewDevice(link, conn.NewDefaultBind(), logger)
+	// MUST use newJoinerBind() (the Android-aware protect-aware
+	// Bind), not conn.NewDefaultBind() — otherwise wireguard-go's
+	// outbound UDP socket is subject to VpnService routing on
+	// Android, and a full-tunnel config (AllowedIPs = 0.0.0.0/0,
+	// ::/0) routes wg-go's *own* handshakes back through tun0.
+	// First handshake usually squeaks through during the
+	// route-install race; everything after gets caught in the
+	// loop and silently fails.  The legacy single-joiner path
+	// (api.go:wgbridgeNewWithTunFd) already uses newJoinerBind();
+	// joiner-N regressed here when D4.J1 wired in the shared
+	// stack.  Real-device-reproducible on ChromeOS ARC over a
+	// cellular hotspot with a full-tunnel imported wg-quick.
+	dev := device.NewDevice(link, newJoinerBind(), logger)
 	if err := dev.Up(); err != nil {
 		_ = link.Close() // also detaches the NIC
 		return 0, 0, fmt.Errorf("device.Up: %w", err)
