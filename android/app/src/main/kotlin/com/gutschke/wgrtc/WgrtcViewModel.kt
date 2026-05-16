@@ -7,8 +7,12 @@ import androidx.lifecycle.viewModelScope
 import com.gutschke.wgrtc.data.ActiveTunnelTracker
 import com.gutschke.wgrtc.data.HostModeFactory
 import com.gutschke.wgrtc.data.HostModeReconfigurer
+import com.gutschke.wgrtc.data.JoinerNController
+import com.gutschke.wgrtc.data.JoinerNEndpointReconfigurer
+import com.gutschke.wgrtc.data.JoinerNVpnBinding
 import com.gutschke.wgrtc.data.JoinerVpnBinding
 import com.gutschke.wgrtc.data.JoinerVpnConfig
+import com.gutschke.wgrtc.data.bindJoinerNVpnService
 import com.gutschke.wgrtc.data.ThroughputStats
 import com.gutschke.wgrtc.data.WgBridgeTunnelEndpointController
 import com.gutschke.wgrtc.data.bindJoinerVpnService
@@ -106,6 +110,25 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  @Volatile
  private var activeJoinerBinding: JoinerVpnBinding? = null
 
+ /**
+  * Joiner-N shared VpnService binding. Held across multiple
+  * joiner add/remove cycles — the kernel TUN survives those
+  * swaps. Null whenever the joiner-N set is empty.
+  * Gated by [SettingsStore.joinerNEnabled]; the legacy
+  * single-joiner path uses [activeJoinerBinding] above.
+  */
+ @Volatile
+ private var activeJoinerNBinding: JoinerNVpnBinding? = null
+
+ /** Tunnel ids currently routed through the joiner-N shared
+  * stack. Independent of [_activeJoinerTunnelId] — the two
+  * are mutually exclusive in practice (the user toggles a
+  * single flag) but the union ([activeTunnelIds]) is what
+  * the UI reads. */
+ private val _activeJoinerNTunnelIds = MutableStateFlow<Set<String>>(emptySet())
+ val activeJoinerNTunnelIds: StateFlow<Set<String>> =
+  _activeJoinerNTunnelIds.asStateFlow()
+
  /** State string ("DOWN", "UP", "TOGGLE", "FAILED", …) for the live tunnel. */
  private val _liveState = MutableStateFlow("DOWN")
  val liveState: StateFlow<String> = _liveState.asStateFlow()
@@ -138,12 +161,14 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  ActiveTunnelTracker.combinedFlow(
  joiner = _activeJoinerTunnelId,
  host = WgrtcApp.instance.hostModeBackend.activeTunnelIds,
+ joinerN = _activeJoinerNTunnelIds,
  ).stateIn(
  viewModelScope,
  SharingStarted.Eagerly,
  ActiveTunnelTracker.union(
  _activeJoinerTunnelId.value,
  WgrtcApp.instance.hostModeBackend.activeTunnelIds.value,
+ _activeJoinerNTunnelIds.value,
  ),
  )
  }
@@ -342,12 +367,28 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // entered, not joined).  Host tunnels don't need a wake on
  // network change; the daemon-side equivalent is the listener
  // path.
- val id = _activeJoinerTunnelId.value ?: return@NetworkChangeMonitor
- Log.i("wgrtc-vm", "network change → force-wake tunnel $id")
- hub.wake(id, force = true)
+ val singleJoinerId = _activeJoinerTunnelId.value
+ val joinerNIds = _activeJoinerNTunnelIds.value
+ if (singleJoinerId == null && joinerNIds.isEmpty()) {
+ return@NetworkChangeMonitor
+ }
+ singleJoinerId?.let {
+ Log.i("wgrtc-vm", "network change → force-wake tunnel $it")
+ hub.wake(it, force = true)
+ }
+ joinerNIds.forEach {
+ Log.i("wgrtc-vm",
+ "network change → force-wake joiner-N tunnel $it")
+ hub.wake(it, force = true)
+ }
  // also notify the roam handler so it can
  // re-race candidates if the network change made the
  // current live endpoint unreachable.
+ // RoamController is single-joiner only; joiner-N's
+ // listener-driven endpoint rewrite path catches the
+ // network change indirectly (the wake above triggers a
+ // fresh OFFER, which fires endpointUpdates, which
+ // reconfigures via JoinerNEndpointReconfigurer).
  activeRoamController?.onNetworkChanged()
  }
  }
@@ -429,6 +470,29 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  } catch (t: Throwable) {
  Log.w("wgrtc-vm",
  "live reconfigure after endpoint update failed", t)
+ } finally {
+ reconfiguringTunnelId = null
+ }
+ } else if (_activeJoinerNTunnelIds.value.contains(evt.tunnelId)) {
+ // Joiner-N parallel of the single-joiner reconfigure
+ // above. JoinerNVpnService.reconfigure takes the
+ // tunnel id and the rendered UAPI; the shared stack
+ // re-applies it against the per-slot bridge handle
+ // without rebuilding routes.
+ reconfiguringTunnelId = evt.tunnelId
+ try {
+ activeJoinerNBinding?.service?.let { svc ->
+ withContext(Dispatchers.IO) {
+ svc.reconfigure(
+ evt.tunnelId,
+ WgQuickUapi.render(evt.tunnel.configText),
+ )
+ }
+ }
+ } catch (t: Throwable) {
+ Log.w("wgrtc-vm",
+ "joiner-N reconfigure after endpoint update failed",
+ t)
  } finally {
  reconfiguringTunnelId = null
  }
@@ -999,6 +1063,16 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  "after-wait=${cached.size}entries, " +
  "racing=${candidates.size}: ${candidates.joinToString(",") { "${it.ip}:${it.port}" }}")
  if (candidates.isNotEmpty()) {
+ if (WgrtcApp.instance.settings.joinerNEnabled) {
+ // Joiner-N path: share one VpnService across N
+ // joiners via the userspace gvisor netstack. The
+ // shared binding is cached on the ViewModel; the
+ // first joiner triggers Builder.establish, every
+ // subsequent join re-establishes against the
+ // wider union of addresses + routes.
+ connectViaJoinerN(id, t, candidates)
+ return
+ }
  // Joiner path: bind JoinerVpnService and run the
  // candidate race against wgbridge_native in TUN-fd
  // mode. After the legacy wireguard-android
@@ -1192,6 +1266,10 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
  }
  }
+ if (WgrtcApp.instance.settings.joinerNEnabled) {
+ connectViaJoinerNNoCandidates(id, t)
+ return
+ }
  // No-candidates fallback: bring the joiner up directly via
  // wgbridge_native with the persisted wg-quick text. The
  // peer's `Endpoint = host:port` (or `ip:port`) is forwarded
@@ -1251,8 +1329,9 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  suspend fun disconnect(tunnelId: String) {
  val hostBackend = WgrtcApp.instance.hostModeBackend
  val isJoiner = _activeJoinerTunnelId.value == tunnelId
+ val isJoinerN = _activeJoinerNTunnelIds.value.contains(tunnelId)
  val isHost = hostBackend.activeTunnelIds.value.contains(tunnelId)
- if (!isJoiner && !isHost) {
+ if (!isJoiner && !isJoinerN && !isHost) {
  Log.i("wgrtc-vm", "disconnect($tunnelId): not active, no-op")
  return
  }
@@ -1264,6 +1343,12 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  // ConnectionRunner's delay() / setState calls are
  // cooperatively cancellable.
  tearDownJoinerInternal()
+ }
+ if (isJoinerN) {
+ // Same cancel-then-teardown ordering for the joiner-N
+ // path. The helper handles the empty-set collapse so
+ // the kernel TUN comes down with the last joiner.
+ tearDownJoinerNInternal(tunnelId)
  }
  if (isHost) {
  // Host-side per-tunnel "pause not teardown" — leaves
@@ -1318,6 +1403,17 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  Log.e("wgrtc-vm", "disconnectAll: joiner teardown failed", t)
  }
  }
+ // 1b. Joiner-N — drop every joiner from the shared stack;
+ //     the last removeJoiner collapses the binding via the
+ //     helper's empty-set guard.
+ val joinerNSnapshot = _activeJoinerNTunnelIds.value.toList()
+ for (id in joinerNSnapshot) {
+ try { tearDownJoinerNInternal(id) }
+ catch (t: Throwable) {
+ Log.e("wgrtc-vm",
+ "disconnectAll: joiner-N teardown of $id failed", t)
+ }
+ }
  // 2. Host slots — full JNI close, not pause.
  try {
  WgrtcApp.instance.hostModeBackend.teardownAll()
@@ -1367,6 +1463,201 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _throughput.update { it - joinerId }
  _peerStats.update { it - joinerId }
  }
+
+ /** Joiner-N candidate-race connect. Mirrors the legacy
+  * single-joiner path at the same call-site, but talks to the
+  * shared [JoinerNVpnService] instead of [JoinerVpnService]
+  * and tracks state in [_activeJoinerNTunnelIds].
+  *
+  * RoamController is NOT wired into the joiner-N path yet —
+  * listener-driven endpoint rewrites still work (via the
+  * `endpointUpdates` collector below, which routes through
+  * [JoinerNEndpointReconfigurer]), but a mid-tunnel network
+  * change won't auto re-race candidates. Acceptable for the
+  * opt-in first cut. */
+ private suspend fun connectViaJoinerN(
+ id: String,
+ t: Tunnel,
+ candidates: List<EndpointUpdate>,
+ ) {
+ val binding = ensureJoinerNBinding()
+ val service = binding.service
+ val parsed = try { JoinerVpnConfig.parse(t.configText) }
+ catch (e: Throwable) {
+ maybeUnbindJoinerN(binding)
+ throw e
+ }
+ val cfg = buildJoinerNConfig(id, t.configText, parsed)
+ try {
+ withContext(Dispatchers.IO) { service.addJoiner(cfg) }
+ } catch (e: Throwable) {
+ maybeUnbindJoinerN(binding)
+ throw e
+ }
+ // From this point forward, a failure must call removeJoiner
+ // for this id; the helper below collapses the binding when
+ // we drop the last joiner.
+ val reconfigurer = JoinerNEndpointReconfigurer(service, id)
+ val controller: com.gutschke.wgrtc.signalling.TunnelEndpointController =
+ WgBridgeTunnelEndpointController(reconfigurer, hub)
+ val probe = com.gutschke.wgrtc.signalling.RealUdpProbe(
+ protector = com.gutschke.wgrtc.signalling.SocketProtector { s ->
+ service.protect(s)
+ },
+ )
+ val runner = ConnectionRunner(controller, probe = probe)
+ val ifaces = withContext(Dispatchers.IO) { enumerateLocalInterfaces() }
+ val r = runner.connect(
+ tunnelId = id,
+ candidates = candidates,
+ localInterfaces = ifaces,
+ strictHotspot = false,
+ baselineHandshakeMs = 0L,
+ )
+ when (r) {
+ is ConnectAttemptResult.Success -> {
+ Log.i("wgrtc-vm",
+ "connect: joiner-N race succeeded on " +
+ "${r.finalEndpoint.ip}:${r.finalEndpoint.port} " +
+ "(egress=${r.egressInterface ?: "default"}, " +
+ "wait=${r.handshakeWaitMs}ms)")
+ _activeJoinerNTunnelIds.update { it + id }
+ _liveState.value = "UP"
+ _liveEndpoints.update { it + (id to r.finalEndpoint) }
+ _lastError.value = null
+ _tunnels.value = withContext(Dispatchers.IO) { hub.loadTunnels() }
+ startThroughputSampler()
+ networkChangeMonitor.start()
+ }
+ is ConnectAttemptResult.Failed -> {
+ val tried = r.triedCandidates.size
+ val msg = when {
+ r.strictModeBlocked && tried > 1 ->
+ "Local connection failed (strict-hotspot " +
+ "mode refused to fall back to public IP)"
+ r.strictModeBlocked ->
+ "Local connection failed: server's LAN " +
+ "address is unreachable from this network."
+ else -> "All $tried candidate(s) failed: ${r.reason}"
+ }
+ Log.w("wgrtc-vm", "connect race failed (joiner-N): $msg")
+ _lastError.value = msg
+ try { withContext(Dispatchers.IO) { service.removeJoiner(id) } }
+ catch (_: Throwable) {}
+ maybeUnbindJoinerN(binding)
+ throw RuntimeException(msg)
+ }
+ }
+ }
+
+ /** Joiner-N no-candidates fallback — bring the joiner up with
+  * the persisted wg-quick text. Mirrors the legacy fallback at
+  * the bottom of [connect] but routes through the shared
+  * service. */
+ private suspend fun connectViaJoinerNNoCandidates(id: String, t: Tunnel) {
+ val binding = ensureJoinerNBinding()
+ val service = binding.service
+ val parsed = try { JoinerVpnConfig.parse(t.configText) }
+ catch (e: Throwable) {
+ maybeUnbindJoinerN(binding)
+ throw e
+ }
+ val cfg = buildJoinerNConfig(id, t.configText, parsed)
+ try {
+ withContext(Dispatchers.IO) { service.addJoiner(cfg) }
+ } catch (e: Throwable) {
+ maybeUnbindJoinerN(binding)
+ throw e
+ }
+ _activeJoinerNTunnelIds.update { it + id }
+ _liveState.value = "UP"
+ _lastError.value = null
+ startThroughputSampler()
+ networkChangeMonitor.start()
+ }
+
+ /** If the joiner-N active set is empty, drop the binding (the
+  * shared stack is fully torn down by [JoinerNVpnService.stopAll],
+  * but the binding itself still keeps the service process pinned).
+  * Called only from the error paths in [connectViaJoinerN] /
+  * [connectViaJoinerNNoCandidates] — the success-then-disconnect
+  * path goes through [tearDownJoinerNInternal] which has its own
+  * empty-set guard. */
+ private fun maybeUnbindJoinerN(binding: JoinerNVpnBinding) {
+ if (_activeJoinerNTunnelIds.value.isEmpty()) {
+ binding.unbind()
+ if (activeJoinerNBinding === binding) {
+ activeJoinerNBinding = null
+ }
+ }
+ }
+
+ /** Drop one joiner from the joiner-N shared stack. When the set
+  * becomes empty, also stop the service and unbind so the kernel
+  * TUN goes away. Mirrors [tearDownJoinerInternal] but for the
+  * N-set rather than the single slot. Safe to call for ids not in
+  * the set (no-op). Called from [disconnect] when the flag-ON
+  * path was used, and from the connect-failure paths below. */
+ private suspend fun tearDownJoinerNInternal(tunnelId: String) {
+ if (!_activeJoinerNTunnelIds.value.contains(tunnelId)) return
+ // Cancel any in-flight connect that targets this id so the
+ // disconnect's removeJoiner is the last service mutation,
+ // not racing the next setEndpoint of an unfinished race.
+ connectJob?.let {
+ try { it.cancelAndJoin() }
+ catch (e: Throwable) { Log.w("wgrtc-vm", "connect cancel failed", e) }
+ }
+ connectJob = null
+ activeJoinerNBinding?.let { binding ->
+ try { withContext(Dispatchers.IO) { binding.service.removeJoiner(tunnelId) } }
+ catch (t: Throwable) {
+ Log.w("wgrtc-vm", "joiner-N removeJoiner($tunnelId) failed", t)
+ }
+ }
+ _activeJoinerNTunnelIds.update { it - tunnelId }
+ _throughput.update { it - tunnelId }
+ _peerStats.update { it - tunnelId }
+ _liveEndpoints.update { it - tunnelId }
+ if (_activeJoinerNTunnelIds.value.isEmpty()) {
+ networkChangeMonitor.stop()
+ activeJoinerNBinding?.let { binding ->
+ try { withContext(Dispatchers.IO) { binding.service.stopAll() } }
+ catch (t: Throwable) {
+ Log.e("wgrtc-vm", "joiner-N stopAll failed", t)
+ }
+ binding.unbind()
+ activeJoinerNBinding = null
+ }
+ }
+ }
+
+ /** Acquire (or reuse) the joiner-N service binding. The shared
+  * stack survives across joiner add/remove cycles, so callers
+  * stash the binding here once and use the same handle for every
+  * subsequent join. */
+ private suspend fun ensureJoinerNBinding(): JoinerNVpnBinding {
+ activeJoinerNBinding?.let { return it }
+ val app = getApplication<android.app.Application>().applicationContext
+ val binding = bindJoinerNVpnService(app)
+ activeJoinerNBinding = binding
+ return binding
+ }
+
+ /** Convert one parsed wg-quick + tunnel id into a JoinerConfig
+  * the [JoinerNController] can swallow. */
+ private fun buildJoinerNConfig(
+ id: String,
+ configText: String,
+ parsed: JoinerVpnConfig,
+ ): JoinerNController.JoinerConfig =
+ JoinerNController.JoinerConfig(
+ tunnelId = id,
+ addresses = parsed.addresses,
+ routes = parsed.routes,
+ mtu = parsed.mtu,
+ wgQuickUapi = WgQuickUapi.render(configText),
+ dnsServers = parsed.dnsServers,
+ )
 
  // ---------------------------- HostModeReconfigurer
 
