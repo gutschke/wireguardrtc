@@ -1458,6 +1458,14 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  //    empty; the sampler also writes empty maps before its
  //    job is canceled, which would wake any per-id throughput
  //    subscribers with null exactly once.
+ // 4. Sweep orphaned joiner-N roam controllers — the per-id
+ //    tearDown loop above removes the ones associated with
+ //    active tunnels, but a future bug (a controller created
+ //    without a corresponding _activeJoinerNTunnelIds entry,
+ //    for instance) would otherwise leave it polling forever.
+ //    Cheap belt-and-braces.
+ for (rc in activeJoinerNRoamControllers.values) rc.stop()
+ activeJoinerNRoamControllers.clear()
  _throughput.value = emptyMap()
  _peerStats.value = emptyMap()
  if (activeTunnelIds.value.isEmpty()) {
@@ -1500,12 +1508,13 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
   * shared [JoinerNVpnService] instead of [JoinerVpnService]
   * and tracks state in [_activeJoinerNTunnelIds].
   *
-  * RoamController is NOT wired into the joiner-N path yet —
-  * listener-driven endpoint rewrites still work (via the
-  * `endpointUpdates` collector below, which routes through
-  * [JoinerNEndpointReconfigurer]), but a mid-tunnel network
-  * change won't auto re-race candidates. Acceptable for the
-  * opt-in first cut. */
+  * On success this also constructs a per-tunnel
+  * [com.gutschke.wgrtc.signalling.RoamController] and stores it
+  * in [activeJoinerNRoamControllers] so the active joiner re-
+  * races candidates in place when the phone's underlying
+  * network changes. The listener-driven endpoint-rewrite path
+  * still works in parallel for the case where the daemon
+  * volunteers a fresh OFFER. */
  private suspend fun connectViaJoinerN(
  id: String,
  t: Tunnel,
@@ -1632,6 +1641,12 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
  Log.w("wgrtc-vm", "connect race failed (joiner-N): $msg")
  _lastError.value = msg
+ // Belt-and-braces — the controller is only ever
+ // created in the Success branch above, so this is
+ // a defensive no-op today. Keeps the map consistent
+ // if a future refactor ever moves controller
+ // creation earlier.
+ activeJoinerNRoamControllers.remove(id)?.stop()
  try { withContext(Dispatchers.IO) { service.removeJoiner(id) } }
  catch (_: Throwable) {}
  maybeUnbindJoinerN(binding)
