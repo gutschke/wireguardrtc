@@ -55,7 +55,14 @@ fun HostModeSetupScreen(
     vm: WgrtcViewModel = viewModel(),
 ) {
     val tunnels by vm.tunnels.collectAsState()
-    val defaultName = remember(tunnels.size) { vm.defaultName() }
+    // §11.9 — host-specific placeholder ("Host 1", "Host 2", …)
+    // distinguishes itself from generic "tunnel-N" used for joiner
+    // imports.  Re-key on the full name SET so an in-flight rename
+    // (e.g. user opens this screen, switches to TunnelList, renames
+    // existing "tunnel-3" to "Host 1", returns) invalidates the
+    // placeholder and re-derives the next free suffix.
+    val nameKey = tunnels.map { it.name }
+    val defaultName = remember(nameKey) { vm.defaultHostName() }
     val settings = remember {
         com.gutschke.wgrtc.WgrtcApp.instance.settings.snapshot()
     }

@@ -808,7 +808,13 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  WgAllowedIps.canonicalize(it)
  }?.ifBlank { null }
  val t = HostModeFactory.newTunnel(
- name = name.ifBlank { defaultName() },
+ // §11.9 — host tunnels fall back to defaultHostName so a
+ // blank user input becomes "Host N", matching the
+ // HostModeSetupScreen placeholder.  defaultName() ("tunnel-N")
+ // was wrong here for the host-mode flow: it ignored the
+ // host-specific namespace the placeholder was already
+ // promising.
+ name = name.ifBlank { defaultHostName() },
  subnet = subnet,
  hostIp = hostIp,
  listenPort = listenPort,
@@ -1018,11 +1024,25 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * The fallback name [addLegacyTunnel] / [enrollAndAdd] would give
  * a tunnel if the caller passed an empty name. Public so the add
  * screens can show it as a placeholder ("leave blank → tunnel-N").
+ *
+ * Finds the smallest N such that "tunnel-N" doesn't collide with
+ * an existing tunnel's name.  size+1 was wrong: after deletes the
+ * counter rewinds and overlaps with an existing tunnel.
  */
- fun defaultName(): String {
- val n = _tunnels.value.size + 1
- return "tunnel-$n"
- }
+ fun defaultName(): String =
+ com.gutschke.wgrtc.data.nextAvailableTunnelName(
+ _tunnels.value.map { it.name }, prefix = "tunnel")
+
+ /**
+ * Host-mode variant of [defaultName].  §11.9 — host tunnels should
+ * have a host-specific default so two never-named hosts don't end
+ * up with identical-looking generic names.  "Host 1" / "Host 2"
+ * is short and the suffix carries enough information to
+ * disambiguate at a glance.
+ */
+ fun defaultHostName(): String =
+ com.gutschke.wgrtc.data.nextAvailableTunnelName(
+ _tunnels.value.map { it.name }, prefix = "Host", separator = " ")
 
  // ---------------------------------------------------------- Connect/Disconnect
 
