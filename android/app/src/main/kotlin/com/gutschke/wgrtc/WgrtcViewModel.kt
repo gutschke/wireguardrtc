@@ -638,6 +638,31 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * want to rename should keep using [renameTunnel] — it skips the
  * disconnect + reconcile dance.
  */
+ /**
+ * Update [Tunnel.relayPolicy] without bouncing the tunnel.
+ * Targeted entrypoint for the §2.3 banner — the heavier
+ * [updateTunnel] disconnects + reconciles, which would defeat
+ * the "no DOWN→UP cycle" promise of §2.4.
+ *
+ * Synchronous: writes the new value to memory, persists to
+ * disk on the IO dispatcher, then nudges [HostModeBackend] to
+ * register or unregister with the cascade ferry as appropriate.
+ */
+ fun setRelayPolicy(tunnelId: String, policy: com.gutschke.wgrtc.data.RelayPolicy) {
+ val all = _tunnels.value.map {
+ if (it.id == tunnelId) it.copy(relayPolicy = policy) else it
+ }
+ _tunnels.value = all
+ val updated = all.firstOrNull { it.id == tunnelId } ?: return
+ viewModelScope.launch(Dispatchers.IO) {
+ hub.saveTunnels(all)
+ }
+ // Sync — cascade-registry mutation is JNI but fast (1-5 ms
+ // per the design's feasibility note), and the user
+ // expects the row to react immediately to their tap.
+ WgrtcApp.instance.hostModeBackend.reevaluateCascade(updated)
+ }
+
  suspend fun updateTunnel(updated: Tunnel): Boolean {
  // Validate config text up front — abort cleanly if the user
  // pasted broken text rather than partially apply.

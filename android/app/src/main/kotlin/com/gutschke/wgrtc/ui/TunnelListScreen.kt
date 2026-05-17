@@ -26,7 +26,9 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -141,6 +143,13 @@ fun TunnelListScreen(
                 EmptyState(onAddClick)
             } else {
                 Spacer(Modifier.height(4.dp))
+                // CASCADE-2 §2.3 banner eligibility — surfaced once
+                // per host tunnel that's actively running while at
+                // least one joiner is connected.  Empty when no host
+                // is in Ask state.
+                val activeJoinerCount = tunnels.count { t ->
+                    t.source != Tunnel.Source.HOST_MODE && activeIds.contains(t.id)
+                }
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     items(tunnels, key = { it.id }) { t ->
                         TunnelCard(
@@ -152,6 +161,17 @@ fun TunnelListScreen(
                                 if (wantUp) connect(t.id) else disconnect(t.id)
                             },
                         )
+                        if (t.source == Tunnel.Source.HOST_MODE &&
+                            t.relayPolicy == com.gutschke.wgrtc.data.RelayPolicy.Ask &&
+                            activeIds.contains(t.id) &&
+                            activeJoinerCount > 0
+                        ) {
+                            CascadeAskBanner(
+                                hostName = t.name,
+                                onAllow = { vm.setRelayPolicy(t.id, com.gutschke.wgrtc.data.RelayPolicy.Always) },
+                                onBlock = { vm.setRelayPolicy(t.id, com.gutschke.wgrtc.data.RelayPolicy.Never) },
+                            )
+                        }
                     }
                 }
             }
@@ -346,6 +366,61 @@ private fun NetworkBlockedBanner() {
         }
     }
     Spacer(Modifier.height(12.dp))
+}
+
+/**
+ * §2.3 cascade-eligibility banner.  Renders under a host tunnel
+ * row whose `relayPolicy == Ask` while at least one joiner tunnel
+ * is connected.  Two buttons:
+ *
+ *  - **Allow** writes `relayPolicy = Always`; cascade auto-installs
+ *    for this host and any current/future Connected joiner.
+ *  - **Block** writes `relayPolicy = Never`; cascade routes for
+ *    this host stay torn down even when a cascade-eligible joiner
+ *    is up.
+ *
+ *  Fail-safe: ignoring the banner equals Block until the user
+ *  decides — `relayPolicy=Ask` blocks cascade in
+ *  [HostModeBackend.start].  The banner sticks around until the
+ *  user picks; it dismisses itself only after a policy is set.
+ *
+ *  Round-2 amendment A4 resolution: decision is per-host (not
+ *  per-(host, joiner) pair); we never re-prompt for a new joiner.
+ *  See `docs/ux-design-v2.md` §2.4.
+ */
+@Composable
+private fun CascadeAskBanner(
+    hostName: String,
+    onAllow: () -> Unit,
+    onBlock: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Allow $hostName to relay through your other tunnels?",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Devices on $hostName could reach networks your " +
+                    "currently-connected outbound tunnels cover.  " +
+                    "If you don't want them to, leave this blocked.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Block on the left = LTR-prominent fail-safe default.
+                OutlinedButton(onClick = onBlock) { Text("Block") }
+                Button(onClick = onAllow) { Text("Allow") }
+            }
+        }
+    }
 }
 
 @Composable
