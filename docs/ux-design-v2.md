@@ -35,6 +35,45 @@ accidental relay on CASCADE-2 regressions" gets a structural answer in §13.
 
 ---
 
+## Round-3 amendments (applied 2026-05-17)
+
+The round-2 critic returned **ship-with-amendments** with three must-fixes
+(A1, A2, A4) and two questions for the maintainer.  Both questions are
+answered in-doc:
+
+**Q1: Is `OfferListenerService` allowed to call `VpnService.prepare()`?**
+**Yes** — for detection.  A `Service` cannot launch the consent UI (an
+`Activity` startActivityForResult is required), but `prepare()` itself is a
+static call that returns either `null` (consent granted) or an `Intent`
+(consent missing).  We only need the latter signal; we don't try to launch
+the Intent from the service.  See §1.2 row 4 (new) and §6.1 step 4 (new).
+
+**Q2: `relayPolicy` per-host or per-(host, joiner)?**  **Per-host.**  Matches
+the §2 prose and §9.7's earlier answer.  §2.4's re-prompt-per-new-joiner
+clause is removed; one decision applies to the host tunnel and persists
+across joiner appearances.  Users wanting per-pair granularity split into
+two host tunnels with disjoint enrolled-peer sets.
+
+**Must-fixes applied**:
+
+- **A1** (§1.2 row 4 + §6.1 step 4): periodic `OfferListenerService`
+  re-`prepare()` via WorkManager catches the phantom-active window for users
+  who never re-foreground the app.
+- **A2** (§12): `TunnelIntent` enumerated as `NoIntentYet | WantsOn |
+  ExplicitlyOff`; preserves `Disabled` vs. `Paused (user)` across reboot.
+- **A4** (§2.4): re-prompt-per-new-joiner clause dropped; one policy
+  per-host.
+
+**Should-fixes** (A3, A5) noted as follow-up:
+
+- **A3** — `Pairing` failure split: SAS-mismatch/timeout → `Failed
+  (recoverable)`; user-cancel / code-expired → `Failed (permanent)`.  Will
+  land with the §11.1 implementation work.
+- **A5** — `K_CASCADE_FORCED_OFF` hidden Settings long-press for release
+  builds.  Will land with the §11.3 (`relayPolicy`) implementation work.
+
+---
+
 ## 0. One-paragraph thesis
 
 The current app exposes WireGuard's mental model: a tunnel is a config object, with
@@ -102,6 +141,7 @@ a never-asked-for tunnel reads off.
 | `builder.establish()` returns null | `JoinerVpnService.kt:108-110`, `JoinerNVpnService.kt` analogue | All joiners → `Paused (system)`. **This is the ground-truth signal for permission revocation** — both the "user toggled VPN permission off in Settings" and "force-stopped" cases are caught here on the next connect attempt. |
 | `VpnService.onRevoke()` callback | new override on `JoinerNVpnService` | All joiners under this service → `Paused (system)`. Covers only the "another VPN app took over" case; covers it cheaply. **Not** sufficient on its own (does not fire on Settings-revoke or force-stop). |
 | `MainActivity.onResume()` → re-`VpnService.prepare()` | Activity-scope foreground hook | If `prepare()` returns a non-null consent Intent while any joiner row was previously rendered Connected, transition all joiners to `Paused (system)` immediately. Catches the Settings-revoke case at the next foreground without waiting for the user to tap Reconnect. |
+| `OfferListenerService` low-cadence re-`VpnService.prepare()` | new — WorkManager `PeriodicWorkRequest` @ 30 min, gated on ≥ 1 joiner with `intent=WantsOn` | A `Service` may call `VpnService.prepare()` to **detect** consent loss (it can't launch the consent UI — that's Activity-only — but a non-null-Intent return value is the signal we need). Catches the phantom-active scenario where the user never re-foregrounds the app for hours/days. Skipped when no joiner intends to be on. |
 | `lastHandshakeTime` poll @ 1 s | `WgrtcViewModel.kt:1868` (already exists) | Connecting → Connected on first non-zero handshake; Connected → Idle after `HANDSHAKE_STALE_SEC = 180` (this is `RejectAfterTime` in the WG state machine, **not** RekeyAttemptTime). |
 | Outbound packet observed on gvisor write side | host_forwarder / joiner channel.Endpoint Write callback | Idle → Connecting. Re-uses the existing per-NIC packet counter; threshold = "any non-zero delta since last poll". |
 | Endpoint reconfigure (signaling delivered a new endpoint) | offer-listener | Idle → Connecting if currently Idle; also clears Degraded. |
@@ -114,20 +154,18 @@ a never-asked-for tunnel reads off.
 
 ### 1.3 Two invariants
 
-**Invariant 1: the ViewModel is downstream of the service, never upstream of it.**
-Today, `_activeJoinerNTunnelIds` is a `MutableStateFlow` mutated by the UI when the
-user taps Connect, and *also* read by the UI to draw the row. When the system revokes
-consent, the service dies but the flow never gets updated. We invert this: the
-service owns a `TunnelStateRegistry` (process-wide, in-memory, rebuilt from UAPI on
-service start), and the ViewModel **only reads** from it. The Connect button posts a
-command to the service; the service mutates the registry; the registry emits; the UI
-redraws.
+**Invariant 1: ViewModel downstream of service, never upstream.** Today,
+`_activeJoinerNTunnelIds` is a `MutableStateFlow` mutated by the UI on Connect
+*and* read by the UI to draw the row. When the system revokes consent the
+service dies but the flow doesn't update. Inverted: the service owns a
+`TunnelStateRegistry` (process-wide, rebuilt from UAPI on service start) and
+the ViewModel **only reads**. Connect posts a command; service mutates the
+registry; registry emits; UI redraws.
 
-**Invariant 2: state is derived, not stored.** `Connected` is the result of
-`lastHandshakeTime > now - 180s AND service.bridgeAlive(id) AND !consentRevoked(id)`.
-If any flips, the derived state flips on the next emission. The emission cadence is
-1 s today (`WgrtcViewModel.kt:1868`) — the design accepts that worst-case state
-freshness is ~1 s and does not try to make derivation packet-synchronous.
+**Invariant 2: state is derived, not stored.** `Connected = lastHandshakeTime
+> now - 180s AND service.bridgeAlive(id) AND !consentRevoked(id)`. Emission
+cadence is 1 s (`WgrtcViewModel.kt:1868`); worst-case freshness ~1 s. No
+attempt to make derivation packet-synchronous.
 
 ### 1.4 FGS notification while every tunnel is paused
 
@@ -185,12 +223,11 @@ leaking through host_forwarder's catchall.
 ### 2.2 Why not a toggle
 
 A toggle requires the user to know what cascade is, that they want it, and to
-revisit Settings whenever they add a new tunnel. The brief's pain point #1 is
-real. Three costs paid every install; benefit zero in the simple-joiner case
-(majority). The critic conceded this in Win #1 and we keep the argument intact.
+revisit Settings on every new tunnel. Three costs paid every install; benefit
+zero in the simple-joiner majority. The critic conceded this in Win #1.
 
-The toggle is replaced by per-tunnel `relayPolicy: Always | Never | Ask`,
-stored on the host tunnel (the side that admits cascade traffic, per §2.1).
+Replaced by per-tunnel `relayPolicy: Always | Never | Ask`, stored on the host
+tunnel (the side that admits cascade traffic, per §2.1).
 
 ### 2.3 Default policy (changed)
 
@@ -223,8 +260,15 @@ only dismissal paths; ignoring is the safe default (fail-safe Block, see §2.3).
 
 With multiple cascade-eligible joiners running (Joiner-N), the banner
 enumerates: "Devices on *Home* could now reach addresses covered by *Work VPN*
-and *Lab Cluster*." A single decision applies to all currently-Connected
-joiners; the next joiner to come up re-prompts.
+and *Lab Cluster*." A single decision applies to the host tunnel and persists
+**per-host** (not per-(host, joiner) pair).  A future joiner that overlaps the
+same host's address space is admitted under the same policy without
+re-prompting — Allow means "allow this host to relay to any joiner that
+covers a destination it admits", Block means "never relay this host".  See
+§9.7: this resolves the round-2 critic's A4 (the v2 draft accidentally
+modelled both per-host and per-pair semantics).  Per-pair granularity (an
+N×M settings surface) is out of scope; users who want it can split into two
+host tunnels with disjoint enrolled-peer sets.
 
 ---
 
@@ -232,29 +276,25 @@ joiners; the next joiner to come up re-prompts.
 
 ### 3.1 Reframing: kill "host" and "joiner" as user-facing words
 
-**Changed since v1:** the row's switch and the alphabet's `Paused (user)` are
-now reconciled. There is exactly one pause-with-intent control: the **switch**.
+**Changed since v1:** the switch and `Paused (user)` reconciled — exactly
+**one** pause-with-intent control (the switch).
 
 Show **Connections**. A Connection has:
 
-- a **name** (user-given or imported from config)
-- a **direction badge** (small icon, not text):
-  - arrow into a phone glyph = inbound (host)
-  - arrow out of a phone glyph = outbound (joiner)
-  - two arrows = bridge (host + cascade-active joiner)
-- a **status pill** drawn from §1's state alphabet, color-coded:
-  - green Connected, gray Idle, amber Degraded/Paused-system, blue Paused-user,
-    red Failed-recoverable, dark red Failed-permanent, neutral Disabled, violet Pairing
-- a **right-side switch** that toggles between Disabled/Paused-user and "user
-  wants this on". The switch is bound to *user intent*. If live state is
-  Paused-system, the switch shows on but the status pill shows the system
-  pause. Tapping the switch off when state is Paused-system writes
-  `intent=off` (the Resume button no longer prompts on reboot).
-- **Tap the row** = navigate to detail. Tap is never a state change — that's
-  the switch's job.
+- a **name** (user-given or imported).
+- a **direction badge** (icon, not text): inbound arrow = host, outbound
+  arrow = joiner, two arrows = bridge.
+- a **status pill** from §1's alphabet, color-coded (green Connected, gray
+  Idle, amber Degraded/Paused-system, blue Paused-user, red
+  Failed-recoverable, dark red Failed-permanent, neutral Disabled,
+  violet Pairing).
+- a **right-side switch** bound to user intent. If live state is
+  Paused-system, switch shows on but pill shows the system pause. Flipping
+  off in Paused-system writes `intent=off` (Resume notification no longer
+  prompts on reboot).
+- **Tap the row** = navigate to detail. Tap is never a state change.
 
-The single control = single semantic resolves the critique's "two pause-with-intent
-semantics on two controls" concern.
+Resolves the critique's "two pause-with-intent semantics on two controls".
 
 ### 3.2 One Bridge, one row — even when it's two backend tunnels
 
@@ -416,11 +456,19 @@ The phantom-active failure is fixed by the combination of:
 3. `MainActivity.onResume()` re-runs `VpnService.prepare()`; if non-null while
    any joiner is "intended on", emit `RevokeEvent(FOREGROUND_RESYNC)`. Catches
    the Settings-revoke case at next foreground without user action.
+4. **`OfferListenerService` periodic re-`prepare()`** (round-2 amendment A1).
+   A WorkManager `PeriodicWorkRequest` @ 30 min cadence, gated on at least one
+   joiner having `intent=WantsOn`. Same detection as (3) but reaches the
+   never-re-foregrounding user — the dominant phantom-active cohort. The
+   service can't launch the consent Intent (that's Activity-only), but the
+   non-null return value of `prepare()` is itself the signal we need. Emits
+   `RevokeEvent(BACKGROUND_RESYNC)`.
 
-**Implementation cost (honest)**: ~120-180 LOC, not "~30 lines". Split across
-the two services (~40 LOC), `MainActivity` (~30), a new `TunnelStateRegistry`
-(~80), and the ViewModel subscription rewrite (~30), plus tests at each layer.
-The v1 estimate was wrong.
+**Implementation cost (honest)**: ~150-220 LOC after A1's WorkManager addition.
+Split across the two services (~40), `MainActivity` (~30), a new
+`TunnelStateRegistry` (~80), WorkManager hook (~20), and the ViewModel
+subscription rewrite (~30), plus tests at each layer. The v1 estimate was
+wrong; v2's was light by ~20-40 LOC.
 
 ### 6.2 The ChromeOS routing-loop case (use case D)
 
@@ -457,150 +505,121 @@ This is the design's highest-confidence single deliverable.
 
 ## 7. *(deleted)*
 
-**Cut since v1.** The §7 "drag-to-bridge" gesture is removed. As the critic
-noted, dragging a joiner onto a joiner can't compose them into a bridge
-(cascade is host→joiner, not joiner↔joiner). Dragging a joiner onto a host
-matches the real direction but the affordance is awkward on phone-class
-hardware (§9.7 open question already admitted that).
+**Cut since v1.** The drag-to-bridge gesture is removed — joiner↔joiner
+composition has no implementation (cascade is host→joiner), and the
+phone-class drag affordance was already weak (v1 §9.7 admitted it).
 
-The replacement: a long-press menu item on each row, **"Bridge with…"**,
-which opens a single-select list of *compatible* tunnels. Compatibility is
-the §2.1 rule applied symbolically — pick a host, the list shows joiners
-whose AllowedIPs would cover at least one of its enrolled-peer destination
-ranges. Pick a joiner, the list shows hosts. Selecting writes a shared
-`groupId` to both, optionally renames them to `Source ↔ Sink`, and the §2.3
-banner fires at the next connection event to confirm the relay decision.
-
-This is the single user gesture that promotes "compose two connections
-into a bridge" to a first-class operation, replacing the deleted drag.
+Replacement: a long-press menu item on each row, **"Bridge with…"**, opening
+a single-select list of compatible tunnels. Compatibility = the §2.1 rule
+applied symbolically (host shows joiners covering at least one of its
+enrolled-peer destinations; joiner shows hosts). Selecting writes a shared
+`groupId`, optionally renames to `Source ↔ Sink`, and the §2.3 banner fires
+at next eligibility.
 
 ---
 
 ## 8. Feasibility check
 
-**Changed since v1:** honest LOC for the §6.1 fix; §6.2 changed from
-"Medium" to "Low" (no JNI work); §3.2 groupId schema cost surfaced at ~50 LOC
-not "minor"; §5.1 onboarding cost surfaced.
+**Changed since v1:** honest LOC for §6.1; §6.2 dropped from Medium to Low
+(no JNI); §3.2 groupId no longer "minor"; §5.1 onboarding cost surfaced.
 
-| Claim | Engineering work | Confidence |
+| Claim | Engineering | Confidence |
 |---|---|---|
-| §1.2 phantom-active fix (3 signals) | ~120-180 LOC across services + Activity + new registry + ViewModel. Tests at each layer. | High; honest size now. |
-| §1.3 derived state from `lastHandshakeTime` | Poll already exists at 1 s. Add `HANDSHAKE_STALE_SEC = 180` (matches `RejectAfterTime`, not RekeyAttemptTime). | High. |
-| §1.4 FGS notification semantics | Modify `OfferListenerService` to compute "any tunnel needs me" predicate and post a paused notification + suspend the WSS read loop when the predicate is false. ~40 LOC. | High. |
-| §2.1 automatic cascade | Already implemented in CASCADE-2; remove the global gate and add per-tunnel `relayPolicy`. | High; the hard part is done. |
-| §2.3 default = Block / Ask-at-first-eligibility | Add `relayPolicy: Ask` to the `Tunnel` data class. Wire the banner on TunnelList rows. ~80 LOC plus persistence migration. | High. |
-| §3.2 single-row Bridge presentation | Add `groupId: UUID?` to `Tunnel`. Migration is one nullable field (the pattern is established — see `Tunnel.kt:34-48` where `subnetV6`, `claimedRoutes`, `brokerWss` were all added the same way). Schema migration ~50 LOC plus tests; ViewModel grouping ~40 LOC; UI rendering ~30 LOC. | High. |
-| §4 transition log + dropped-same-uid units | Ring buffer per tunnel: trivial. The dropped-same-uid counter is already in gvisor `Stats`; we surface it as packets (count, not bytes). | High. |
-| §4 broker URL surfacing | Already in `Tunnel.brokerWss` (`Tunnel.kt:40`); just render. | High. |
-| §4 gvisor route table dump | Needs a new JNI export (no current method dumps routes). Lowest-priority detail field; ships if cheap, otherwise dropped. | Medium; punt. |
-| §5.1 three-tile first run + Tile #3 flow | Replaces `ui/OnboardingScreen.kt`'s three-page pager. 300-500 LOC plus the Bridge flow's two-step wizard. | High but larger than v1 claimed. |
-| §6.1 specific port-conflict cause | `/proc/net/udp` readability lost at API 29. Will ship as "port in use" without naming the holder uid. | Low; concede. |
-| §6.2 routing-loop ChromeOS deep-link | `Settings.ACTION_VPN_SETTINGS` exists; ARC honors it. No JNI work. ~30 LOC. | High. |
-| §7 long-press "Bridge with…" menu | Compose `dropdownMenu` is standard; the compatibility predicate is the §2.1 rule. ~80 LOC. | High. |
+| §1.2 phantom-active fix (3 signals) | ~120-180 LOC across services + Activity + new registry + ViewModel | High |
+| §1.3 derived state @ 1 s | Poll exists; add `HANDSHAKE_STALE_SEC = 180` (`RejectAfterTime`) | High |
+| §1.4 FGS suspend-when-all-paused | ~40 LOC in OfferListenerService | High |
+| §2.1 automatic cascade | CASCADE-2 already implements; remove global gate, add per-tunnel `relayPolicy` | High |
+| §2.3 `Ask`-at-first-eligibility | Add `relayPolicy` to `Tunnel`; wire banner on rows. ~80 LOC + migration | High |
+| §3.2 single-row Bridge + groupId | Add `groupId: UUID?` (pattern established in `Tunnel.kt:34-48`). ~50 LOC schema + ~70 LOC UI | High |
+| §4 transition log + counters | Ring buffer trivial; gvisor stats already exist (surface as packet count) | High |
+| §4 broker URL surface | Already in `Tunnel.brokerWss` (`Tunnel.kt:40`); just render | High |
+| §4 gvisor route table dump | New JNI export needed (no method dumps routes today). Punt. | Medium |
+| §5.1 three-tile first run + Tile #3 | Replaces `OnboardingScreen.kt`'s 3-page pager. 300-500 LOC + wizard | High |
+| §6.1 port-conflict holder uid | `/proc/net/udp` gated at API 29; ship as "port in use" only | Low — concede |
+| §6.2 ChromeOS deep-link | `Settings.ACTION_VPN_SETTINGS` exists, ~30 LOC | High |
+| §7 long-press "Bridge with…" | Compose dropdown, ~80 LOC | High |
 
 ### Things I claim are impossible
 
-(Unchanged from v1 — the critic didn't push on these.)
+Unchanged from v1 — critic didn't push:
 
-- **Reading ChromeOS-native WG client config**: confirmed in the brief, confirmed
-  by our own packet captures. We can warn the user passively (§6.2); we cannot
-  read the config.
-- **Per-joiner VpnService consent**: the brief locks this. UX consequence:
-  consent is a one-shot per applicationId, and once granted, all joiners under
-  that buildType inherit. We surface this honestly in onboarding.
-- **Routing the wgrtc app's own traffic through its own joiner**: Android
-  refuses; the brief is correct. UX consequence: `host_forwarder` traffic
-  visibly skips the joiner. We document this in Detail under "Through:
-  doesn't route through *Work VPN*" with a small info icon.
+- Reading ChromeOS-native WG client config (warn passively only — §6.2).
+- Per-joiner VpnService consent (locked by the brief; consent is one-shot per
+  applicationId).
+- Routing wgrtc's own traffic through its own joiner (Android refuses;
+  `host_forwarder` visibly skips the joiner — documented in detail).
 
 ---
 
 ## 9. Open questions for the reviewer
 
-(Some pruned from v1 — the critique resolved them.)
+Pruned from v1 — several resolved by the critique.
 
-1. **The "Connection" rename.** Does collapsing host/joiner into one noun lose
-   information that power users need? The diagnostic surface still exposes both
-   words.
-2. **§2.3 Ask-at-first-eligibility.** Three-button banner ("Allow once / Allow
-   always / Block always"). Is three buttons too many? The alternative is a
-   two-button "Allow / Block" plus a sticky-dismiss option, but I worry the
-   sticky-dismiss meaning is unclear.
-3. **§3.2 single-row Bridge vs. two rows.** `groupId` discriminator: do users
-   prefer the collapsed view or always-two-rows? Cheap to A/B in debug builds.
-4. **§5.1 Tile-#3 discoverability.** "Bridge two networks" — self-explanatory or
-   does it need a sub-line? ("Share a remote VPN with devices on your local
-   Wi-Fi.")
-5. **State alphabet size.** Nine states now (added `Pairing`). Still too many?
-   `Idle` is the suspicious one — the round-2 design gives it explicit exits,
-   but does the *user* care about the Idle/Connected distinction or only the
-   maintainer?
-6. **Onboarding tile #2 "Share my network".** Most users *should never see this*
-   because the use case is rare and the loop hazards are real. Should it be
-   hidden behind a "More options" gesture?
-7. **The `relay: never` policy.** Per-tunnel or per-(host, joiner) pair?
-   Per-tunnel is in the round-2 design; per-pair is more precise but
-   requires an N×M settings surface.
-8. **Permanent-vs-recoverable failure classification.** `PeerKeyRejected` —
-   permanent or recoverable? `ConsentSilentlyDenied` definitely permanent.
-   The split is judgment; the transition log makes mistakes recoverable.
+1. **The "Connection" rename.** Does collapsing host/joiner lose info power
+   users need? Diagnostic surface still exposes both words.
+2. **§2.3 three-button banner.** Too many choices? Alternative: two buttons
+   plus sticky-dismiss, but the dismiss meaning is unclear.
+3. **§3.2 single-row vs. two rows.** A/B-able in debug builds.
+4. **§5.1 Tile-#3 title.** "Bridge two networks" self-explanatory, or
+   needs a sub-line?
+5. **State alphabet size.** Nine. `Idle` is the suspicious one — round-2
+   gives it explicit exits, but does the *user* care about the Idle/Connected
+   distinction or only the maintainer?
+6. **Onboarding tile #2 "Share my network".** Should it be hidden behind
+   "More options"? The use case is rare; loop hazards are real.
+7. **`relay: never` policy.** Per-tunnel (current design) or per-(host, joiner)
+   pair? Per-pair is more precise; per-tunnel is easier to reason about.
+8. **Permanent vs. recoverable classification.** `PeerKeyRejected` — which?
+   `ConsentSilentlyDenied` is definitely permanent. Judgment call; the
+   transition log makes mistakes recoverable.
 
-*(Cut from v1: §9.5 routing-loop probe latency — moot, no active probe;
-§9.7 drag-to-bridge — cut entirely.)*
+*(v1's §9.5 routing-loop probe latency and §9.7 drag gesture are moot.)*
 
 ---
 
 ## 10. What this design deletes
 
-For the reviewer to push back on, here's what we're proposing to *remove*:
-
+Removed:
 - Global cascade toggle in Settings (`SettingsStore.kt:57-61`, `K_CASCADE_ENABLED`).
-- "Host Mode" as a user-facing concept and the `HostModeSection` composable.
-- Implicit ordering of joiners-then-hosts in TunnelList.
-- The current single-state "active / inactive" boolean mutation pattern in
-  `WgrtcViewModel`'s `_activeJoinerNTunnelIds`.
-- Any UI string containing the words "joiner" or "host" outside the diagnostic fold.
-- The current three-page onboarding pager (`ui/OnboardingScreen.kt`); replaced
-  by the three-tile first run.
-- §7's drag-to-bridge gesture (was: speculative; now: cut).
+- "Host Mode" as a user-facing concept; the `HostModeSection` composable.
+- Implicit joiners-on-top ordering.
+- UI-side mutation of `_activeJoinerNTunnelIds` in `WgrtcViewModel`.
+- "joiner" / "host" strings outside the diagnostic fold.
+- The three-page `OnboardingScreen.kt` pager — replaced by three tiles.
+- §7's drag-to-bridge (cut, not iterated).
 
-What we keep:
-
-- The wormhole pairing flow (it's good and orthogonal). Now explicitly modeled
-  via the `Pairing` state.
-- The QR / paste / manual config paths (folded under Tile #1).
-- The OfferListener foreground notification — but with the §1.4 semantics that
-  let it stand down when no tunnel needs it.
-- The Edit raw config escape hatch (under "technical details").
+Kept:
+- Wormhole pairing flow (now explicitly modeled via `Pairing` state).
+- QR / paste / manual config paths (under Tile #1).
+- OfferListener FGS notification (with §1.4 stand-down semantics).
+- "Edit raw config" escape hatch.
 
 ---
 
 ## 11. Implementation order (rough)
 
-**Changed since v1:** N-host UX surfaced as step 9 per critic's loose end.
+**Changed since v1:** N-host UX added as step 9 per critic's loose end.
 
-1. **Land the state machine + transition log** (incl. `Pairing`). Pure-Kotlin;
-   pure-JVM testable. Don't change any UI yet. Subscribe diagnostic logging to
-   it.
-2. **Wire the three phantom-active signals** through the registry. Phantom-active
-   failure dies.
-3. **Remove the global cascade toggle.** Replace with per-tunnel `relayPolicy`
-   defaulted to `Ask`. Wire §2.3's three-button banner.
-4. **Repaint TunnelList rows.** Direction badges, status pills, no "host" word.
-5. **Repaint TunnelDetail.** Transcript view, broker URL surfaced,
-   §4.1 specific failure messages including `BrokerMissing` and `ConsentSilentlyDenied`.
-6. **Three-tile first run.** Tile #3 is the headline.
-7. **§6.2 passive ChromeOS dialog** + deep-link.
-8. **`groupId` schema migration** + single-row Bridge presentation + long-press
+1. State machine + transition log (incl. `Pairing`). Pure-Kotlin, pure-JVM
+   testable. No UI change yet.
+2. Wire the three §6.1 phantom-active signals through the registry.
+3. Remove the global cascade toggle; add per-tunnel `relayPolicy` defaulted to
+   `Ask`; wire §2.3 banner.
+4. Repaint TunnelList rows (direction badges, status pills, no "host" word).
+5. Repaint TunnelDetail (transcript view, broker URL, §4.1 causes including
+   `BrokerMissing` and `ConsentSilentlyDenied`).
+6. Three-tile first run; Tile #3 headline.
+7. §6.2 passive ChromeOS dialog + deep-link.
+8. `groupId` schema migration; single-row Bridge presentation; long-press
    "Bridge with…" menu.
-9. **N concurrent host tunnels UX.** The current code already supports
-   multiple host bridges (`CascadeWiring` keys host bridges by handle); UX
-   needs: per-host listen-port selection in Tile #2 with a "next available port"
-   default (avoid 51820 collision); naming defaults so two "Home Hosts" don't
-   look identical; per-host `relayPolicy`. The §2.3 banner already enumerates
-   joiners; same enumeration applies host-side.
+9. **N concurrent host tunnels UX.** Backend already supports it
+   (`CascadeWiring` keys hosts by handle). UX needs: per-host listen-port
+   selection in Tile #2 with "next available port" default (avoid 51820
+   collision); name disambiguation so two "Home Hosts" don't render
+   identical; per-host `relayPolicy`. The §2.3 banner enumeration generalises
+   host-side.
 
-Each step is independently shippable. Steps 1–2 alone resolve the most painful
+Each step is independently shippable. Steps 1–2 alone resolve the painful
 brief items.
 
 ---
@@ -620,6 +639,32 @@ Round-2 adds to `Tunnel`:
 val groupId: String? = null,                            // paired-Bridge UUID
 val relayPolicy: RelayPolicy = RelayPolicy.Ask,         // host tunnels only
 val intent: TunnelIntent = TunnelIntent.NoIntentYet,    // last switch position
+```
+
+with these enum shapes (amendment A2 — values explicit so `Disabled` vs.
+`Paused (user)` survives serialisation):
+
+```kotlin
+enum class RelayPolicy { Ask, Always, Never }
+
+enum class TunnelIntent {
+    /** Never asked-for.  Freshly-imported / pre-migration tunnels land
+     *  here.  Maps to `Disabled` in the state machine — switch off,
+     *  status pill "Disabled". */
+    NoIntentYet,
+
+    /** User flipped the switch on.  Maps to whichever live state the
+     *  signal stack derives (Arming / Connecting / Connected / Idle /
+     *  Degraded / Paused (system) / Failed (recoverable | permanent)). */
+    WantsOn,
+
+    /** User flipped the switch off after having it on (or after a
+     *  Paused (system) transition).  Maps to `Paused (user)`.  Sticky
+     *  across reboots; survives upgrades.  Distinct from
+     *  `NoIntentYet` so we don't auto-resume a tunnel the user has
+     *  explicitly paused. */
+    ExplicitlyOff,
+}
 ```
 
 Plus `OfferListenerService.lastActiveSet: Set<String>` for the §1.4 Resume hint.
