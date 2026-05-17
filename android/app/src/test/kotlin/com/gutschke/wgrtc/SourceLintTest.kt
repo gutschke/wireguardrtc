@@ -145,6 +145,73 @@ class SourceLintTest {
 
     // ----- JoinerNVpnService exposes snapshotStats(tunnelId) -----------
 
+    @Test fun `addLegacyTunnel does not silently consume the Bridge flow`() {
+        // §11.6 ambient-context-bug fix: round-2 critic on commit
+        // f21ba653 caught that addLegacyTunnel reading
+        // peekBridgeGroupIdForNewTunnel would stamp ANY paste / QR /
+        // wormhole import while a Bridge wizard happened to be open.
+        // The explicit-API split (addLegacyTunnelInBridgeFlow) is the
+        // fix; pin it so a future "convenience refactor" can't
+        // re-introduce the ambient call.
+        val src = stripKotlinLineComments(
+            read("app/src/main/kotlin/com/gutschke/wgrtc/WgrtcViewModel.kt"))
+        // Locate the body of addLegacyTunnel (the non-bridge entry
+        // point) and assert it doesn't peek the Bridge state.
+        // Method-body slicing on Kotlin source via regex is brittle
+        // in general but this entry point's signature is stable.
+        val legacyBody = Regex(
+            """fun\s+addLegacyTunnel\s*\([^)]*\)\s*:\s*Tunnel\s*\{[\s\S]*?\n\s{1}\}""",
+        ).find(src)?.value
+        assertTrue(legacyBody != null,
+            "couldn't locate addLegacyTunnel body — did the signature change?")
+        assertTrue(
+            !legacyBody!!.contains("peekBridgeGroupIdForNewTunnel"),
+            "addLegacyTunnel must NOT read the Bridge flow state. " +
+                "Tile-#3 wizard should call addLegacyTunnelInBridgeFlow " +
+                "explicitly; ambient-state-read in the shared entry " +
+                "point is the f21ba653-round-2 bug. " +
+                "See docs/ux-design-v2.md §11.6.",
+        )
+        // Positive pin: the explicit wizard entry point exists AND
+        // reads the bridge state.
+        assertTrue(
+            src.contains("fun addLegacyTunnelInBridgeFlow") &&
+                src.contains("peekBridgeGroupIdForNewTunnel"),
+            "addLegacyTunnelInBridgeFlow must exist and read the " +
+                "Bridge flow state.",
+        )
+    }
+
+    @Test fun `addHostModeTunnel does not silently consume the Bridge flow`() {
+        // Symmetric pin to the joiner-side test.  The host-mode
+        // create path has its own non-Bridge call sites (Tile-#2,
+        // imports, replays) and would re-introduce the
+        // ambient-context bug if peekBridgeGroupIdForNewTunnel
+        // leaked back into the shared entry point.
+        val src = stripKotlinLineComments(
+            read("app/src/main/kotlin/com/gutschke/wgrtc/WgrtcViewModel.kt"))
+        val hostBody = Regex(
+            """fun\s+addHostModeTunnel\s*\([\s\S]*?\)\s*:\s*Tunnel\s*\{[\s\S]*?\n\s{1}\}""",
+        ).find(src)?.value
+        assertTrue(hostBody != null,
+            "couldn't locate addHostModeTunnel body — did the signature change?")
+        assertTrue(
+            !hostBody!!.contains("peekBridgeGroupIdForNewTunnel"),
+            "addHostModeTunnel must NOT read the Bridge flow state. " +
+                "Tile-#3 wizard should call addHostModeTunnelInBridgeFlow " +
+                "explicitly; ambient-state-read in the shared entry " +
+                "point is the f21ba653-round-2 bug, symmetric to " +
+                "addLegacyTunnel.",
+        )
+        assertTrue(
+            src.contains("fun addHostModeTunnelInBridgeFlow") &&
+                src.split("addHostModeTunnelInBridgeFlow")[1]
+                    .contains("peekBridgeGroupIdForNewTunnel"),
+            "addHostModeTunnelInBridgeFlow must exist and read the " +
+                "Bridge flow state.",
+        )
+    }
+
     @Test fun `JoinerNVpnService exposes snapshotStats(tunnelId)`() {
         val src = stripKotlinLineComments(
             read("app/src/main/kotlin/com/gutschke/wgrtc/service/JoinerNVpnService.kt"))

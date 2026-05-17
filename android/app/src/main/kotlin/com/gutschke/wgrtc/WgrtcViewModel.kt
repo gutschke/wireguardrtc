@@ -818,10 +818,51 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  return true
  }
 
- /** Add a tunnel from raw wg-quick text. Throws on parse failure. */
+ /** Add a tunnel from raw wg-quick text. Throws on parse failure.
+  *
+  *  Does NOT consult the Bridge flow.  Use
+  *  [addLegacyTunnelInBridgeFlow] from the Tile-#3 wizard if the
+  *  new tunnel should be stamped with the pending Bridge
+  *  groupId.  This split prevents the ambient-context bug where
+  *  any Tile-#1 paste / wormhole-result / QR import during a
+  *  stray Bridge flow would silently get bridged. */
  fun addLegacyTunnel(name: String, configText: String, source: Tunnel.Source = Tunnel.Source.LEGACY): Tunnel {
  WgQuickUapi.render(configText) // validate
- val t = Tunnel(name = name.ifBlank { defaultName() }, configText = configText, source = source)
+ val t = Tunnel(
+ name = name.ifBlank { defaultName() },
+ configText = configText,
+ source = source,
+ )
+ persistAndStart(t)
+ return t
+ }
+
+ /**
+  * Tile-#3 Bridge-flow variant of [addLegacyTunnel].  Stamps
+  *  the pending Bridge groupId onto the new tunnel.  Throws when
+  *  no Bridge flow is in progress — callers are wizard screens
+  *  that must have called [startBridgeFlow] first.
+  *
+  *  Does NOT call [finishBridgeFlow] — the host-side save is the
+  *  second half and the wizard's `onComplete` is the deliberate
+  *  termination point.  The joiner is conventionally the first
+  *  half but the design doesn't pin ordering; both halves only
+  *  peek, the wizard finishes.
+  */
+ fun addLegacyTunnelInBridgeFlow(
+ name: String,
+ configText: String,
+ source: Tunnel.Source = Tunnel.Source.LEGACY,
+ ): Tunnel {
+ val groupId = peekBridgeGroupIdForNewTunnel()
+ ?: error("addLegacyTunnelInBridgeFlow called without active Bridge flow")
+ WgQuickUapi.render(configText) // validate
+ val t = Tunnel(
+ name = name.ifBlank { defaultName() },
+ configText = configText,
+ source = source,
+ groupId = groupId,
+ )
  persistAndStart(t)
  return t
  }
@@ -867,6 +908,41 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  brokerKey = brokerKey,
  advertisedAllowedIps = canonAllowed,
  )
+ persistAndStart(t)
+ return t
+ }
+
+ /**
+  * Tile-#3 Bridge-flow variant of [addHostModeTunnel].  Stamps
+  *  the pending Bridge groupId onto the new host tunnel.  Throws
+  *  when no Bridge flow is in progress.  Does NOT call
+  *  [finishBridgeFlow] — that's the wizard's `onComplete`
+  *  responsibility so a save-time exception leaves the flow
+  *  intact for retry.
+  */
+ fun addHostModeTunnelInBridgeFlow(
+ name: String,
+ subnet: String,
+ hostIp: String,
+ listenPort: Int,
+ brokerWss: String,
+ brokerKey: String,
+ advertisedAllowedIps: String? = null,
+ ): Tunnel {
+ val groupId = peekBridgeGroupIdForNewTunnel()
+ ?: error("addHostModeTunnelInBridgeFlow called without active Bridge flow")
+ val canonAllowed = advertisedAllowedIps?.let {
+ WgAllowedIps.canonicalize(it)
+ }?.ifBlank { null }
+ val t = HostModeFactory.newTunnel(
+ name = name.ifBlank { defaultHostName() },
+ subnet = subnet,
+ hostIp = hostIp,
+ listenPort = listenPort,
+ brokerWss = brokerWss,
+ brokerKey = brokerKey,
+ advertisedAllowedIps = canonAllowed,
+ ).copy(groupId = groupId)
  persistAndStart(t)
  return t
  }
