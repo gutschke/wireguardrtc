@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Login
 import androidx.compose.material.icons.outlined.WifiTethering
 import androidx.compose.material3.Card
@@ -41,6 +42,9 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -264,6 +268,12 @@ private fun TunnelCard(
         isActive = isActive,
         isConnecting = isConnecting,
     )
+    // §4.1 — when the pill represents a Failed or PausedSystem
+    // state we make it tappable so the user can see the structured
+    // human-readable reason + one-tap remediation.
+    var failureDetail by remember(tunnel.id) {
+        mutableStateOf<com.gutschke.wgrtc.data.TunnelState?>(null)
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth().clickable { onClick() },
@@ -296,7 +306,13 @@ private fun TunnelCard(
                 Text(tunnel.name, style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    StatusPill(state)
+                    StatusPill(
+                        state = state,
+                        onClick = if (tunnelState is com.gutschke.wgrtc.data.TunnelState.Failed ||
+                            tunnelState is com.gutschke.wgrtc.data.TunnelState.PausedSystem) {
+                            { failureDetail = tunnelState }
+                        } else null,
+                    )
                     Spacer(Modifier.width(8.dp))
                     Text(
                         if (isHost) "Hosting" else "Client",
@@ -315,6 +331,14 @@ private fun TunnelCard(
                 Switch(checked = isActive, onCheckedChange = onToggle)
             }
         }
+    }
+
+    failureDetail?.let { detail ->
+        FailureDetailDialog(
+            tunnel = tunnel,
+            state = detail,
+            onDismiss = { failureDetail = null },
+        )
     }
 }
 
@@ -373,7 +397,7 @@ private fun stateForPill(
 }
 
 @Composable
-private fun StatusPill(state: ConnState) {
+private fun StatusPill(state: ConnState, onClick: (() -> Unit)? = null) {
     val (label, fg, bg) = when (state) {
         ConnState.Connected ->
             Triple("Connected", StatusUpLight, StatusUpContainerLight)
@@ -424,13 +448,27 @@ private fun StatusPill(state: ConnState) {
         modifier = Modifier
             .clip(RoundedCornerShape(6.dp))
             .background(bg as Color)
+            .let { if (onClick != null) it.clickable { onClick() } else it }
             .padding(horizontal = 8.dp, vertical = 2.dp),
     ) {
-        Text(
-            label as String,
-            style = MaterialTheme.typography.labelSmall,
-            color = fg as Color,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                label as String,
+                style = MaterialTheme.typography.labelSmall,
+                color = fg as Color,
+            )
+            if (onClick != null) {
+                // Subtle tap affordance — the i in a circle nudges
+                // discoverability without shouting.
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = "Details",
+                    tint = fg,
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+        }
     }
 }
 
@@ -483,6 +521,168 @@ private fun NetworkBlockedBanner() {
         }
     }
     Spacer(Modifier.height(12.dp))
+}
+
+/**
+ * §4.1 failure-cause dialog.  Shown when the user taps the status
+ * pill on a row in [TunnelState.Failed] or [TunnelState.PausedSystem].
+ * Renders the human-readable message + a single one-tap remediation
+ * action when one applies.
+ */
+@Composable
+private fun FailureDetailDialog(
+    tunnel: Tunnel,
+    state: com.gutschke.wgrtc.data.TunnelState,
+    onDismiss: () -> Unit,
+) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val connect = LocalConnect.current
+    val (title, body, action) = remember(state) {
+        failureCopy(tunnel, state)
+    }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = {
+            action?.let { (label, intent) ->
+                Button(onClick = {
+                    when (intent) {
+                        is FailureRemediation.Retry -> connect(tunnel.id)
+                        is FailureRemediation.OpenVpnSettings -> {
+                            val i = android.content.Intent(
+                                android.provider.Settings.ACTION_VPN_SETTINGS,
+                            ).apply {
+                                flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                            }
+                            runCatching { ctx.startActivity(i) }
+                        }
+                        is FailureRemediation.OpenAppInfo -> {
+                            val i = android.content.Intent(
+                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                android.net.Uri.fromParts("package", ctx.packageName, null),
+                            ).apply {
+                                flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                            }
+                            runCatching { ctx.startActivity(i) }
+                        }
+                    }
+                    onDismiss()
+                }) { Text(label) }
+            } ?: TextButton(onClick = onDismiss) { Text("Got it") }
+        },
+        dismissButton = if (action != null) {
+            { TextButton(onClick = onDismiss) { Text("Dismiss") } }
+        } else null,
+    )
+}
+
+/** One-tap action the user can take from a failure dialog. */
+internal sealed class FailureRemediation {
+    object Retry : FailureRemediation()
+    object OpenVpnSettings : FailureRemediation()
+    object OpenAppInfo : FailureRemediation()
+}
+
+/** Maps a [TunnelState] to (title, body, optional (label, intent))
+ *  triples.  Pure function; tests live in `TunnelListFailureCopyTest`. */
+internal fun failureCopy(
+    tunnel: Tunnel,
+    state: com.gutschke.wgrtc.data.TunnelState,
+): Triple<String, String, Pair<String, FailureRemediation>?> = when (state) {
+    is com.gutschke.wgrtc.data.TunnelState.Failed -> when (val cause = state.cause) {
+        com.gutschke.wgrtc.data.FailureCause.ConsentDenied -> Triple(
+            "Permission needed",
+            "Android didn't grant permission for this connection. Tap to ask again.",
+            "Ask again" to FailureRemediation.Retry,
+        )
+        com.gutschke.wgrtc.data.FailureCause.ConsentSilentlyDenied -> Triple(
+            "Permission blocked",
+            "Android is silently refusing the VPN permission for this app. " +
+                "Open System Settings → Apps → wgrtc → Permissions to clear the denial.",
+            "Open app info" to FailureRemediation.OpenAppInfo,
+        )
+        com.gutschke.wgrtc.data.FailureCause.BrokerMissing -> Triple(
+            "No signaling server",
+            "This tunnel relies on a signaling server to keep your peer's " +
+                "endpoint up to date. The broker URL is empty — open the " +
+                "tunnel's details and set one, or restore the default in " +
+                "Settings.",
+            null,
+        )
+        is com.gutschke.wgrtc.data.FailureCause.BrokerUnreachable -> Triple(
+            "Signaling server unreachable",
+            "Can't reach the signaling server at ${cause.url}. Check your " +
+                "internet connection.",
+            "Retry" to FailureRemediation.Retry,
+        )
+        com.gutschke.wgrtc.data.FailureCause.PeerKeyRejected -> Triple(
+            "Identity rejected",
+            "The other side rejected this connection's identity. " +
+                "The remote server may have removed this device.",
+            null,
+        )
+        is com.gutschke.wgrtc.data.FailureCause.HandshakeTimeout -> Triple(
+            "Couldn't reach the server",
+            "Couldn't reach the server at ${cause.endpoint}. The endpoint " +
+                "may be down or moved.",
+            "Retry" to FailureRemediation.Retry,
+        )
+        is com.gutschke.wgrtc.data.FailureCause.PortInUse -> Triple(
+            "Port in use",
+            "UDP port ${cause.port} is busy. Another VPN app or wgrtc " +
+                "tunnel is probably using it.",
+            null,
+        )
+        com.gutschke.wgrtc.data.FailureCause.RoutingLoopUserConfirmed -> Triple(
+            "Routing-loop risk",
+            "You said another WireGuard client routes through this device. " +
+                "Disable that client first, then re-enable this tunnel.",
+            "Open VPN settings" to FailureRemediation.OpenVpnSettings,
+        )
+        com.gutschke.wgrtc.data.FailureCause.CascadePolicyBlocked -> Triple(
+            "Relay blocked",
+            "This tunnel is set to never relay. Open the tunnel's details " +
+                "to allow relay.",
+            null,
+        )
+        com.gutschke.wgrtc.data.FailureCause.PairingSasMismatch -> Triple(
+            "Pairing code mismatch",
+            "The pairing code didn't match. Re-enter or ask the other side " +
+                "for a fresh one.",
+            "Retry" to FailureRemediation.Retry,
+        )
+        com.gutschke.wgrtc.data.FailureCause.PairingCancelled -> Triple(
+            "Pairing cancelled",
+            "The pairing flow ended before both sides confirmed. Restart " +
+                "from the other side.",
+            null,
+        )
+    }
+    is com.gutschke.wgrtc.data.TunnelState.PausedSystem -> when (state.reason) {
+        com.gutschke.wgrtc.data.PauseReason.AnotherVpnTookOver -> Triple(
+            "Another VPN is active",
+            "Another VPN app took over the system VPN slot. Disable it, " +
+                "then turn this tunnel back on.",
+            "Open VPN settings" to FailureRemediation.OpenVpnSettings,
+        )
+        com.gutschke.wgrtc.data.PauseReason.EstablishNull,
+        com.gutschke.wgrtc.data.PauseReason.ForegroundResync,
+        com.gutschke.wgrtc.data.PauseReason.BackgroundResync -> Triple(
+            "VPN permission revoked",
+            "Android revoked permission for this tunnel. Tap to reconnect " +
+                "and we'll ask for permission again.",
+            "Reconnect" to FailureRemediation.Retry,
+        )
+        com.gutschke.wgrtc.data.PauseReason.FgsKilledByDoze -> Triple(
+            "Background killed by Doze",
+            "Android stopped the background service that keeps your " +
+                "connection alive. Open battery settings to mark wgrtc " +
+                "as unrestricted.",
+            "Open app info" to FailureRemediation.OpenAppInfo,
+        )
+    }
+    else -> Triple("", "", null)
 }
 
 /**
