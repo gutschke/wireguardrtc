@@ -221,12 +221,38 @@ be cut.
 
 ## Out-of-scope for v0.3 (tracked here so the doc lives one place)
 
+- **v0.3.x or v0.4** Joiner-side DNS proxy.  v0.2.12 added a synth-v6-DNS
+  fix that handles well-known providers (Cloudflare / Google / Quad9)
+  by mapping the user's v4 DNS to its v6 sibling — this preserves the
+  family-preference behavior some servers have (return AAAA when
+  queried via v6, A when queried via v4) and is the right primitive
+  for known providers.  But for *proprietary / internal* v4-only DNS
+  servers (e.g. `10.10.0.102` on a home LAN), the synth falls back to
+  Cloudflare's public v6 — a silent leak of AAAA queries away from
+  the user's intended resolver, and a miss for any internal AAAA
+  records.  Plan: add a wgrtc-side DNS proxy on the joiner gvisor
+  netstack (reuse host-mode's existing `DnsProxy`).  Listen on a
+  synthetic v6 address chosen at runtime; the VPN pushes that as
+  the v6 DNS entry instead of Cloudflare's when the user's
+  configured v4 DNS isn't a recognized public provider.  The proxy
+  re-issues v6-transport AAAA queries as v4-transport queries to
+  the user's actual DNS server.  Net effect: known providers keep
+  using the synth (preferred — avoids the extra hop and preserves
+  family-preference); unknown / private DNS servers get proxied
+  correctly (preferred — no silent third-party introduction).
+  Estimated ~300–500 lines; gvisor wiring is the bulk of the work
+  and overlaps with Phase 5 (Android-side transport plugins).
 - **v0.4+** MASQUE peer-to-peer NAT (design §10.7). Adds cross-process
   punch RPC.
 - **v0.4+** Reality / VLESS reconsideration if GFW bypass becomes a load-
   bearing user need (design §19).
 - **v0.5+** JA3/JA4 mimicry, uTLS-for-QUIC. Library-availability gated.
 - **v0.5+** Encrypted Client Hello. Library + Cloudflare gated.
+- **Upstream** ChromeOS-host v6-via-VPN forwarding (see README "Known
+  limitations").  This is a Patchpanel-side incomplete v6 forwarding
+  path that affects every Android VPN app on ARC, not wgrtc-specific.
+  The DNS proxy above improves the *resolver* leg from ARC's view; the
+  ChromeOS-host route-replacement issue itself is out of scope.
 
 
 ## Cross-cutting work that doesn't belong to a single phase

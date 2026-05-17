@@ -440,6 +440,39 @@ miniature personal app store.
 
 ---
 
+## Known limitations
+
+### IPv6 from ChromeOS host applications when the VPN is up
+
+If you're running the Android app inside ChromeOS (ARC) and have a
+dual-stack tunnel up, **IPv6 works fine for Android apps inside
+ARC** (including the Android Chrome browser), but **may fail for
+applications running on the ChromeOS host directly** (the ChromeOS
+Chrome browser, Crostini) and from the `crosh` shell.
+
+This is a platform-side limitation in how ChromeOS Patchpanel
+forwards ChromeOS-host traffic into ARC's `VpnService`.  The v4
+forwarding path is complete; the v6 forwarding path tends to
+leave the host's main IPv6 routing table or DNS resolver in a
+partially-replaced state, so `send()` on a fresh v6 socket from
+crosh fails immediately and `getaddrinfo` for AAAA records times
+out on host-resolver paths.  Established v6 connections survive
+across VPN toggles, but new ones can't be opened from
+ChromeOS-host context.
+
+Diagnostic fingerprint:
+- `arc dns ipv6.google.com` from crosh: returns both A and AAAA.
+- `ping ipv6.google.com` from crosh: "unknown host."
+- `tracepath gutschke.com` from crosh with VPN up: "send failed"
+  on the first hop.
+- The same tunnel works fully for v6 when used from a native
+  Android device or from a Linux daemon.
+
+Workaround: run v6-needing traffic via an Android app inside ARC
+rather than via ChromeOS-host's Chrome / Crostini.  We're tracking
+a wgrtc-side DNS proxy that will further improve the resolver path,
+but the underlying ChromeOS-Patchpanel-v6 issue itself is upstream.
+
 ## Privacy
 
 The privacy policy in [`PRIVACY.md`](PRIVACY.md) is the authoritative
