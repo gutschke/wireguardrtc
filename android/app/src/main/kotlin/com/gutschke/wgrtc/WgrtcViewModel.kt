@@ -639,6 +639,50 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  * disconnect + reconcile dance.
  */
  /**
+ * Per-host §6.2 routing-loop dialog state.  Non-null when the
+ * UI should be showing the warning dialog for a specific host
+ * tunnel that's about to come up on ARC for the first time.
+ * The UI observes via [chromeOsLoopWarningFor]; the user's
+ * choice routes back through [acknowledgeChromeOsLoopWarning].
+ */
+ private val _chromeOsLoopWarningFor =
+ MutableStateFlow<com.gutschke.wgrtc.data.Tunnel?>(null)
+ val chromeOsLoopWarningFor: StateFlow<com.gutschke.wgrtc.data.Tunnel?> =
+ _chromeOsLoopWarningFor.asStateFlow()
+
+ /** Called by the dialog when the user picks "Open Settings" or
+ *  "I've checked — continue".  Persists the dismissal so we
+ *  don't re-prompt, then proceeds with Connect.  On Cancel:
+ *  marks the tunnel Failed (permanent, RoutingLoopUserConfirmed)
+ *  in the registry. */
+ fun acknowledgeChromeOsLoopWarning(
+ tunnelId: String,
+ proceed: Boolean,
+ ) {
+ _chromeOsLoopWarningFor.value = null
+ if (proceed) {
+ // Sticky dismiss — record in the persistent Tunnel
+ // field so we don't re-prompt on every Connect.
+ val all = _tunnels.value.map {
+ if (it.id == tunnelId) it.copy(chromeOsLoopWarned = true) else it
+ }
+ _tunnels.value = all
+ viewModelScope.launch(Dispatchers.IO) { hub.saveTunnels(all) }
+ // Re-enter connect now that the precheck is satisfied.
+ viewModelScope.launch { connect(tunnelId) }
+ } else {
+ com.gutschke.wgrtc.data.TunnelStateRegistry
+ .getProcessSingleton()
+ .recordFailure(
+ tunnelId,
+ com.gutschke.wgrtc.data.FailureCause.RoutingLoopUserConfirmed,
+ recoverable = false,
+ note = "user cancelled at ChromeOS routing-loop precheck",
+ )
+ }
+ }
+
+ /**
  * Update [Tunnel.relayPolicy] without bouncing the tunnel.
  * Targeted entrypoint for the §2.3 banner — the heavier
  * [updateTunnel] disconnects + reconciles, which would defeat
@@ -1060,6 +1104,26 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  connectJobs.compute(id) { _, v -> if (v == myJob) null else v }
  throw IllegalStateException(msg)
  }
+ // ─── ChromeOS routing-loop precheck (§6.2) ────────────
+ // First-time-Connect of a host tunnel on ARC: warn that
+ // another local WG client routing through this device's IP
+ // would form a loop.  We can't probe — see design §6.2 —
+ // so we ask the user once per tunnel.  Sticky-dismiss via
+ // tunnel.chromeOsLoopWarned.  Non-ARC: skip entirely.
+ if (t.source == Tunnel.Source.HOST_MODE &&
+ !t.chromeOsLoopWarned &&
+ WgrtcApp.instance.packageManager.hasSystemFeature(
+ android.content.pm.PackageManager.FEATURE_PC)
+ ) {
+ // Bail out of this connect attempt; the UI will show
+ // the dialog and re-enter via acknowledgeChromeOsLoopWarning.
+ _chromeOsLoopWarningFor.value = t
+ _connectingTunnelId.value = null
+ val myJob = currentCoroutineContext()[Job]
+ connectJobs.compute(id) { _, v -> if (v == myJob) null else v }
+ return
+ }
+
  // ─── Host () short-circuit ────────────────────────
  // Host-mode tunnels run on wgbridge_native's gvisor netstack.
  // There's no candidate race for a host (no daemon-driven

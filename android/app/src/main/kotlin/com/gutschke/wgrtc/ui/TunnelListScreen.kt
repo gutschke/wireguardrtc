@@ -78,6 +78,7 @@ fun TunnelListScreen(
     val tunnels by vm.tunnels.collectAsState()
     val activeIds by vm.activeTunnelIds.collectAsState()
     val connectingId by vm.connectingTunnelId.collectAsState()
+    val chromeOsWarningFor by vm.chromeOsLoopWarningFor.collectAsState()
     // dropped vm.liveState — it's a singular legacy signal
     // that can't tell two concurrent tunnels apart.  Per-row state
     // is now (isActive contains id, connectingId == id) only.
@@ -176,6 +177,29 @@ fun TunnelListScreen(
                 }
             }
         }
+    }
+
+    // §6.2 ChromeOS routing-loop warning.  Sticky dismissal lives
+    // on the persisted Tunnel; the dialog only renders once per
+    // host tunnel.  See `docs/ux-design-v2.md` §6.2.
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    chromeOsWarningFor?.let { t ->
+        ChromeOsRoutingLoopDialog(
+            hostName = t.name,
+            onOpenSettings = {
+                val intent = android.content.Intent(
+                    android.provider.Settings.ACTION_VPN_SETTINGS)
+                intent.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                runCatching { ctx.startActivity(intent) }
+                vm.acknowledgeChromeOsLoopWarning(t.id, proceed = true)
+            },
+            onContinue = {
+                vm.acknowledgeChromeOsLoopWarning(t.id, proceed = true)
+            },
+            onCancel = {
+                vm.acknowledgeChromeOsLoopWarning(t.id, proceed = false)
+            },
+        )
     }
 }
 
@@ -366,6 +390,52 @@ private fun NetworkBlockedBanner() {
         }
     }
     Spacer(Modifier.height(12.dp))
+}
+
+/**
+ * §6.2 ChromeOS routing-loop warning.  Fires once per host tunnel
+ * at first Connect on ARC.  Sticky dismissal lives on the
+ * persisted [Tunnel] via [Tunnel.chromeOsLoopWarned].
+ *
+ * Three actions:
+ *   * **Open settings** — deep-links to ChromeOS Network → VPN so
+ *     the user can verify no other WG client routes through this
+ *     device's IP.  Treats this as "ack" — same as Continue.
+ *   * **Continue** — user vouches they checked.  Proceeds.
+ *   * **Cancel** — user backs out; the tunnel transitions to
+ *     `Failed (permanent, RoutingLoopUserConfirmed)` so the row
+ *     surfaces the reason.  Re-tapping Connect later re-shows the
+ *     dialog (the sticky flag isn't set yet).
+ */
+@Composable
+private fun ChromeOsRoutingLoopDialog(
+    hostName: String,
+    onOpenSettings: () -> Unit,
+    onContinue: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Possible routing loop?") },
+        text = {
+            Text(
+                "Before \"$hostName\" comes up: if another WireGuard " +
+                    "client on this Chromebook has this device's IP " +
+                    "in its AllowedIPs, traffic will loop back here " +
+                    "and your network will break.\n\n" +
+                    "Open ChromeOS Settings → Network → VPN and check.",
+            )
+        },
+        confirmButton = {
+            Button(onClick = onOpenSettings) { Text("Open settings") }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onCancel) { Text("Cancel") }
+                OutlinedButton(onClick = onContinue) { Text("I've checked") }
+            }
+        },
+    )
 }
 
 /**

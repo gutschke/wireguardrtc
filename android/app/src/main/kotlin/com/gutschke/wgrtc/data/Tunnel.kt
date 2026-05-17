@@ -75,6 +75,14 @@ data class Tunnel(
      * created tunnels (the common case).  See §3.2.
      */
     val groupId: String? = null,
+    /**
+     * Sticky dismissal flag for the §6.2 ChromeOS routing-loop
+     * dialog.  Set to true once the user picked either "Open
+     * Settings" or "I've checked — continue" so we don't re-prompt
+     * on every Connect.  Only consulted when running on ARC and
+     * the tunnel is host-mode.  See `docs/ux-design-v2.md` §6.2.
+     */
+    val chromeOsLoopWarned: Boolean = false,
 ) {
     enum class Source { LEGACY, ENROLL, MANUAL, HOST_MODE }
 }
