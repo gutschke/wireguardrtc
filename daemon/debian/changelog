@@ -1,3 +1,80 @@
+wireguardrtc (0.3.0-1) unstable; urgency=medium
+
+  * Android: CASCADE-2 cross-stack forwarding ferry lets a host-mode
+    tunnel relay decrypted traffic through a joiner-mode tunnel
+    when their AllowedIPs overlap — the phone becomes a two-LAN
+    bridge.  See `docs/cascade-2-plan.md` for the gvisor-route
+    architecture (paired channel.Endpoints, drop-NIC gap
+    handling, additive route ownership in host_forwarder).
+  * Android: UX v2 — complete restructure around a 9-state
+    machine per tunnel.  TunnelStateRegistry is the single source
+    of truth; the UI reads from it instead of mutating active-set
+    booleans.  Fixes the user-reported "phantom-active" bug where
+    a ChromeOS / Android system-menu VPN disconnect left the
+    tunnel showing "Connected" in the app indefinitely.  Four
+    detection signals: builder.establish() returning null,
+    VpnService.onRevoke, MainActivity.onResume re-prepare, and a
+    background 30-min WorkManager-style re-prepare for users who
+    never re-foreground.
+  * Android: cascade is now a per-host-tunnel decision
+    (Tunnel.relayPolicy: Ask | Always | Never).  The previous
+    global Settings toggle has been retired.  Ask is the
+    fail-safe default — cascade routes don't install until the
+    user picks via a §2.3 banner that appears under a host row
+    when a joiner becomes cascade-eligible.  Migration: users who
+    had the v0.2.x global toggle ON see relayPolicy=Ask on every
+    host (no automatic relay until they confirm).
+  * Android: status pill repainted to reflect every state in the
+    new machine — Connected, Idle, Connecting, System paused,
+    Paused, Pairing, Reconnecting, Connection failed, Needs
+    attention, Off.  Tappable when red to show a structured
+    FailureCause + one-tap remediation (Retry / Open VPN
+    settings / Open app info).
+  * Android: TunnelDetail gains a transition log — every state
+    transition timestamped + reasoned.  Copy-button stuffs the
+    rendered log into the clipboard for bug reports.  The critic
+    rounds called this "the highest-payoff single deliverable".
+  * Android: first-launch experience replaced.  Empty state now
+    renders three tiles — "Join a network", "Share my network",
+    "Bridge two networks".  Tile #3 is an orchestrated wizard
+    that creates a joiner + host pair with a shared groupId; the
+    pair renders as one row in the list.  Long-press on any
+    existing tunnel offers "Bridge with…" to pair two existing
+    tunnels post-hoc.
+  * Android: ChromeOS routing-loop precheck (§6.2).  At first
+    Connect of a host-mode tunnel on ARC, a one-shot dialog
+    warns about another local WireGuard client routing through
+    this device — the exact scenario that broke the user's
+    network in the field.  Sticky dismissal per host tunnel.
+  * Android: §13-layer-3 emergency cascade kill-switch.
+    Long-press on the Settings version label opens a dialog with
+    a "Force cascade off" toggle for release-build users hit by
+    a CASCADE-2 regression.  Version label re-renders as
+    "wgrtc v0.3.0 · cascade off" in red while engaged.  Tears
+    down all active cascade routes synchronously; re-enabling
+    re-registers active host slots without bouncing them.
+  * Android: host-mode tunnel naming default is now "Host 1" /
+    "Host 2" / … via a next-available-suffix scan (was the
+    generic "tunnel-N" shared with joiners + broken after
+    deletes).  Listen-port default scans existing host configs
+    and picks the lowest free port ≥ 51820.  Real-time port-
+    collision feedback inline under the port field, aligned with
+    HostModeBackend's runtime check (paused slots' ports don't
+    count, matching the backend's permissive rule).
+  * Android: CASCADE-1 — TunnelOverlapGuard now permits
+    LPM-resolvable overlaps so `0.0.0.0/0` + `10.99.0.0/24` can
+    both be active simultaneously without manual conflict
+    resolution.  Identical-prefix collisions still blocked.
+  * 117 new pure-JVM tests across this release covering the
+    state machine, registry, transition log, FailureCause copy,
+    Bridge grouping, name/port defaults, port-collision
+    detection, Bridge orchestration plumbing, §13 kill-switch
+    gate, and source-lint guards against the ambient-context
+    bug class.
+  * Daemon: no API changes this release.  Bumped for parity.
+
+ -- wireguardrtc maintainers <maintainers@wgrtc.invalid>  Sun, 17 May 2026 12:00:00 +0000
+
 wireguardrtc (0.2.10-1) unstable; urgency=medium
 
   * Android: multi-joiner shared-tunnel path is now the default.

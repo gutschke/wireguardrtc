@@ -29,8 +29,8 @@ android {
         applicationId = "com.gutschke.wgrtc"
         minSdk = 26
         targetSdk = 35
-        versionCode = 33
-        versionName = "0.2.12"
+        versionCode = 34
+        versionName = "0.3.0"
         // Instrumented (androidTest) tests use AndroidX Test's JUnit 4
         // runner. The connectedDebugAndroidTest task drives them via
         // ADB against whichever device/emulator is currently attached.
