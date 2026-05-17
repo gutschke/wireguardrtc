@@ -102,6 +102,11 @@ class WgrtcApp : Application() {
         // trap. See BrokerNetworkPin's doc for full rationale and
         // the case where it doesn't help.
         BrokerNetworkPin.register(this)
+        // CASCADE-2 — restore the persisted cascade-enabled flag so
+        // backends post lifecycle events to the registry from app
+        // start.  Off by default; users who flipped it on in
+        // Settings get it back across process restarts.
+        com.gutschke.wgrtc.data.CascadeWiring.setEnabled(settings.cascadeEnabled)
         // No startup JNI probe: the SIGSEGV class we used to chase
         // turned out to be gomobile-bind's marshalling, not a
         // dual-runtime conflict. deleted WgBridgeSmokeProbe;

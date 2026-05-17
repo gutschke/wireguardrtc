@@ -180,6 +180,12 @@ class HostModeRunner(
     fun snapshotUapi(): String =
         endpoint?.snapshotUapi() ?: ""
 
+    /** Native handle of the underlying wgbridge — needed by
+     *  CASCADE-2 to register this host bridge with the ferry
+     *  registry.  Returns 0 when the runner isn't started yet
+     *  or when running atop a fake backend. */
+    val nativeBridgeHandle: Int get() = endpoint?.nativeBridgeHandle ?: 0
+
     /**
      * Put the running bridge into a "no-peers, no-listen" idle
      * state without closing the underlying wireguard-go device.

@@ -198,6 +198,64 @@ object WgBridgeNative {
     ): Int
 
     // ─────────────────────────────────────────────────────────
+    // CASCADE-2 — ferry registry lifecycle.  See
+    // wgbridge_native/cascade_ferry_exports.go for the Go side +
+    // return-code documentation.
+    //
+    // CascadeWiring (Kotlin) is the only caller.  Backends post
+    // lifecycle events to it; CascadeWiring decides whether to
+    // call these JNI hooks based on SettingsStore.cascadeEnabled.
+
+    /**
+     * Record the joiner-N shared stack [stackHandle] in the
+     * cascade registry.  [allowedIpsCsv] is the comma-separated
+     * union of every active joiner peer's AllowedIPs.  Returns 0
+     * on success; -1 unknown stack handle; -2 malformed CSV.
+     */
+    @JvmStatic external fun nativeCascadeRegisterJoiner(
+        stackHandle: Int,
+        allowedIpsCsv: String?,
+    ): Int
+
+    /**
+     * Unregister the joiner stack — MUST be called BEFORE the
+     * stack itself is destroyed so the registry can install
+     * drop-NIC routes on each host stack to prevent leakage
+     * during the rebuild gap.  Idempotent.
+     */
+    @JvmStatic external fun nativeCascadeUnregisterJoiner()
+
+    /**
+     * Update the joiner-N AllowedIPs union without a full stack
+     * rebuild (a joiner came up or went away).  -1 malformed CSV.
+     */
+    @JvmStatic external fun nativeCascadeOnAllowedIPsChanged(
+        allowedIpsCsv: String?,
+    ): Int
+
+    /**
+     * Record a host-mode bridge in the cascade registry.
+     * [peerSubnetsCsv] is the host's claimed subnet(s).  -1
+     * unknown bridge handle; -2 malformed CSV; -3 bridge is not
+     * host-mode (cascade doesn't apply).
+     */
+    @JvmStatic external fun nativeCascadeRegisterHostBridge(
+        bridgeHandle: Int,
+        peerSubnetsCsv: String?,
+    ): Int
+
+    /** Remove a host bridge from the cascade registry.  Idempotent. */
+    @JvmStatic external fun nativeCascadeUnregisterHostBridge(bridgeHandle: Int)
+
+    /**
+     * Diagnostic helper: returns 1 if [addr] (a literal IPv4 or
+     * IPv6) falls under any active cascade prefix, 0 otherwise.
+     * Used by tests; production paths consult the Go-side
+     * registry directly.
+     */
+    @JvmStatic external fun nativeCascadeHasPrefix(addr: String): Int
+
+    // ─────────────────────────────────────────────────────────
     // TCP / UDP listeners on the host's gvisor netstack.
     //
     // **Async model.** [nativeListenTcp] / [nativeListenUdp] are

@@ -58,6 +58,7 @@ class JoinerStackBackend(
     private data class Slot(
         val bridgeHandle: Int,
         @Volatile var uapi: String,
+        @Volatile var peerAllowed: List<String>,
     )
 
     private val slots: ConcurrentHashMap<String, Slot> = ConcurrentHashMap()
@@ -105,6 +106,7 @@ class JoinerStackBackend(
                 stackHandle = handle
                 stackMtu = mtu
             }
+            CascadeWiring.onJoinerStackUp(stackHandle, "")
         }
     }
 
@@ -154,9 +156,15 @@ class JoinerStackBackend(
                     throw JoinerStackException(
                         "configureUapi('$tunnelId') failed with rc=$rc")
                 }
-                slots[tunnelId] = Slot(bridgeHandle = bridgeHandle, uapi = wgQuickUapi)
+                slots[tunnelId] = Slot(
+                    bridgeHandle = bridgeHandle,
+                    uapi = wgQuickUapi,
+                    peerAllowed = peerAllowed,
+                )
                 _activeJoinerIds.value = slots.keys.toSet()
                 bridgeHandle
+            }.also {
+                CascadeWiring.onJoinerAllowedIpsChanged(unionAllowedIpsCsv())
             }
         }
     }
@@ -198,6 +206,7 @@ class JoinerStackBackend(
     suspend fun closeJoiner(tunnelId: String) {
         val slot = slots.remove(tunnelId) ?: return
         _activeJoinerIds.value = slots.keys.toSet()
+        CascadeWiring.onJoinerAllowedIpsChanged(unionAllowedIpsCsv())
         withContext(Dispatchers.IO) {
             try { factory.close(slot.bridgeHandle) } catch (_: Throwable) {}
         }
@@ -214,6 +223,13 @@ class JoinerStackBackend(
             val ids = slots.keys.toList()
             for (id in ids) closeJoiner(id)
             val sh = stackHandle
+            // Stack is about to go away — give cascade a chance to
+            // install drop-NIC routes on each host stack BEFORE we
+            // tear gvisor down.  CascadeWiring is a no-op when the
+            // user hasn't enabled cascade.
+            if (sh != 0) {
+                CascadeWiring.onJoinerStackDown()
+            }
             stackHandle = 0
             stackMtu = 0
             if (sh != 0) {
@@ -222,6 +238,15 @@ class JoinerStackBackend(
                 }
             }
         }
+    }
+
+    /** Comma-separated union of every active slot's AllowedIPs.
+     *  Empty string when no slot has any.  Used to keep the cascade
+     *  registry in sync with the joiner-N slot map. */
+    private fun unionAllowedIpsCsv(): String {
+        val all = linkedSetOf<String>()
+        for (slot in slots.values) all.addAll(slot.peerAllowed)
+        return all.joinToString(",")
     }
 }
 

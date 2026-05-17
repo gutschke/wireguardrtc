@@ -77,7 +77,12 @@ type hostForwarderState struct {
 	outNICID tcpip.NICID // NIC2 — virtual outbound NIC
 	outEp *gvchannel.Endpoint
 	inEp *gvchannel.Endpoint
-	origRoutes []tcpip.Route
+	// installedRoutes tracks the routes this forwarder added to the
+	// stack at install time, for selective removal on close.  We
+	// no longer use SetRouteTable (which would replace the whole
+	// table) because that wipes any concurrent cascade routes
+	// installed by [CascadeFerryRegistry] — see CASCADE-2 plan §6.
+	installedRoutes []tcpip.Route
 	stop context.CancelFunc
 	pingWg sync.WaitGroup
 	ctx context.Context
@@ -243,8 +248,13 @@ func wgbridgeInstallHostForwarder(handle C.int,
 			tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: newNICID},
 		)
 	}
-	origRoutes := append([]tcpip.Route(nil), stk.GetRouteTable()...)
-	stk.SetRouteTable(routes)
+	// Install routes additively (AddRoute, not SetRouteTable).
+	// Preserves any pre-existing routes (e.g. cascade ferry routes
+	// installed by CascadeFerryRegistry on this stack) and lets us
+	// remove only our own routes on close — see CASCADE-2 §6.
+	for _, route := range routes {
+		stk.AddRoute(route)
+	}
 	stk.SetForwardingDefaultAndAllNICs(gvipv4.ProtocolNumber, true)
 	if v6Net != nil {
 		stk.SetForwardingDefaultAndAllNICs(gvipv6.ProtocolNumber, true)
@@ -254,7 +264,8 @@ func wgbridgeInstallHostForwarder(handle C.int,
 	state := &hostForwarderState{
 		stk: stk, origNICID: origID, outNICID: newNICID,
 		outEp: outEp, inEp: inEp,
-		origRoutes: origRoutes, stop: cancel, ctx: ctx,
+		installedRoutes: append([]tcpip.Route(nil), routes...),
+		stop: cancel, ctx: ctx,
 		pingTimeout: 2 * time.Second,
 		tempAddrs: make(map[tcpip.Address]bool),
 	}
@@ -645,6 +656,21 @@ func (s *hostForwarderState) redirectViaTempAddressV6(dst tcpip.Address, raw []b
 }
 
 func (s *hostForwarderState) ensureTempLocalAddressV6(addr tcpip.Address) {
+	// CASCADE-2 §7: if this dst falls under an active cascade
+	// prefix, registering it as a temp-local on NIC1 would make
+	// gvisor deliver locally (HandleLocal=true) and bypass the
+	// cascade route to the ferry NIC.  Defence in depth — under
+	// normal conditions LPM already routes cascade traffic to the
+	// ferry NIC before it reaches the forwarder's NIC2 drain
+	// loop, so this skip should never fire.  But the symmetric
+	// "previously-registered temp-local shadows a newly-added
+	// cascade prefix" case isn't covered here; that's a follow-up.
+	if registry := getCascadeFerryRegistry(); registry != nil {
+		if a, ok := tcpipAddressToNetip(addr); ok && registry.HasCascadePrefix(a) {
+			hostFwdLog("skip v6 temp-local for %v: shadowed by cascade prefix", addr)
+			return
+		}
+	}
 	s.tempAddrMu.Lock()
 	defer s.tempAddrMu.Unlock()
 	if s.tempAddrs[addr] {
@@ -690,6 +716,13 @@ func (s *hostForwarderState) redirectViaTempAddress(dst tcpip.Address, raw []byt
 }
 
 func (s *hostForwarderState) ensureTempLocalAddress(addr tcpip.Address) {
+	// CASCADE-2 §7 — see ensureTempLocalAddressV6 for rationale.
+	if registry := getCascadeFerryRegistry(); registry != nil {
+		if a, ok := tcpipAddressToNetip(addr); ok && registry.HasCascadePrefix(a) {
+			hostFwdLog("skip v4 temp-local for %v: shadowed by cascade prefix", addr)
+			return
+		}
+	}
 	s.tempAddrMu.Lock()
 	defer s.tempAddrMu.Unlock()
 	if s.tempAddrs[addr] {
@@ -997,7 +1030,15 @@ func (s *hostForwarderState) closeForwarder() {
 	// `s.pingWg.Add(1)/Done()`).  This Wait() therefore drains
 	// in-flight pings of either family before NIC tear-down.
 	s.pingWg.Wait()
-	s.stk.SetRouteTable(s.origRoutes)
+	// Remove only the routes we installed.  Any cascade routes
+	// (added by CascadeFerryRegistry between our install and close)
+	// or other concurrent additions stay.  See CASCADE-2 §6.
+	for _, route := range s.installedRoutes {
+		routeCopy := route
+		s.stk.RemoveRoutes(func(r tcpip.Route) bool {
+			return r.Destination.Equal(routeCopy.Destination) && r.NIC == routeCopy.NIC
+		})
+	}
 	s.stk.RemoveNIC(s.outNICID)
 	// Forwarding-enable for ipv4/ipv6 is intentionally NOT reverted
 	// here.  The whole stack dies with `nativeClose` (the bridge is

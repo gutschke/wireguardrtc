@@ -15,6 +15,12 @@ import kotlinx.coroutines.CoroutineScope
  */
 interface WgBridgeBackend : AutoCloseable {
 
+    /** Native handle that identifies this bridge in the wgbridge
+     *  registry — needed by CASCADE-2 to wire the host-mode
+     *  bridge into the cross-stack ferry.  Returns 0 for backends
+     *  (test fakes) that don't bind to a native bridge. */
+    val nativeBridgeHandle: Int get() = 0
+
     /** Apply a wireguard-tools UAPI string ("private_key=... \npeer ...").
      * Throws on parse failure or wrong-state device. */
     @Throws(Exception::class)

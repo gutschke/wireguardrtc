@@ -48,6 +48,16 @@ extern int wgbridgeSharedStackOpenJoiner(int stackHandle,
                                           const char *peerAllowedCsv, long peerAllowedLen,
                                           const char *interfaceAddrsCsv, long interfaceAddrsLen,
                                           int mtu);
+// CASCADE-2 — see cascade_ferry_exports.go.
+extern int wgbridgeSharedStackCascadeRegisterJoiner(int stackHandle,
+                                          const char *allowedIpsCsv, long allowedIpsLen);
+extern void wgbridgeSharedStackCascadeUnregisterJoiner(void);
+extern int wgbridgeSharedStackCascadeOnAllowedIPsChanged(
+                                          const char *allowedIpsCsv, long allowedIpsLen);
+extern int wgbridgeSharedStackCascadeRegisterHostBridge(int bridgeHandle,
+                                          const char *peerSubnetsCsv, long peerSubnetsLen);
+extern void wgbridgeSharedStackCascadeUnregisterHostBridge(int bridgeHandle);
+extern int wgbridgeSharedStackCascadeHasPrefix(const char *addr, long addrLen);
 extern int wgbridgeTCPRead(int connHandle, char *buf, int bufLen);
 extern int wgbridgeTCPWrite(int connHandle, char *buf, int bufLen);
 extern void wgbridgeTCPClose(int connHandle);
@@ -554,3 +564,90 @@ Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeSharedStackOpenJoiner(
     return (jint) rc;
 }
 
+
+// ─── CASCADE-2 ferry registry JNI surface ────────────────────────
+// Adapt the //export functions from cascade_ferry_exports.go to
+// the Kotlin native-method signatures declared in WgBridgeNative.kt.
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeRegisterJoiner(
+    JNIEnv *env, jclass cls, jint stackHandle, jstring allowedIps)
+{
+    (void) cls;
+    const char *s = "";
+    jsize n = 0;
+    if (allowedIps != NULL) {
+        s = (*env)->GetStringUTFChars(env, allowedIps, 0);
+        if (s == NULL) return -2;
+        n = (*env)->GetStringUTFLength(env, allowedIps);
+    }
+    int rc = wgbridgeSharedStackCascadeRegisterJoiner(
+        (int) stackHandle, s, (long) n);
+    if (allowedIps != NULL) (*env)->ReleaseStringUTFChars(env, allowedIps, s);
+    return (jint) rc;
+}
+
+JNIEXPORT void JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeUnregisterJoiner(
+    JNIEnv *env, jclass cls)
+{
+    (void) env; (void) cls;
+    wgbridgeSharedStackCascadeUnregisterJoiner();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeOnAllowedIPsChanged(
+    JNIEnv *env, jclass cls, jstring allowedIps)
+{
+    (void) cls;
+    const char *s = "";
+    jsize n = 0;
+    if (allowedIps != NULL) {
+        s = (*env)->GetStringUTFChars(env, allowedIps, 0);
+        if (s == NULL) return -1;
+        n = (*env)->GetStringUTFLength(env, allowedIps);
+    }
+    int rc = wgbridgeSharedStackCascadeOnAllowedIPsChanged(s, (long) n);
+    if (allowedIps != NULL) (*env)->ReleaseStringUTFChars(env, allowedIps, s);
+    return (jint) rc;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeRegisterHostBridge(
+    JNIEnv *env, jclass cls, jint bridgeHandle, jstring peerSubnets)
+{
+    (void) cls;
+    const char *s = "";
+    jsize n = 0;
+    if (peerSubnets != NULL) {
+        s = (*env)->GetStringUTFChars(env, peerSubnets, 0);
+        if (s == NULL) return -2;
+        n = (*env)->GetStringUTFLength(env, peerSubnets);
+    }
+    int rc = wgbridgeSharedStackCascadeRegisterHostBridge(
+        (int) bridgeHandle, s, (long) n);
+    if (peerSubnets != NULL) (*env)->ReleaseStringUTFChars(env, peerSubnets, s);
+    return (jint) rc;
+}
+
+JNIEXPORT void JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeUnregisterHostBridge(
+    JNIEnv *env, jclass cls, jint bridgeHandle)
+{
+    (void) env; (void) cls;
+    wgbridgeSharedStackCascadeUnregisterHostBridge((int) bridgeHandle);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeHasPrefix(
+    JNIEnv *env, jclass cls, jstring addr)
+{
+    (void) cls;
+    if (addr == NULL) return 0;
+    const char *s = (*env)->GetStringUTFChars(env, addr, 0);
+    if (s == NULL) return 0;
+    jsize n = (*env)->GetStringUTFLength(env, addr);
+    int rc = wgbridgeSharedStackCascadeHasPrefix(s, (long) n);
+    (*env)->ReleaseStringUTFChars(env, addr, s);
+    return (jint) rc;
+}

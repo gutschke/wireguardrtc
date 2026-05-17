@@ -129,4 +129,31 @@ class SettingsStoreTest {
         s.resetToDefaults()
         assertEquals(true, s.joinerNEnabled)
     }
+
+    @Test fun `cascadeEnabled defaults to false`() {
+        val s = SettingsStore.forTestInMemory()
+        assertEquals(false, s.cascadeEnabled)
+        assertEquals(false, s.cascadeEnabledFlow.value)
+    }
+
+    @Test fun `cascadeEnabled round-trips through persistence`() {
+        val s = SettingsStore.forTestInMemory()
+        s.cascadeEnabled = true
+        assertEquals(true, s.cascadeEnabled)
+        assertEquals(true, s.cascadeEnabledFlow.value)
+        s.cascadeEnabled = false
+        assertEquals(false, s.cascadeEnabled)
+    }
+
+    @Test fun `cascadeEnabled reads back persisted true on construction`() {
+        val s = SettingsStore.forTestInMemory(mapOf("cascade_enabled" to "true"))
+        assertEquals(true, s.cascadeEnabled)
+    }
+
+    @Test fun `resetToDefaults restores cascadeEnabled to false`() {
+        val s = SettingsStore.forTestInMemory()
+        s.cascadeEnabled = true
+        s.resetToDefaults()
+        assertEquals(false, s.cascadeEnabled)
+    }
 }

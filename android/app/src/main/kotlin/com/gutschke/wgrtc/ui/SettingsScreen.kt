@@ -40,6 +40,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.gutschke.wgrtc.data.CascadeWiring
 import com.gutschke.wgrtc.data.EgressLiveStatus
 import com.gutschke.wgrtc.data.EgressLiveStatusObserver
 import com.gutschke.wgrtc.data.EgressPolicy
@@ -214,6 +215,13 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.outlineVariant,
             )
             Spacer(Modifier.height(16.dp))
+            CascadeSection(settings)
+
+            Spacer(Modifier.height(24.dp))
+            androidx.compose.material3.HorizontalDivider(
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+            Spacer(Modifier.height(16.dp))
             NotificationSection(settings)
 
             Spacer(Modifier.height(24.dp))
@@ -344,6 +352,49 @@ private fun JoinerModeSection(settings: SettingsStore) {
             checked = joinerN,
             onCheckedChange = { newValue ->
                 settings.joinerNEnabled = newValue
+            },
+        )
+    }
+}
+
+/**
+ * Cascade-forwarding toggle (CASCADE-2).  When on, traffic
+ * decrypted by a host-mode tunnel that's destined for a subnet
+ * served by a joiner tunnel gets re-encrypted and forwarded
+ * through that joiner — turning the phone into a relay between
+ * the two networks.  Off by default until validated in the
+ * field.
+ */
+@Composable
+private fun CascadeSection(settings: SettingsStore) {
+    val cascade by settings.cascadeEnabledFlow.collectAsState()
+    Text("Cascade forwarding", style = MaterialTheme.typography.titleMedium)
+    Spacer(Modifier.height(8.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "Relay between host-mode and joiner tunnels",
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                "Experimental.  When on, traffic that arrives over " +
+                    "one of your host-mode tunnels and is destined for " +
+                    "a network reachable through one of your joiner " +
+                    "tunnels gets forwarded across — useful for relaying " +
+                    "two LANs through the phone.  Leave off if you only " +
+                    "use joiner OR host mode.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = cascade,
+            onCheckedChange = { newValue ->
+                settings.cascadeEnabled = newValue
+                CascadeWiring.setEnabled(newValue)
             },
         )
     }

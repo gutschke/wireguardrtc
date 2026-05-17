@@ -156,6 +156,11 @@ class HostModeBackend(
                     listenPort = cfg.listenPort,
                 )
                 refreshActiveIds()
+                val handle = r.nativeBridgeHandle
+                val subnet = cfg.hostForwarderSubnet
+                if (handle != 0 && subnet != null) {
+                    CascadeWiring.onHostBridgeUp(handle, subnet)
+                }
             }
         }
     }
@@ -184,6 +189,10 @@ class HostModeBackend(
      */
     suspend fun teardown(tunnelId: String) {
         val slot = slots.remove(tunnelId) ?: return
+        val handle = slot.runner.nativeBridgeHandle
+        if (handle != 0) {
+            CascadeWiring.onHostBridgeDown(handle)
+        }
         withContext(Dispatchers.IO) {
             try { slot.runner.stop() } catch (_: Throwable) {}
         }

@@ -26,6 +26,8 @@ class RealWgBridgeBackendNative private constructor(
 
     @Volatile private var closed = false
 
+    override val nativeBridgeHandle: Int get() = handle
+
     /** Listener IDs we own; closed in [close] so the gvisor
      * netstack's accept goroutines exit cleanly. */
     private val activeListenerIds = mutableListOf<Int>()

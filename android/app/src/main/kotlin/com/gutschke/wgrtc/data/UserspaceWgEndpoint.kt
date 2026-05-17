@@ -37,6 +37,10 @@ class UserspaceWgEndpoint(
 
     val isClosed: Boolean get() = closed.get()
 
+    /** Pass-through to [WgBridgeBackend.nativeBridgeHandle] for
+     *  CASCADE-2 wiring; 0 when the backend is a test fake. */
+    val nativeBridgeHandle: Int get() = backend.nativeBridgeHandle
+
     /** Apply (or extend) the WG configuration. Same UAPI string
      * format as `wg set <iface> <args>`. */
     @Throws(Exception::class)
