@@ -1,7 +1,9 @@
 package com.gutschke.wgrtc.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -90,6 +92,7 @@ fun TunnelListScreen(
     val activeIds by vm.activeTunnelIds.collectAsState()
     val connectingId by vm.connectingTunnelId.collectAsState()
     val chromeOsWarningFor by vm.chromeOsLoopWarningFor.collectAsState()
+    var bridgePartnerPicker by remember { mutableStateOf<Tunnel?>(null) }
     // dropped vm.liveState — it's a singular legacy signal
     // that can't tell two concurrent tunnels apart.  Per-row state
     // is now (isActive contains id, connectingId == id) only.
@@ -192,6 +195,7 @@ fun TunnelListScreen(
                                     onToggle = { wantUp ->
                                         if (wantUp) connect(t.id) else disconnect(t.id)
                                     },
+                                    onLongPress = { bridgePartnerPicker = t },
                                 )
                                 if (t.source == Tunnel.Source.HOST_MODE &&
                                     t.relayPolicy == com.gutschke.wgrtc.data.RelayPolicy.Ask &&
@@ -232,6 +236,32 @@ fun TunnelListScreen(
     // §6.2 ChromeOS routing-loop warning.  Sticky dismissal lives
     // on the persisted Tunnel; the dialog only renders once per
     // host tunnel.  See `docs/ux-design-v2.md` §6.2.
+    bridgePartnerPicker?.let { t ->
+        BridgeWithDialog(
+            source = t,
+            candidates = tunnels.filter { other ->
+                other.id != t.id &&
+                    // Can't pair with a tunnel that's already in
+                    // a different Bridge group; would create a
+                    // 3-member group that grouping refuses to
+                    // collapse.  Same-group is fine (and means
+                    // the user wants to unpair → re-pair).
+                    (other.groupId == null || other.groupId == t.groupId)
+            },
+            onPick = { partner ->
+                vm.pairBridge(t.id, partner.id)
+                bridgePartnerPicker = null
+            },
+            onUnpair = if (t.groupId != null) {
+                {
+                    vm.unpairBridge(t.id)
+                    bridgePartnerPicker = null
+                }
+            } else null,
+            onDismiss = { bridgePartnerPicker = null },
+        )
+    }
+
     val ctx = androidx.compose.ui.platform.LocalContext.current
     chromeOsWarningFor?.let { t ->
         ChromeOsRoutingLoopDialog(
@@ -395,6 +425,7 @@ private fun EmptyState(onAddClick: () -> Unit) {
 
 // ─── Tunnel card ─────────────────────────────────────────────────
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TunnelCard(
     tunnel: Tunnel,
@@ -402,6 +433,7 @@ private fun TunnelCard(
     isConnecting: Boolean,
     onClick: () -> Unit,
     onToggle: (Boolean) -> Unit,
+    onLongPress: (() -> Unit)? = null,
 ) {
     val isHost = tunnel.source == Tunnel.Source.HOST_MODE
     val (badgeIcon, badgeTint) = if (isHost) {
@@ -429,7 +461,12 @@ private fun TunnelCard(
     }
 
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { onClick() },
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongPress,
+            ),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surface,
         ),
@@ -969,6 +1006,79 @@ internal fun failureCopy(
         )
     }
     else -> Triple("", "", null)
+}
+
+/**
+ * §11.8b "Bridge with…" dialog.  Long-pressing a tunnel row opens
+ * this picker showing every compatible candidate (any other tunnel
+ * not already in a different Bridge group).  Picking one pairs the
+ * two via [WgrtcViewModel.pairBridge].  When the source tunnel is
+ * already part of a Bridge, an "Unpair Bridge" option appears at
+ * the top.
+ *
+ * Compatibility — first-cut policy: candidate-list is anyone-but-
+ * different-Bridge.  Tighter rules (host-only allowed as Bridge
+ * partner, joiner AllowedIPs must overlap the host's enrolled
+ * peer set, etc.) are §2.1-rule-refinements that the user can
+ * decide on once they see how this affordance feels in practice.
+ */
+@Composable
+private fun BridgeWithDialog(
+    source: Tunnel,
+    candidates: List<Tunnel>,
+    onPick: (Tunnel) -> Unit,
+    onUnpair: (() -> Unit)?,
+    onDismiss: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Bridge \"${source.name}\" with…") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (candidates.isEmpty() && onUnpair == null) {
+                    Text(
+                        "No other tunnels to pair with. Add a second " +
+                            "tunnel first, then long-press here again.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                onUnpair?.let {
+                    TextButton(onClick = it) {
+                        Text(
+                            "Unpair this tunnel from its Bridge",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+                for (c in candidates) {
+                    TextButton(
+                        onClick = { onPick(c) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                if (c.source == Tunnel.Source.HOST_MODE)
+                                    Icons.Outlined.WifiTethering
+                                else Icons.Outlined.Login,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(c.name)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 /**

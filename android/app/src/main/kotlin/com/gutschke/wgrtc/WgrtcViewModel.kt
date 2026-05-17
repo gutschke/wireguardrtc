@@ -683,6 +683,41 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
 
  /**
+ * §11.8b — pair two tunnels into a Bridge by assigning a shared
+ * [Tunnel.groupId].  Idempotent: if one half is already in a
+ * group, that group's id is reused so the third member doesn't
+ * create a new id.  Use [unpairBridge] to undo.  Persisted via
+ * hub.saveTunnels.
+ */
+ fun pairBridge(firstId: String, secondId: String) {
+ if (firstId == secondId) return
+ val current = _tunnels.value
+ val groupId = current.firstOrNull { it.id == firstId }?.groupId
+ ?: current.firstOrNull { it.id == secondId }?.groupId
+ ?: java.util.UUID.randomUUID().toString()
+ val all = current.map {
+ if (it.id == firstId || it.id == secondId) it.copy(groupId = groupId) else it
+ }
+ _tunnels.value = all
+ viewModelScope.launch(Dispatchers.IO) { hub.saveTunnels(all) }
+ }
+
+ /**
+ * §11.8b — clear [Tunnel.groupId] on [tunnelId].  The OTHER half
+ * is left alone — if the user wants to unpair both they call
+ * this twice (or just delete the tunnel, which also clears the
+ * field implicitly).  See `docs/ux-design-v2.md` §3.2 orphan
+ * handling: a singleton group renders as Single anyway.
+ */
+ fun unpairBridge(tunnelId: String) {
+ val all = _tunnels.value.map {
+ if (it.id == tunnelId) it.copy(groupId = null) else it
+ }
+ _tunnels.value = all
+ viewModelScope.launch(Dispatchers.IO) { hub.saveTunnels(all) }
+ }
+
+ /**
  * Update [Tunnel.relayPolicy] without bouncing the tunnel.
  * Targeted entrypoint for the §2.3 banner — the heavier
  * [updateTunnel] disconnects + reconciles, which would defeat
