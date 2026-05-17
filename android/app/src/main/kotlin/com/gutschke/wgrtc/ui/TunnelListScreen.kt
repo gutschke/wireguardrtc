@@ -252,14 +252,18 @@ private fun TunnelCard(
     } else {
         Icons.Outlined.Login to MaterialTheme.colorScheme.primary
     }
-    // state derives from per-tunnel signals only —
-    // `isActive` from the unified active set, `isConnecting` from
-    // the in-flight connect id.  No global liveState read here.
-    val state = when {
-        isConnecting -> ConnState.Connecting
-        isActive -> ConnState.Up
-        else -> ConnState.Down
-    }
+    // §11.4 — registry-derived state is the source of truth.  Old
+    // (isActive, isConnecting) tuple is a fallback when the registry
+    // hasn't seen any transitions yet (typically because the user
+    // just imported a tunnel and hasn't tapped Connect).
+    val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+        .getProcessSingleton()
+    val tunnelState by registry.stateOf(tunnel.id).collectAsState()
+    val state = stateForPill(
+        registryState = tunnelState,
+        isActive = isActive,
+        isConnecting = isConnecting,
+    )
 
     Card(
         modifier = Modifier.fillMaxWidth().clickable { onClick() },
@@ -314,17 +318,106 @@ private fun TunnelCard(
     }
 }
 
-private enum class ConnState { Up, Down, Connecting }
+/**
+ * Status alphabet shown in the row pill.  Maps the registry's
+ * 9-state machine down to a smaller-cardinality presentation —
+ * the design's §3.1 colour palette has 8 distinct slots but the
+ * `Disabled` and `PausedUser` cases share "switch off" visual
+ * affordances, and `Connecting` covers both `Arming` and
+ * `Connecting` proper.
+ */
+private enum class ConnState {
+    Connected,    // green
+    Idle,         // gray (no-traffic non-fault)
+    Connecting,   // amber spinner
+    PausedSystem, // amber pill — "system paused"
+    PausedUser,   // blue pill — user pause
+    Pairing,      // violet — wormhole flow
+    Degraded,     // amber — handshake stale
+    FailedRec,    // red — recoverable
+    FailedPerm,   // dark red — needs user action
+    Disabled,     // neutral (also the legacy "Down")
+}
+
+/**
+ * Translate a registry state + the legacy (isActive, isConnecting)
+ * tuple into a single ConnState.  Registry wins when it has anything
+ * other than [TunnelState.Disabled]; otherwise we fall back so a
+ * never-touched tunnel doesn't appear as "Disabled" while the user
+ * thinks it just imported it (the legacy code rendered "Idle").
+ */
+private fun stateForPill(
+    registryState: com.gutschke.wgrtc.data.TunnelState,
+    isActive: Boolean,
+    isConnecting: Boolean,
+): ConnState = when (registryState) {
+    com.gutschke.wgrtc.data.TunnelState.Connected -> ConnState.Connected
+    com.gutschke.wgrtc.data.TunnelState.Idle -> ConnState.Idle
+    com.gutschke.wgrtc.data.TunnelState.Connecting,
+    com.gutschke.wgrtc.data.TunnelState.Arming -> ConnState.Connecting
+    com.gutschke.wgrtc.data.TunnelState.Degraded -> ConnState.Degraded
+    is com.gutschke.wgrtc.data.TunnelState.PausedSystem -> ConnState.PausedSystem
+    com.gutschke.wgrtc.data.TunnelState.PausedUser -> ConnState.PausedUser
+    com.gutschke.wgrtc.data.TunnelState.Pairing -> ConnState.Pairing
+    is com.gutschke.wgrtc.data.TunnelState.Failed ->
+        if (registryState.recoverable) ConnState.FailedRec else ConnState.FailedPerm
+    com.gutschke.wgrtc.data.TunnelState.Disabled -> when {
+        // Legacy fallback — the registry hasn't seen this tunnel
+        // yet but the ViewModel's old active-set still says it's
+        // up.  Trust the older signal until the rest of the
+        // pipeline starts emitting transitions.
+        isConnecting -> ConnState.Connecting
+        isActive -> ConnState.Connected
+        else -> ConnState.Idle
+    }
+}
 
 @Composable
 private fun StatusPill(state: ConnState) {
     val (label, fg, bg) = when (state) {
-        ConnState.Up -> Triple("Connected", StatusUpLight, StatusUpContainerLight)
-        ConnState.Connecting -> Triple("Connecting…", StatusConnectingLight, StatusConnectingContainerLight)
-        ConnState.Down -> Triple(
+        ConnState.Connected ->
+            Triple("Connected", StatusUpLight, StatusUpContainerLight)
+        ConnState.Connecting ->
+            Triple("Connecting…", StatusConnectingLight, StatusConnectingContainerLight)
+        ConnState.Idle -> Triple(
             "Idle",
             MaterialTheme.colorScheme.onSurfaceVariant,
             MaterialTheme.colorScheme.surfaceVariant,
+        )
+        ConnState.Disabled -> Triple(
+            "Off",
+            MaterialTheme.colorScheme.onSurfaceVariant,
+            MaterialTheme.colorScheme.surfaceVariant,
+        )
+        ConnState.PausedSystem -> Triple(
+            "System paused",
+            MaterialTheme.colorScheme.onTertiaryContainer,
+            MaterialTheme.colorScheme.tertiaryContainer,
+        )
+        ConnState.PausedUser -> Triple(
+            "Paused",
+            MaterialTheme.colorScheme.onSecondaryContainer,
+            MaterialTheme.colorScheme.secondaryContainer,
+        )
+        ConnState.Pairing -> Triple(
+            "Pairing…",
+            MaterialTheme.colorScheme.onSecondaryContainer,
+            MaterialTheme.colorScheme.secondaryContainer,
+        )
+        ConnState.Degraded -> Triple(
+            "Reconnecting",
+            MaterialTheme.colorScheme.onTertiaryContainer,
+            MaterialTheme.colorScheme.tertiaryContainer,
+        )
+        ConnState.FailedRec -> Triple(
+            "Connection failed",
+            MaterialTheme.colorScheme.onErrorContainer,
+            MaterialTheme.colorScheme.errorContainer,
+        )
+        ConnState.FailedPerm -> Triple(
+            "Needs attention",
+            MaterialTheme.colorScheme.onError,
+            MaterialTheme.colorScheme.error,
         )
     }
     Box(
