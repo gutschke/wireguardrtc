@@ -59,7 +59,26 @@ class JoinerNVpnService : VpnService() {
     private val binder = LocalBinder()
     private val backend: JoinerStackBackend = JoinerStackBackend(RealJoinerStackNative)
     private val tunProvider = BuilderTunFdProvider()
-    private val controller = JoinerNController(backend, tunProvider)
+    /** Forwards revoke/failure signals from the controller +
+     *  service callbacks into the process-wide [TunnelStateRegistry].
+     *  See `docs/ux-design-v2.md` §6.1 — establish-null is the
+     *  ground-truth signal; onRevoke and prepare-resync are the
+     *  belt-and-suspenders coverage. */
+    private val stateSink: com.gutschke.wgrtc.data.JoinerStateSink =
+        object : com.gutschke.wgrtc.data.JoinerStateSink {
+            override fun onRevoke(
+                affected: Set<String>,
+                reason: com.gutschke.wgrtc.data.PauseReason,
+                note: String?,
+            ) {
+                val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+                    .getProcessSingleton()
+                for (id in affected) {
+                    registry.recordRevoke(id, reason, note)
+                }
+            }
+        }
+    private val controller = JoinerNController(backend, tunProvider, stateSink)
 
     /** Most-recent VpnService TUN ParcelFileDescriptor. Held here
      *  so we can close it on teardown without racing the JoinerN
@@ -149,6 +168,27 @@ class JoinerNVpnService : VpnService() {
         // its `onDestroy` is the kind of bug review #3 flagged
         // pre-emptively.
         WgBridgeNative.installProtector(null)
+    }
+
+    /**
+     * VpnService.onRevoke fires when another VPN app takes over
+     * the system VPN slot.  Distinct from "user toggled VPN
+     * permission off in Settings" (which is caught via
+     * Builder.establish() returning null on the next connect —
+     * see JoinerNController.rebuildLocked).  Both paths emit to
+     * the registry; this one catches the cheap competitor-VPN case
+     * without waiting for a reconnect attempt.
+     *
+     * Per `docs/ux-design-v2.md` §6.1 signal 2.
+     */
+    override fun onRevoke() {
+        val affected = controller.activeJoinerIds
+        stateSink.onRevoke(
+            affected,
+            com.gutschke.wgrtc.data.PauseReason.AnotherVpnTookOver,
+            note = "VpnService.onRevoke() fired",
+        )
+        super.onRevoke()
     }
 
     override fun onDestroy() {

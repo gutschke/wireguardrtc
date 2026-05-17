@@ -39,6 +39,11 @@ import kotlinx.coroutines.sync.withLock
 class JoinerNController(
     private val backend: JoinerStackBackend,
     private val tunFdProvider: TunFdProvider,
+    /** Optional sink for revoke/failure events that the service
+     *  layer wires to [TunnelStateRegistry].  Null in pure-JVM
+     *  tests; production wires this in
+     *  [JoinerNVpnService]. */
+    private val stateSink: JoinerStateSink? = null,
 ) {
     /** Per-joiner configuration the caller hands us.  Mirrors the
      *  fields the controller pulls from the wg-quick text +
@@ -184,6 +189,16 @@ class JoinerNController(
             throw JoinerNException("VpnService.Builder.establish failed: ${t.message}", t)
         }
         if (fd < 0) {
+            // PHANTOM-ACTIVE FIX (v2 §6.1 signal 1):
+            // Builder.establish() returning null is the dominant
+            // ground-truth signal for VPN consent revocation —
+            // covers Settings-toggle-off, force-stop, and the
+            // background-process-reaped cases.  Mark every
+            // currently-managed joiner as Paused(system) so the
+            // UI stops claiming they're active.
+            val affected = active.keys.toSet() + configs.map { it.tunnelId }
+            stateSink?.onRevoke(affected, PauseReason.EstablishNull,
+                note = "Builder.establish() returned null — consent withdrawn")
             throw JoinerNException(
                 "VpnService.Builder.establish returned no fd " +
                 "(consent revoked?)")
@@ -218,6 +233,25 @@ class JoinerNController(
 /** Typed exception for joiner-N controller failures. */
 class JoinerNException(msg: String, cause: Throwable? = null) :
     RuntimeException(msg, cause)
+
+/**
+ * Sink for joiner-N lifecycle events that the service layer
+ * forwards to [TunnelStateRegistry].  Implementations are
+ * synchronous — fast no-op-or-emit work only.  Each method receives
+ * the set of tunnel ids affected by the event; an empty set means
+ * "nobody managed yet" (the controller had no slots when the event
+ * fired) and is itself meaningful for the never-connected case.
+ *
+ * Production wires this in `JoinerNVpnService`; pure-JVM tests
+ * pass null or a recording fake.
+ */
+interface JoinerStateSink {
+    /** Some signal indicates Android revoked our consent.  Mark
+     *  every [affected] tunnel as [TunnelState.PausedSystem]
+     *  carrying [reason].  Optional human-readable [note] joins
+     *  the transition-log entry. */
+    fun onRevoke(affected: Set<String>, reason: PauseReason, note: String? = null)
+}
 
 /**
  * Abstraction over `VpnService.Builder.establish()` so the

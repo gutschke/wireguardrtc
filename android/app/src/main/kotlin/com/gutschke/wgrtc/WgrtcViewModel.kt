@@ -465,6 +465,40 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  _liveState.value = "UP"
  startThroughputSampler()
  }
+ // PHANTOM-ACTIVE FIX (v2 §11.2): subscribe to the
+ // process-wide TunnelStateRegistry so the moment a joiner
+ // transitions to PausedSystem (consent revoked / another
+ // VPN took over / foreground resync / background resync)
+ // the UI clears that tunnel from the active set.  Without
+ // this, the UI keeps drawing the tunnel as connected
+ // forever — the bug the user reported.
+ //
+ // We don't switch the WHOLE UI to read from the registry
+ // here; that's §11.4-5.  This minimal observer just resolves
+ // the visible regression.
+ viewModelScope.launch {
+ val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+ .getProcessSingleton()
+ // The registry can grow over time; subscribe to the
+ // ids we know about right now and re-subscribe when the
+ // active set changes.  This is poll-style (1 Hz) rather
+ // than per-tunnel-flow because the active set is small
+ // (<10 tunnels typical) and the freshness budget is
+ // human-scale.
+ while (isActive) {
+ kotlinx.coroutines.delay(1_000)
+ val ids = _activeJoinerNTunnelIds.value
+ val revoked = ids.filter { id ->
+ registry.stateOf(id).value is
+ com.gutschke.wgrtc.data.TunnelState.PausedSystem
+ }
+ if (revoked.isNotEmpty()) {
+ _activeJoinerNTunnelIds.value = ids - revoked.toSet()
+ android.util.Log.i("wgrtc-vm",
+ "registry observed PausedSystem on $revoked; clearing from active set")
+ }
+ }
+ }
  // Subscribe to the hub's endpoint-applied events so the
  // viewmodel's _tunnels stays in sync with the disk state
  // when listeners (which run in the hub's scope) rewrite

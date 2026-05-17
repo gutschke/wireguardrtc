@@ -77,6 +77,25 @@ class MainActivity : ComponentActivity() {
         // Re-check on every resume so the system permission sheet
         // shows up next time the app is in front.
         maybeRequestNotificationPermission()
+        // PHANTOM-ACTIVE FIX (v2 §6.1 signal 3):
+        // re-check VPN consent on every foreground.  If prepare()
+        // returns a non-null Intent it means consent has been
+        // revoked between connect attempts (typically the user
+        // toggled VPN permission off in Settings → Apps → wgrtc).
+        // Don't launch the consent UI here — that's the user's call
+        // when they next tap Connect.  Just emit the registry
+        // event so the row stops claiming Connected.
+        if (VpnService.prepare(this) != null) {
+            val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+                .getProcessSingleton()
+            for (id in vm.activeJoinerNTunnelIds.value) {
+                registry.recordRevoke(
+                    id,
+                    com.gutschke.wgrtc.data.PauseReason.ForegroundResync,
+                    note = "VpnService.prepare() returned non-null on resume",
+                )
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

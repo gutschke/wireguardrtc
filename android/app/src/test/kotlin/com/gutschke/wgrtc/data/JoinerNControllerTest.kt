@@ -201,19 +201,70 @@ class JoinerNControllerTest {
         assertTrue(rig.controller.activeJoinerIds.isEmpty())
     }
 
+    @Test
+    fun `establish-null fires onRevoke with EstablishNull for affected tunnels`() = runBlocking<Unit> {
+        val rig = newRig()
+        // Get a tunnel up first so we have an active set to revoke.
+        rig.controller.addJoiner(joiner("t1", "10.99.0.2", peerCidr = "10.99.0.0/24"))
+        // Now arrange for the NEXT rebuild's establish() to fail
+        // (simulating user toggling VPN permission off in Settings).
+        rig.tunProvider.nextOpenReturnsNegative = true
+        assertThrows(JoinerNException::class.java) {
+            runBlocking {
+                rig.controller.addJoiner(
+                    joiner("t2", "10.50.0.2", peerCidr = "10.50.0.0/24"))
+            }
+        }
+        // Exactly one revoke event, covering both currently-managed
+        // (t1) and pending (t2) ids.
+        assertEquals(1, rig.stateSink.events.size)
+        val e = rig.stateSink.events[0]
+        assertEquals(PauseReason.EstablishNull, e.reason)
+        assertTrue(e.affected.contains("t1"))
+        assertTrue(e.affected.contains("t2"))
+    }
+
+    @Test
+    fun `successful add does not fire a revoke event`() = runBlocking<Unit> {
+        val rig = newRig()
+        rig.controller.addJoiner(joiner("t1", "10.99.0.2", peerCidr = "10.99.0.0/24"))
+        rig.controller.addJoiner(joiner("t2", "10.50.0.2", peerCidr = "10.50.0.0/24"))
+        rig.controller.removeJoiner("t1")
+        rig.controller.closeAll()
+        assertTrue(rig.stateSink.events.isEmpty(),
+            "non-revoke lifecycle must not write to the revoke sink: ${rig.stateSink.events}")
+    }
+
     // ── helpers ────────────────────────────────────────────────
 
     private data class Rig(
         val fakeNative: FakeJoinerStackNative,
         val tunProvider: FakeTunFdProvider,
         val controller: JoinerNController,
+        val stateSink: RecordingStateSink,
     )
 
     private fun newRig(): Rig {
         val fakeNative = FakeJoinerStackNative()
         val backend = JoinerStackBackend(fakeNative)
         val tunProvider = FakeTunFdProvider()
-        return Rig(fakeNative, tunProvider, JoinerNController(backend, tunProvider))
+        val sink = RecordingStateSink()
+        return Rig(
+            fakeNative,
+            tunProvider,
+            JoinerNController(backend, tunProvider, sink),
+            sink,
+        )
+    }
+
+    /** Records every revoke event for inspection in
+     *  phantom-active tests. */
+    private class RecordingStateSink : JoinerStateSink {
+        data class Event(val affected: Set<String>, val reason: PauseReason, val note: String?)
+        val events = mutableListOf<Event>()
+        override fun onRevoke(affected: Set<String>, reason: PauseReason, note: String?) {
+            events += Event(affected, reason, note)
+        }
     }
 
     private fun joiner(
@@ -240,6 +291,12 @@ class JoinerNControllerTest {
         private val nextFd = AtomicInteger(99)
         // Default: produce a fresh positive fd on every call.
         var nextResultOrErr: TunResult? = null
+        /** Simulate `Builder.establish() returning null` once — the
+         *  flag clears after one use so subsequent calls succeed
+         *  again.  Distinct from [nextResultOrErr] which is one-shot
+         *  but cumbersome to construct from outside (the sealed
+         *  interface is private). */
+        var nextOpenReturnsNegative: Boolean = false
         override fun openTunFd(
             addresses: List<Cidr>,
             routes: List<Cidr>,
@@ -247,6 +304,10 @@ class JoinerNControllerTest {
             dnsServers: List<String>,
         ): Int {
             openMtus += mtu
+            if (nextOpenReturnsNegative) {
+                nextOpenReturnsNegative = false
+                return -1
+            }
             val r = nextResultOrErr
             nextResultOrErr = null
             return when (r) {
