@@ -309,15 +309,33 @@ fun HostModeSetupScreen(
                             }
                     }
                     try {
-                        val t = vm.addHostModeTunnel(
-                            name = name,
-                            subnet = subnet,
-                            hostIp = hostIp,
-                            listenPort = port,
-                            brokerWss = brokerWss,
-                            brokerKey = brokerKey,
-                            advertisedAllowedIps = advertised,
-                        )
+                        // §11.6 Tile-#3 — bridge-aware save path.
+                        // When a Bridge flow is in progress the
+                        // host is the second half; route through
+                        // the explicit wizard entrypoint so the
+                        // new tunnel is stamped with the same
+                        // groupId as the just-created joiner.
+                        val t = if (vm.pendingBridgeGroupId.value != null) {
+                            vm.addHostModeTunnelInBridgeFlow(
+                                name = name,
+                                subnet = subnet,
+                                hostIp = hostIp,
+                                listenPort = port,
+                                brokerWss = brokerWss,
+                                brokerKey = brokerKey,
+                                advertisedAllowedIps = advertised,
+                            )
+                        } else {
+                            vm.addHostModeTunnel(
+                                name = name,
+                                subnet = subnet,
+                                hostIp = hostIp,
+                                listenPort = port,
+                                brokerWss = brokerWss,
+                                brokerKey = brokerKey,
+                                advertisedAllowedIps = advertised,
+                            )
+                        }
                         onCreated(t.id)
                     } catch (e: Throwable) {
                         error = e.message ?: e.javaClass.simpleName

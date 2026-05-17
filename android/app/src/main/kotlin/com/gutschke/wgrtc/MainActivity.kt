@@ -237,6 +237,23 @@ class MainActivity : ComponentActivity() {
         val startDest = remember {
             if (app.settings.onboardingSeen) Routes.LIST else Routes.ONBOARDING
         }
+        // §11.6 Tile-#3 bridge-aware nav helper.  Three "tunnel
+        // just got added" screens (PasteTunnelScreen,
+        // ManualEntryScreen, HostModeSetupScreen) need the same
+        // routing rule: pop back to LIST normally, OR navigate
+        // forward to HOST_SETUP when this was the joiner half of
+        // a Bridge flow.  Capturing it once here prevents the
+        // three callsites from drifting (round-2 critic).  Host
+        // side passes shouldNavigateToHostSetup=false because
+        // the host save is the SECOND half — the wizard ends.
+        fun onJoinerAddedBridgeAware() {
+            if (vm.pendingBridgeGroupId.value != null) {
+                nav.popBackStack(Routes.LIST, false)
+                nav.navigate(Routes.HOST_SETUP)
+            } else {
+                nav.popBackStack(Routes.LIST, false)
+            }
+        }
         NavHost(navController = nav, startDestination = startDest) {
             composable(Routes.ONBOARDING) {
                 com.gutschke.wgrtc.ui.OnboardingScreen(
@@ -251,6 +268,21 @@ class MainActivity : ComponentActivity() {
                 )
             }
             composable(Routes.LIST) {
+                // §11.6 Tile-#3 — cancel-mid-flow handling:
+                // we intentionally do NOT clear the pending
+                // Bridge flow here.  The wizard's success path is
+                // `JOIN → popBackStack(LIST) → navigate(HOST_SETUP)`,
+                // which briefly recomposes LIST between the pop
+                // and the push.  Clearing pending here would race
+                // the HOST_SETUP composition and break the wizard.
+                //
+                // The bounded-leak invariants we accept:
+                //   - pending lives in a StateFlow (in-memory only;
+                //     process restart clears it);
+                //   - next startBridgeFlow() warn-and-overwrites;
+                //   - a dangling joiner groupId (orphaned by a
+                //     cancelled flow) renders as Single by
+                //     groupTunnels — see BridgeGrouping.kt §3.2.
                 TunnelListScreen(
                     onAddClick = { nav.navigate(Routes.ADD) },
                     onTunnelClick = { t -> nav.navigate(Routes.detail(t.id)) },
@@ -262,7 +294,20 @@ class MainActivity : ComponentActivity() {
                     // both halves with a shared groupId is §11.8;
                     // until it lands, the user has a clean entry
                     // point for the first half.
-                    onBridgeClick = { nav.navigate(Routes.JOIN) },
+                    onBridgeClick = {
+                        // §11.6 Tile-#3 wizard kickoff.  Allocate
+                        // the pending groupId BEFORE navigation so
+                        // the joiner-side save (PasteTunnelScreen
+                        // or ManualEntryScreen) sees the flow when
+                        // the user confirms.  The host save then
+                        // terminates the flow; if the user backs
+                        // out mid-way the flow stays pending until
+                        // they either complete a host save or
+                        // explicitly cancel — the next
+                        // startBridgeFlow() warns on clobber.
+                        vm.startBridgeFlow()
+                        nav.navigate(Routes.JOIN)
+                    },
                     vm = vm,
                 )
             }
@@ -430,6 +475,18 @@ class MainActivity : ComponentActivity() {
                 HostModeSetupScreen(
                     onBack = { nav.popBackStack() },
                     onCreated = { id ->
+                        // §11.6 Tile-#3 — when this was the host
+                        // half of a Bridge flow, terminate the
+                        // flow here.  The save site already
+                        // stamped the groupId; we drop the
+                        // pending-id slot so a subsequent unrelated
+                        // host save doesn't accidentally consume
+                        // it.  This is the deliberate
+                        // termination point per the
+                        // BridgeOrchestrationState contract.
+                        if (vm.pendingBridgeGroupId.value != null) {
+                            vm.finishBridgeFlow()
+                        }
                         // Created — drop straight to the new tunnel's
                         // detail screen so the user can mint an
                         // enrollment QR.
@@ -442,7 +499,7 @@ class MainActivity : ComponentActivity() {
             composable(Routes.PASTE) {
                 PasteTunnelScreen(
                     onBack = { nav.popBackStack() },
-                    onAdded = { nav.popBackStack(Routes.LIST, false) },
+                    onAdded = { onJoinerAddedBridgeAware() },
                     vm = vm,
                 )
             }
@@ -472,7 +529,7 @@ class MainActivity : ComponentActivity() {
             composable(Routes.MANUAL) {
                 ManualEntryScreen(
                     onBack = { nav.popBackStack() },
-                    onAdded = { nav.popBackStack(Routes.LIST, false) },
+                    onAdded = { onJoinerAddedBridgeAware() },
                     vm = vm,
                 )
             }

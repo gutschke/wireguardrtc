@@ -282,7 +282,14 @@ private fun LegacyForm(vm: WgrtcViewModel, onAdded: () -> Unit) {
                     if (keepalive.isNotBlank())
                         appendLine("PersistentKeepalive = ${keepalive.trim()}")
                 }
-                vm.addLegacyTunnel(name, cfg, Tunnel.Source.MANUAL)
+                // §11.6 Tile-#3 — bridge-aware save path.  See
+                // PasteTunnelScreen for the doc; this is the
+                // manual-entry sibling.
+                if (vm.pendingBridgeGroupId.value != null) {
+                    vm.addLegacyTunnelInBridgeFlow(name, cfg, Tunnel.Source.MANUAL)
+                } else {
+                    vm.addLegacyTunnel(name, cfg, Tunnel.Source.MANUAL)
+                }
                 onAdded()
             } catch (t: Throwable) {
                 error = t.message ?: t.javaClass.simpleName

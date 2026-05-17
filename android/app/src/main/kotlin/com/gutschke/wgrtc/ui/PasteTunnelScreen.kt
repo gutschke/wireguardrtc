@@ -157,15 +157,39 @@ fun PasteTunnelScreen(
                     busy = true; error = null
                     scope.launch {
                         try {
+                            // §11.6 Tile-#3 — when a Bridge flow is
+                            // in progress this is the joiner-side
+                            // save and the new tunnel must be
+                            // stamped with the pending groupId.
+                            // The raw-config path has an explicit
+                            // bridge-flow variant; the wormhole /
+                            // wgrtc-enroll path does NOT yet —
+                            // refuse to proceed rather than save an
+                            // unstamped joiner that would leave the
+                            // host half pointing at an orphan
+                            // groupId.  (Round-2 critic on the
+                            // wizard wiring caught this footgun.)
+                            val bridgeActive = vm.pendingBridgeGroupId.value != null
                             when {
                                 raw.startsWith("wgrtc-enroll://") -> {
-                                    val uri = EnrollUri.parse(raw)
-                                    vm.enrollAndAdd(uri, deviceLabel,
-                                        name.takeIf { it.isNotBlank() })
-                                    onAdded()
+                                    if (bridgeActive) {
+                                        error = "Bridge setup doesn't support " +
+                                            "wormhole / enroll URIs yet — paste a " +
+                                            "raw [Interface] config, or cancel " +
+                                            "and use Tile #1 for this tunnel."
+                                    } else {
+                                        val uri = EnrollUri.parse(raw)
+                                        vm.enrollAndAdd(uri, deviceLabel,
+                                            name.takeIf { it.isNotBlank() })
+                                        onAdded()
+                                    }
                                 }
                                 raw.startsWith("[Interface]") -> {
-                                    vm.addLegacyTunnel(name, raw)
+                                    if (bridgeActive) {
+                                        vm.addLegacyTunnelInBridgeFlow(name, raw)
+                                    } else {
+                                        vm.addLegacyTunnel(name, raw)
+                                    }
                                     onAdded()
                                 }
                                 else -> error =
