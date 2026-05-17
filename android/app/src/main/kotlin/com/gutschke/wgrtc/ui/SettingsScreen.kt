@@ -1,5 +1,7 @@
 package com.gutschke.wgrtc.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -17,6 +19,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -252,12 +255,92 @@ fun SettingsScreen(
                 } catch (_: Throwable) { "" }
             }
             Spacer(Modifier.height(16.dp))
-            Text(
-                "wgrtc v$versionName",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            HiddenKillSwitchVersionLabel(versionName, settings)
         }
+    }
+}
+
+/**
+ * §13 layer-3 emergency cascade kill-switch UI.  The version label
+ * at the bottom of Settings is long-press-able; a long-press opens
+ * a dialog with the toggle for [SettingsStore.cascadeForcedOff].
+ *
+ * Hidden by design — the long-press affordance is invisible to a
+ * regular user but discoverable via the design doc and bug-report
+ * support channels.  The toggle is the user-side recovery when a
+ * shipped CASCADE-2 regression hits release-build users — without
+ * it, only `.debug` / `.agent` builds (via SET_CASCADE adb
+ * broadcast) have the escape hatch.  See `docs/ux-design-v2.md`
+ * §13.
+ *
+ * When ON, every CascadeWiring evaluation in
+ * [HostModeBackend.start] / [HostModeBackend.reevaluateCascade]
+ * short-circuits to "blocked" regardless of per-tunnel
+ * relayPolicy.  Existing in-flight registrations are torn down on
+ * the next reevaluateCascade tick.
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun HiddenKillSwitchVersionLabel(
+    versionName: String,
+    settings: SettingsStore,
+) {
+    val forcedOff by settings.cascadeForcedOffFlow.collectAsState()
+    var showDialog by remember { mutableStateOf(false) }
+    Text(
+        text = if (forcedOff) "wgrtc v$versionName · cascade off" else "wgrtc v$versionName",
+        style = MaterialTheme.typography.bodySmall,
+        color = if (forcedOff)
+            MaterialTheme.colorScheme.error
+        else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.combinedClickable(
+            onClick = {}, // ignore single tap — only long-press opens the menu
+            onLongClick = { showDialog = true },
+        ),
+    )
+    if (showDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showDialog = false },
+            title = { Text("Emergency: cascade off") },
+            text = {
+                Text(
+                    "Force-disable cascade relaying across every host " +
+                        "tunnel?  Use this only if a recent update broke " +
+                        "your network — flipping it ON tears down every " +
+                        "active cascade and prevents new ones from " +
+                        "registering, regardless of per-tunnel \"Allow " +
+                        "relay\" choices.  Flip OFF again once the " +
+                        "regression is fixed.",
+                )
+            },
+            confirmButton = {
+                if (forcedOff) {
+                    Button(onClick = {
+                        settings.cascadeForcedOff = false
+                        showDialog = false
+                    }) { Text("Re-enable cascade") }
+                } else {
+                    Button(
+                        onClick = {
+                            // Flipping the setting triggers
+                            // WgrtcApp's cascadeForcedOffFlow
+                            // collector → CascadeWiring.setEnabled(false)
+                            // → instant tear-down of every active
+                            // host bridge + joiner stack.  No need
+                            // for a manual sweep here.
+                            settings.cascadeForcedOff = true
+                            showDialog = false
+                        },
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) { Text("Force cascade off") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDialog = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 

@@ -58,6 +58,14 @@ class SettingsStore internal constructor(private val backing: Backing) {
     // per-host-tunnel decision (`Tunnel.relayPolicy`).  See
     // `docs/ux-design-v2.md` §2 / §12.  resetToDefaults still
     // removes the legacy pref so it stops lingering on upgrades.
+    private val _cascadeForcedOff = MutableStateFlow(
+        // §13 layer-3 emergency kill-switch — when on, every
+        // CascadeWiring evaluation short-circuits to "blocked"
+        // regardless of per-tunnel relayPolicy.  Hidden behind a
+        // long-press on the version label in SettingsScreen so a
+        // release-build user with a CASCADE-2 regression has a
+        // user-side escape hatch.  Off by default.
+        backing.getString(K_CASCADE_FORCED_OFF) == "true")
 
     val defaultBrokerWssFlow: StateFlow<String> = _wss.asStateFlow()
     val defaultBrokerKeyFlow: StateFlow<String> = _key.asStateFlow()
@@ -85,6 +93,13 @@ class SettingsStore internal constructor(private val backing: Backing) {
     val joinerNEnabledFlow: StateFlow<Boolean> = _joinerNEnabled.asStateFlow()
 
     // cascadeEnabledFlow removed in v2 §11.3 — see Tunnel.relayPolicy.
+
+    /** §13 layer-3 emergency cascade kill-switch.  When true,
+     *  every CascadeWiring evaluation is force-blocked regardless
+     *  of per-tunnel relayPolicy.  Off by default; surfaced via
+     *  the hidden long-press menu on the Settings version label.
+     *  Persisted across app restarts. */
+    val cascadeForcedOffFlow: StateFlow<Boolean> = _cascadeForcedOff.asStateFlow()
 
     var defaultBrokerWss: String
         get() = _wss.value
@@ -123,6 +138,13 @@ class SettingsStore internal constructor(private val backing: Backing) {
 
     // var cascadeEnabled removed in v2 §11.3 — see Tunnel.relayPolicy.
 
+    var cascadeForcedOff: Boolean
+        get() = _cascadeForcedOff.value
+        set(value) {
+            backing.putString(K_CASCADE_FORCED_OFF, value.toString())
+            _cascadeForcedOff.value = value
+        }
+
     /**
      * Whether the first-launch onboarding has been completed.
      * Read once on Application startup to decide whether the user
@@ -144,6 +166,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         backing.remove(K_EGRESS_POLICY)
         backing.remove(K_HIDE_LISTENER_NOTIFICATION)
         backing.remove(K_JOINER_N_ENABLED)
+        backing.remove(K_CASCADE_FORCED_OFF)
         // K_CASCADE_ENABLED retired in v2 §11.3 but we still scrub
         // the on-disk value so old prefs files don't linger across
         // upgrades.
@@ -158,6 +181,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         _egress.value = EgressPolicy.OsDefault
         _hideListenerNotification.value = false
         _joinerNEnabled.value = true
+        _cascadeForcedOff.value = false
     }
 
     data class Snapshot(val brokerWss: String, val brokerKey: String)
@@ -170,6 +194,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
         private const val K_ONBOARDING_SEEN = "onboarding_seen"
         private const val K_HIDE_LISTENER_NOTIFICATION = "hide_listener_notification"
         private const val K_JOINER_N_ENABLED = "joiner_n_enabled"
+        private const val K_CASCADE_FORCED_OFF = "cascade_forced_off"
         // Legacy keys — read only during resetToDefaults() to
         // scrub leftover prefs from pre- installs. Never
         // written.

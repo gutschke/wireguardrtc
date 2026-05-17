@@ -130,6 +130,38 @@ class SettingsStoreTest {
         assertEquals(true, s.joinerNEnabled)
     }
 
+    @Test fun `cascadeForcedOff defaults to false`() {
+        val s = SettingsStore.forTestInMemory()
+        assertEquals(false, s.cascadeForcedOff)
+        assertEquals(false, s.cascadeForcedOffFlow.value)
+    }
+
+    @Test fun `cascadeForcedOff round-trips through persistence`() {
+        val s = SettingsStore.forTestInMemory()
+        s.cascadeForcedOff = true
+        assertEquals(true, s.cascadeForcedOff)
+        assertEquals(true, s.cascadeForcedOffFlow.value)
+        s.cascadeForcedOff = false
+        assertEquals(false, s.cascadeForcedOff)
+    }
+
+    @Test fun `cascadeForcedOff reads back persisted true on construction`() {
+        // The §13 layer-3 kill-switch must survive process
+        // restarts — that's the whole point of having it
+        // persisted rather than process-scope only.  This test
+        // pins the on-disk key + the "true" / "false" literal
+        // serialisation contract.
+        val s = SettingsStore.forTestInMemory(mapOf("cascade_forced_off" to "true"))
+        assertEquals(true, s.cascadeForcedOff)
+    }
+
+    @Test fun `resetToDefaults clears cascadeForcedOff`() {
+        val s = SettingsStore.forTestInMemory()
+        s.cascadeForcedOff = true
+        s.resetToDefaults()
+        assertEquals(false, s.cascadeForcedOff)
+    }
+
     @Test fun `resetToDefaults scrubs legacy cascade_enabled pref`() {
         // K_CASCADE_ENABLED was retired in v2 §11.3 but the on-disk
         // value lingers for users who had the toggle on in v0.2.x.

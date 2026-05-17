@@ -15,6 +15,7 @@ import com.gutschke.wgrtc.data.RealWgBridgeBackendNative
 import com.gutschke.wgrtc.data.SettingsStore
 import com.gutschke.wgrtc.data.WgBridgeBackendFactory
 import com.gutschke.wgrtc.signalling.BrokerNetworkPin
+import kotlinx.coroutines.launch
 import com.gutschke.wgrtc.signalling.SignallingLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -102,15 +103,35 @@ class WgrtcApp : Application() {
         // trap. See BrokerNetworkPin's doc for full rationale and
         // the case where it doesn't help.
         BrokerNetworkPin.register(this)
-        // CASCADE-2 — cascade is now a per-host-tunnel decision
+        // CASCADE-2 — cascade is a per-host-tunnel decision
         // (Tunnel.relayPolicy) rather than a process-wide toggle.
-        // HostModeBackend.start consults the tunnel's policy before
-        // calling into CascadeWiring; no app-level restore needed
-        // here.  See `docs/ux-design-v2.md` §11.3.  The §13-layer-3
-        // emergency kill-switch (hidden Settings long-press) would
-        // be the only thing that re-enters CascadeWiring at this
-        // layer, and it's a follow-up.
-        com.gutschke.wgrtc.data.CascadeWiring.setEnabled(true)
+        // The §13 layer-3 emergency kill-switch
+        // (SettingsStore.cascadeForcedOff) is the one app-wide
+        // override; collect it into CascadeWiring.setEnabled so a
+        // user-facing toggle in the hidden long-press menu takes
+        // effect immediately AND on every subsequent process
+        // start.  When the flow goes false → true, setEnabled
+        // tears down every registered host bridge + the joiner
+        // stack synchronously.  When it goes true → false, the
+        // wiring re-opens for business and we call
+        // reapplyCascadeForActiveSlots() to re-register active
+        // host slots without bouncing them.
+        appScope.launch {
+            settings.cascadeForcedOffFlow.collect { forcedOff ->
+                com.gutschke.wgrtc.data.CascadeWiring.setEnabled(!forcedOff)
+                if (!forcedOff) {
+                    // reapply reads tunnels.json via ListenerHub +
+                    // calls JNI for each Always host — both belong
+                    // on Dispatchers.IO per the project's "no
+                    // blocking work on Default" convention.
+                    kotlinx.coroutines.withContext(
+                        kotlinx.coroutines.Dispatchers.IO,
+                    ) {
+                        hostModeBackend.reapplyCascadeForActiveSlots()
+                    }
+                }
+            }
+        }
         // No startup JNI probe: the SIGSEGV class we used to chase
         // turned out to be gomobile-bind's marshalling, not a
         // dual-runtime conflict. deleted WgBridgeSmokeProbe;

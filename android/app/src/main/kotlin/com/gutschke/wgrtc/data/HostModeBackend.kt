@@ -162,6 +162,16 @@ class HostModeBackend(
                 // user has explicitly granted relay permission for
                 // this host.  Ask / Never both block; Always installs.
                 // See `docs/ux-design-v2.md` §2.1 rule (3).
+                //
+                // Cascade registration is gated by both the
+                // per-tunnel relayPolicy AND the process-wide
+                // CascadeWiring.setEnabled flag (the §13 layer-3
+                // emergency kill-switch toggles the latter).  The
+                // wiring layer itself ignores onHostBridgeUp when
+                // disabled, so we don't need to short-circuit
+                // here — but we still gate on policy so an
+                // unconditional call doesn't accidentally bridge
+                // a non-Always host when the kill-switch is off.
                 if (handle != 0 && subnet != null && tunnel.relayPolicy == RelayPolicy.Always) {
                     CascadeWiring.onHostBridgeUp(handle, subnet)
                 }
@@ -232,12 +242,49 @@ class HostModeBackend(
      * the same subnet is a no-op in the ferry registry; tearing
      * down an unregistered bridge is also a no-op.
      */
+    /**
+     * Re-apply cascade registration policy across every active
+     * host slot.  Used after the §13 layer-3 kill-switch flips
+     * back to false: when the wiring was disabled the host
+     * registrations were torn down by [CascadeWiring.setEnabled],
+     * and they don't return automatically.  This sweep walks
+     * every active slot and re-invokes
+     * [CascadeWiring.onHostBridgeUp] for each one whose
+     * relayPolicy is Always.  No-op when the wiring is currently
+     * disabled (CascadeWiring's own gating makes each call a
+     * no-op anyway).
+     */
+    fun reapplyCascadeForActiveSlots() {
+        for ((tunnelId, slot) in slots) {
+            if (slot.paused) continue
+            val handle = slot.runner.nativeBridgeHandle
+            if (handle == 0) continue
+            // Look up the tunnel's persisted relayPolicy — the
+            // backend doesn't carry the field, only the runner's
+            // cfg.  Read from the application-scope tunnel
+            // registry rather than caching here.
+            val t = com.gutschke.wgrtc.WgrtcApp.instance
+                .listenerHub.loadTunnels()
+                .firstOrNull { it.id == tunnelId }
+                ?: continue
+            if (t.relayPolicy != RelayPolicy.Always) continue
+            val subnet = t.toRunnerConfig().hostForwarderSubnet ?: continue
+            CascadeWiring.onHostBridgeUp(handle, subnet)
+        }
+    }
+
     fun reevaluateCascade(tunnel: Tunnel) {
         val slot = slots[tunnel.id] ?: return
         if (slot.paused) return
         val handle = slot.runner.nativeBridgeHandle
         if (handle == 0) return
         val subnet = tunnel.toRunnerConfig().hostForwarderSubnet ?: return
+        // §13 layer-3 emergency kill-switch is enforced at the
+        // CascadeWiring layer (its setEnabled flag tracks
+        // SettingsStore.cascadeForcedOff via the WgrtcApp-level
+        // collector).  This method only needs to honour the
+        // per-tunnel relayPolicy — onHostBridgeUp/Down become
+        // no-ops when the wiring is disabled.
         when (tunnel.relayPolicy) {
             RelayPolicy.Always -> CascadeWiring.onHostBridgeUp(handle, subnet)
             RelayPolicy.Never, RelayPolicy.Ask -> CascadeWiring.onHostBridgeDown(handle)

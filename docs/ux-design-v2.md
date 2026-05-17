@@ -695,10 +695,27 @@ Three layers of recourse if a CASCADE-2 regression ships:
    for newly-imported tunnels. Existing user `Always` choices are preserved.
    Hotfix LOC: ~5 in the data-class constructor; no schema change.
 3. **Emergency kill-switch**: a hidden `K_CASCADE_FORCED_OFF` flag in
-   `SettingsStore`, defaulted false, settable only via adb broadcast on
-   `.debug` / `.agent` builds. Short-circuits every cascade evaluation to
-   "blocked". The regression equivalent of the v1 global toggle, but it lives
-   in the diagnostic surface, not the user surface.
+   `SettingsStore`, defaulted false.  Surfaced via two channels:
+   - **Release builds**: long-press on the version label at the bottom of
+     SettingsScreen opens an AlertDialog with "Force cascade off" /
+     "Re-enable cascade" toggle.  When forced off, the version label
+     re-renders as "wgrtc vX.Y.Z · cascade off" in error red so the state
+     is visible even after dismissing the dialog.
+   - **`.debug` / `.agent` builds**: the same flag is also drivable via the
+     `SET_CASCADE` adb broadcast for instrumented testing.
+
+   `WgrtcApp` collects `SettingsStore.cascadeForcedOffFlow` and mirrors it
+   into `CascadeWiring.setEnabled(!forcedOff)`.  On the false → true edge
+   the wiring tears down every host bridge + the joiner stack
+   synchronously; on the true → false edge it re-opens and the app calls
+   `HostModeBackend.reapplyCascadeForActiveSlots()` so active host slots
+   with `relayPolicy=Always` re-register without a reconnect.
+
+   Short-circuits every cascade evaluation to "blocked". The regression
+   equivalent of the v1 global toggle, but it lives in the diagnostic
+   surface, not the user surface.  Discoverability is intentionally low:
+   the long-press affordance is invisible to a regular user, communicated
+   only through bug-report support channels.
 
 The argument for removing v1's toggle isn't "no escape hatch exists" — it's
 "the escape hatch shouldn't be the primary UX".
