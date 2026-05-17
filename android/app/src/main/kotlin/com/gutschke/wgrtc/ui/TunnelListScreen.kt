@@ -170,27 +170,58 @@ fun TunnelListScreen(
                 val activeJoinerCount = tunnels.count { t ->
                     t.source != Tunnel.Source.HOST_MODE && activeIds.contains(t.id)
                 }
+                // §11.8a — collapse two tunnels that share a groupId
+                // into a single Bridge row.  Single tunnels render
+                // as before.
+                val entries = com.gutschke.wgrtc.data.groupTunnels(tunnels)
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(tunnels, key = { it.id }) { t ->
-                        TunnelCard(
-                            tunnel = t,
-                            isActive = activeIds.contains(t.id),
-                            isConnecting = t.id == connectingId,
-                            onClick = { onTunnelClick(t) },
-                            onToggle = { wantUp ->
-                                if (wantUp) connect(t.id) else disconnect(t.id)
-                            },
-                        )
-                        if (t.source == Tunnel.Source.HOST_MODE &&
-                            t.relayPolicy == com.gutschke.wgrtc.data.RelayPolicy.Ask &&
-                            activeIds.contains(t.id) &&
-                            activeJoinerCount > 0
-                        ) {
-                            CascadeAskBanner(
-                                hostName = t.name,
-                                onAllow = { vm.setRelayPolicy(t.id, com.gutschke.wgrtc.data.RelayPolicy.Always) },
-                                onBlock = { vm.setRelayPolicy(t.id, com.gutschke.wgrtc.data.RelayPolicy.Never) },
-                            )
+                    items(entries, key = { e ->
+                        when (e) {
+                            is com.gutschke.wgrtc.data.TunnelListEntry.Single -> e.tunnel.id
+                            is com.gutschke.wgrtc.data.TunnelListEntry.Bridge -> e.groupId
+                        }
+                    }) { entry ->
+                        when (entry) {
+                            is com.gutschke.wgrtc.data.TunnelListEntry.Single -> {
+                                val t = entry.tunnel
+                                TunnelCard(
+                                    tunnel = t,
+                                    isActive = activeIds.contains(t.id),
+                                    isConnecting = t.id == connectingId,
+                                    onClick = { onTunnelClick(t) },
+                                    onToggle = { wantUp ->
+                                        if (wantUp) connect(t.id) else disconnect(t.id)
+                                    },
+                                )
+                                if (t.source == Tunnel.Source.HOST_MODE &&
+                                    t.relayPolicy == com.gutschke.wgrtc.data.RelayPolicy.Ask &&
+                                    activeIds.contains(t.id) &&
+                                    activeJoinerCount > 0
+                                ) {
+                                    CascadeAskBanner(
+                                        hostName = t.name,
+                                        onAllow = { vm.setRelayPolicy(t.id, com.gutschke.wgrtc.data.RelayPolicy.Always) },
+                                        onBlock = { vm.setRelayPolicy(t.id, com.gutschke.wgrtc.data.RelayPolicy.Never) },
+                                    )
+                                }
+                            }
+                            is com.gutschke.wgrtc.data.TunnelListEntry.Bridge -> {
+                                BridgeCard(
+                                    bridge = entry,
+                                    activeIds = activeIds,
+                                    connectingId = connectingId,
+                                    onFirstClick = { onTunnelClick(entry.first) },
+                                    onSecondClick = { onTunnelClick(entry.second) },
+                                    onFirstToggle = { wantUp ->
+                                        if (wantUp) connect(entry.first.id)
+                                        else disconnect(entry.first.id)
+                                    },
+                                    onSecondToggle = { wantUp ->
+                                        if (wantUp) connect(entry.second.id)
+                                        else disconnect(entry.second.id)
+                                    },
+                                )
+                            }
                         }
                     }
                 }
@@ -468,6 +499,132 @@ private fun TunnelCard(
             state = detail,
             onDismiss = { failureDetail = null },
         )
+    }
+}
+
+/**
+ * §11.8a — one row that represents a paired Bridge (two tunnels
+ * sharing a groupId).  Renders a single card with the Bridge's
+ * displayName and a stacked-arrow badge; each half gets its own
+ * status pill + switch in the row's "halves" section.  Tapping
+ * either half navigates to that tunnel's detail screen.
+ *
+ * The card itself doesn't have a single "Connect" switch — Bridges
+ * are inherently two-thing operations and the user may want either
+ * half active independently.  The stacked switches communicate that
+ * affordance.
+ */
+@Composable
+private fun BridgeCard(
+    bridge: com.gutschke.wgrtc.data.TunnelListEntry.Bridge,
+    activeIds: Set<String>,
+    connectingId: String?,
+    onFirstClick: () -> Unit,
+    onSecondClick: () -> Unit,
+    onFirstToggle: (Boolean) -> Unit,
+    onSecondToggle: (Boolean) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.10f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Outlined.SwapHoriz,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column {
+                    Text(
+                        bridge.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Text(
+                        "Bridge",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            BridgeHalfRow(
+                tunnel = bridge.first,
+                isActive = activeIds.contains(bridge.first.id),
+                isConnecting = bridge.first.id == connectingId,
+                onClick = onFirstClick,
+                onToggle = onFirstToggle,
+            )
+            Spacer(Modifier.height(6.dp))
+            BridgeHalfRow(
+                tunnel = bridge.second,
+                isActive = activeIds.contains(bridge.second.id),
+                isConnecting = bridge.second.id == connectingId,
+                onClick = onSecondClick,
+                onToggle = onSecondToggle,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BridgeHalfRow(
+    tunnel: Tunnel,
+    isActive: Boolean,
+    isConnecting: Boolean,
+    onClick: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+) {
+    val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+        .getProcessSingleton()
+    val tunnelState by registry.stateOf(tunnel.id).collectAsState()
+    val pillState = stateForPill(
+        registryState = tunnelState,
+        isActive = isActive,
+        isConnecting = isConnecting,
+    )
+    val arrowIcon = if (tunnel.source == Tunnel.Source.HOST_MODE) {
+        Icons.Outlined.WifiTethering
+    } else {
+        Icons.Outlined.Login
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable { onClick() },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            arrowIcon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(tunnel.name, style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(2.dp))
+            StatusPill(state = pillState)
+        }
+        if (isConnecting) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(20.dp),
+                strokeWidth = 2.dp,
+            )
+        } else {
+            Switch(checked = isActive, onCheckedChange = onToggle)
+        }
     }
 }
 
