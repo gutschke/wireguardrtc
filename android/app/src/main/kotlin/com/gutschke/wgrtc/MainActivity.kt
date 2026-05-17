@@ -255,6 +255,14 @@ class MainActivity : ComponentActivity() {
                     onAddClick = { nav.navigate(Routes.ADD) },
                     onTunnelClick = { t -> nav.navigate(Routes.detail(t.id)) },
                     onSettings = { nav.navigate(Routes.SETTINGS) },
+                    onJoinClick = { nav.navigate(Routes.JOIN) },
+                    onHostClick = { nav.navigate(Routes.HOST_SETUP) },
+                    // §11.6 — Tile 3 currently routes to the join
+                    // flow.  The orchestrated wizard that creates
+                    // both halves with a shared groupId is §11.8;
+                    // until it lands, the user has a clean entry
+                    // point for the first half.
+                    onBridgeClick = { nav.navigate(Routes.JOIN) },
                     vm = vm,
                 )
             }

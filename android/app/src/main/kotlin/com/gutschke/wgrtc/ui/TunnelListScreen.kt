@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Login
+import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material.icons.outlined.WifiTethering
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -77,6 +78,12 @@ fun TunnelListScreen(
     onAddClick: () -> Unit,
     onTunnelClick: (Tunnel) -> Unit,
     onSettings: () -> Unit = {},
+    /** Routes used by the §11.6 first-run tile launcher.  When
+     *  null, the empty state falls back to the single "Add tunnel"
+     *  FAB. */
+    onJoinClick: (() -> Unit)? = null,
+    onHostClick: (() -> Unit)? = null,
+    onBridgeClick: (() -> Unit)? = null,
     vm: WgrtcViewModel = viewModel(),
 ) {
     val tunnels by vm.tunnels.collectAsState()
@@ -145,7 +152,15 @@ fun TunnelListScreen(
                 )
             }
             if (tunnels.isEmpty()) {
-                EmptyState(onAddClick)
+                if (onJoinClick != null && onHostClick != null && onBridgeClick != null) {
+                    FirstRunTiles(
+                        onJoin = onJoinClick,
+                        onHost = onHostClick,
+                        onBridge = onBridgeClick,
+                    )
+                } else {
+                    EmptyState(onAddClick)
+                }
             } else {
                 Spacer(Modifier.height(4.dp))
                 // CASCADE-2 §2.3 banner eligibility — surfaced once
@@ -204,6 +219,113 @@ fun TunnelListScreen(
                 vm.acknowledgeChromeOsLoopWarning(t.id, proceed = false)
             },
         )
+    }
+}
+
+// ─── First-run tile launcher (v2 §11.6) ─────────────────────────
+
+/**
+ * §5.1 first-run discovery surface.  Three tiles — Join / Share /
+ * Bridge — replace the 1-CTA empty-state for users who have no
+ * tunnels yet.  Each tile is a tall card with an icon, headline,
+ * and one-line description; tapping routes to the relevant entry
+ * flow.
+ *
+ * Tile 3 "Bridge two networks" is the §C use-case discovery
+ * surface (the case that's otherwise invisible).  For this first
+ * cut it routes to the same Join flow as Tile 1; the
+ * orchestrated wizard that auto-creates both halves and assigns a
+ * shared groupId is a §11.8 follow-up.
+ */
+@Composable
+private fun FirstRunTiles(
+    onJoin: () -> Unit,
+    onHost: () -> Unit,
+    onBridge: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        BrandMark(size = 72.dp)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "What do you want to do?",
+            style = MaterialTheme.typography.titleLarge,
+        )
+        Spacer(Modifier.height(4.dp))
+        FirstRunTile(
+            icon = Icons.Outlined.Login,
+            iconTint = MaterialTheme.colorScheme.primary,
+            title = "Join a network",
+            body = "Connect to a network someone else is hosting. " +
+                "Paste a config, scan a QR, or use a wormhole code.",
+            onClick = onJoin,
+        )
+        FirstRunTile(
+            icon = Icons.Outlined.WifiTethering,
+            iconTint = MaterialTheme.colorScheme.tertiary,
+            title = "Share my network",
+            body = "Run a private tunnel on this device so other " +
+                "devices can connect through it.",
+            onClick = onHost,
+        )
+        FirstRunTile(
+            icon = Icons.Outlined.SwapHoriz,
+            iconTint = MaterialTheme.colorScheme.secondary,
+            title = "Bridge two networks",
+            body = "Join a remote network and let local devices " +
+                "reach it through this device.",
+            onClick = onBridge,
+        )
+    }
+}
+
+@Composable
+private fun FirstRunTile(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    iconTint: Color,
+    title: String,
+    body: String,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(iconTint.copy(alpha = 0.10f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = iconTint,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    body,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
@@ -313,9 +435,16 @@ private fun TunnelCard(
                             { failureDetail = tunnelState }
                         } else null,
                     )
+                    // §11.4 — direction microcopy.  The badge icon
+                    // already encodes inbound vs outbound (WifiTethering
+                    // for host, Login for joiner) — but "Hosting" /
+                    // "Client" as labels are jargon the design retires.
+                    // §3 frames the same information as a directed
+                    // reachability claim: "Reaches" (joiner → external)
+                    // vs "Reachable" (host accepts inbound).
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        if (isHost) "Hosting" else "Client",
+                        if (isHost) "Reachable here" else "Reaches out",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
