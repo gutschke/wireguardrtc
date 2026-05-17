@@ -102,11 +102,15 @@ class WgrtcApp : Application() {
         // trap. See BrokerNetworkPin's doc for full rationale and
         // the case where it doesn't help.
         BrokerNetworkPin.register(this)
-        // CASCADE-2 — restore the persisted cascade-enabled flag so
-        // backends post lifecycle events to the registry from app
-        // start.  Off by default; users who flipped it on in
-        // Settings get it back across process restarts.
-        com.gutschke.wgrtc.data.CascadeWiring.setEnabled(settings.cascadeEnabled)
+        // CASCADE-2 — cascade is now a per-host-tunnel decision
+        // (Tunnel.relayPolicy) rather than a process-wide toggle.
+        // HostModeBackend.start consults the tunnel's policy before
+        // calling into CascadeWiring; no app-level restore needed
+        // here.  See `docs/ux-design-v2.md` §11.3.  The §13-layer-3
+        // emergency kill-switch (hidden Settings long-press) would
+        // be the only thing that re-enters CascadeWiring at this
+        // layer, and it's a follow-up.
+        com.gutschke.wgrtc.data.CascadeWiring.setEnabled(true)
         // No startup JNI probe: the SIGSEGV class we used to chase
         // turned out to be gomobile-bind's marshalling, not a
         // dual-runtime conflict. deleted WgBridgeSmokeProbe;

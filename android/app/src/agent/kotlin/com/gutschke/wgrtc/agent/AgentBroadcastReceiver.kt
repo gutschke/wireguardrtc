@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import com.gutschke.wgrtc.data.CascadeWiring
-import com.gutschke.wgrtc.data.SettingsStore
 import com.gutschke.wgrtc.data.Tunnel
 import com.gutschke.wgrtc.data.TunnelStore
 import java.util.Base64
@@ -134,15 +133,14 @@ class AgentBroadcastReceiver : BroadcastReceiver() {
     }
 
     /**
-     * Flip a Boolean app setting at runtime so cascade / joiner-N
-     * tests can drive both states without UI-Automator taps.
-     * `--es key cascade` + `--es value true|false`.
+     * Flip the process-wide [CascadeWiring] gate.  In v2 this is
+     * the §13-layer-3 emergency kill-switch — set false to force
+     * cascade off even when a host tunnel's per-host policy is
+     * Always.  Not persisted; resets to true on next process start.
      */
-    private fun handleSetCascade(context: Context, intent: Intent) {
+    private fun handleSetCascade(@Suppress("UNUSED_PARAMETER") context: Context, intent: Intent) {
         val value = intent.getStringExtra(EXTRA_VALUE)
             ?.equals("true", ignoreCase = true) ?: false
-        val store = SettingsStore.create(context.applicationContext)
-        store.cascadeEnabled = value
         CascadeWiring.setEnabled(value)
         resultCode = RESULT_OK
         resultData = if (value) "cascade=on" else "cascade=off"

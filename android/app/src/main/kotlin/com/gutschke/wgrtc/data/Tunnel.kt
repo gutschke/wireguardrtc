@@ -43,8 +43,60 @@ data class Tunnel(
     val saltB64: String? = null,
     /** host-mode state. Null for client-mode tunnels. */
     val hostMode: HostModeConfig? = null,
+    /**
+     * CASCADE-2 relay policy for host-mode tunnels.  Decides whether
+     * traffic decrypted by this tunnel may be re-encrypted and sent
+     * out through any concurrently-Connected joiner whose AllowedIPs
+     * cover the destination.  Ignored on client-mode tunnels.
+     *
+     * Default [RelayPolicy.Ask] is fail-safe: cascade is NOT installed
+     * until the user confirms via the §2.3 banner.  Pre-v2 tunnels
+     * (persisted before this field existed) deserialise to Ask too —
+     * even users who had the deprecated global cascade toggle on must
+     * re-confirm per host.  See `docs/ux-design-v2.md` §2.3 and §12.
+     */
+    val relayPolicy: RelayPolicy = RelayPolicy.Ask,
+    /**
+     * Persistent user-intent for the tunnel's switch position.  Maps
+     * deterministically to a starting [TunnelState] when the registry
+     * rebuilds from disk:
+     *  - [TunnelIntent.NoIntentYet] → [TunnelState.Disabled]
+     *  - [TunnelIntent.WantsOn] → [TunnelState.Arming] (re-derive live)
+     *  - [TunnelIntent.ExplicitlyOff] → [TunnelState.PausedUser]
+     *
+     * Pre-v2 tunnels deserialise to [TunnelIntent.NoIntentYet] — same
+     * as freshly-imported.  See `docs/ux-design-v2.md` §12.
+     */
+    val intent: TunnelIntent = TunnelIntent.NoIntentYet,
+    /**
+     * Paired-Bridge marker (UUID).  Tunnels created via the
+     * "Bridge two networks" onboarding flow share a [groupId]; the
+     * TunnelList collapses them to one row.  Null on independently-
+     * created tunnels (the common case).  See §3.2.
+     */
+    val groupId: String? = null,
 ) {
     enum class Source { LEGACY, ENROLL, MANUAL, HOST_MODE }
+}
+
+/**
+ * Per-host-tunnel cascade relay policy.  See
+ * `docs/ux-design-v2.md` §2 / §11.3.
+ */
+enum class RelayPolicy {
+    /** Banner pending: until the user picks Allow / Block, cascade
+     *  for this host is NOT installed.  Fail-safe default. */
+    Ask,
+
+    /** User confirmed via §2.3 banner; cascade auto-installs when a
+     *  joiner becomes cascade-eligible. */
+    Always,
+
+    /** User confirmed Block — or hit it as the recovery from a
+     *  CASCADE-2 regression (§13 layer 1).  Cascade routes never
+     *  install for this host; the host catchall handles all
+     *  decrypted traffic instead. */
+    Never,
 }
 
 /**

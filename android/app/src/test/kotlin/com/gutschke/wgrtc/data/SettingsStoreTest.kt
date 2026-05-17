@@ -130,30 +130,18 @@ class SettingsStoreTest {
         assertEquals(true, s.joinerNEnabled)
     }
 
-    @Test fun `cascadeEnabled defaults to false`() {
-        val s = SettingsStore.forTestInMemory()
-        assertEquals(false, s.cascadeEnabled)
-        assertEquals(false, s.cascadeEnabledFlow.value)
-    }
-
-    @Test fun `cascadeEnabled round-trips through persistence`() {
-        val s = SettingsStore.forTestInMemory()
-        s.cascadeEnabled = true
-        assertEquals(true, s.cascadeEnabled)
-        assertEquals(true, s.cascadeEnabledFlow.value)
-        s.cascadeEnabled = false
-        assertEquals(false, s.cascadeEnabled)
-    }
-
-    @Test fun `cascadeEnabled reads back persisted true on construction`() {
-        val s = SettingsStore.forTestInMemory(mapOf("cascade_enabled" to "true"))
-        assertEquals(true, s.cascadeEnabled)
-    }
-
-    @Test fun `resetToDefaults restores cascadeEnabled to false`() {
-        val s = SettingsStore.forTestInMemory()
-        s.cascadeEnabled = true
+    @Test fun `resetToDefaults scrubs legacy cascade_enabled pref`() {
+        // K_CASCADE_ENABLED was retired in v2 §11.3 but the on-disk
+        // value lingers for users who had the toggle on in v0.2.x.
+        // resetToDefaults removes it so it doesn't get re-read by
+        // any stale callsite.
+        val seed = mutableMapOf("cascade_enabled" to "true")
+        val s = SettingsStore(object : SettingsStore.Backing {
+            override fun getString(key: String): String? = seed[key]
+            override fun putString(key: String, value: String) { seed[key] = value }
+            override fun remove(key: String) { seed.remove(key) }
+        })
         s.resetToDefaults()
-        assertEquals(false, s.cascadeEnabled)
+        assertEquals(null, seed["cascade_enabled"])
     }
 }

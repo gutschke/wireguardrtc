@@ -54,11 +54,10 @@ class SettingsStore internal constructor(private val backing: Backing) {
         // off (the persisted value is the literal string "false")
         // keep their preference across upgrades.
         backing.getString(K_JOINER_N_ENABLED) != "false")
-    private val _cascadeEnabled = MutableStateFlow(
-        // CASCADE-2 forwarding bridge. OFF by default — opt-in
-        // until we have field validation across the real-world
-        // host-mode-on-hotspot + joiner-elsewhere scenario.
-        backing.getString(K_CASCADE_ENABLED) == "true")
+    // K_CASCADE_ENABLED removed in v2 §11.3 — cascade is now a
+    // per-host-tunnel decision (`Tunnel.relayPolicy`).  See
+    // `docs/ux-design-v2.md` §2 / §12.  resetToDefaults still
+    // removes the legacy pref so it stops lingering on upgrades.
 
     val defaultBrokerWssFlow: StateFlow<String> = _wss.asStateFlow()
     val defaultBrokerKeyFlow: StateFlow<String> = _key.asStateFlow()
@@ -85,11 +84,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
      * toggle off and the previous behaviour is preserved. */
     val joinerNEnabledFlow: StateFlow<Boolean> = _joinerNEnabled.asStateFlow()
 
-    /** CASCADE-2: when ON, host-mode tunnels forward decrypted
-     * traffic destined for joiner AllowedIPs through the userspace
-     * ferry bridge so it gets re-encrypted via the joiner-N tunnel.
-     * OFF by default until validation lands. */
-    val cascadeEnabledFlow: StateFlow<Boolean> = _cascadeEnabled.asStateFlow()
+    // cascadeEnabledFlow removed in v2 §11.3 — see Tunnel.relayPolicy.
 
     var defaultBrokerWss: String
         get() = _wss.value
@@ -126,12 +121,7 @@ class SettingsStore internal constructor(private val backing: Backing) {
             _joinerNEnabled.value = value
         }
 
-    var cascadeEnabled: Boolean
-        get() = _cascadeEnabled.value
-        set(value) {
-            backing.putString(K_CASCADE_ENABLED, value.toString())
-            _cascadeEnabled.value = value
-        }
+    // var cascadeEnabled removed in v2 §11.3 — see Tunnel.relayPolicy.
 
     /**
      * Whether the first-launch onboarding has been completed.
@@ -154,7 +144,10 @@ class SettingsStore internal constructor(private val backing: Backing) {
         backing.remove(K_EGRESS_POLICY)
         backing.remove(K_HIDE_LISTENER_NOTIFICATION)
         backing.remove(K_JOINER_N_ENABLED)
-        backing.remove(K_CASCADE_ENABLED)
+        // K_CASCADE_ENABLED retired in v2 §11.3 but we still scrub
+        // the on-disk value so old prefs files don't linger across
+        // upgrades.
+        backing.remove(K_LEGACY_CASCADE_ENABLED)
         // K_HOSTING_MODE / K_JOINER_BACKEND keys removed in
         // when wireguard-android went away; we also drop any
         // legacy persisted values so they don't linger in prefs.
@@ -165,7 +158,6 @@ class SettingsStore internal constructor(private val backing: Backing) {
         _egress.value = EgressPolicy.OsDefault
         _hideListenerNotification.value = false
         _joinerNEnabled.value = true
-        _cascadeEnabled.value = false
     }
 
     data class Snapshot(val brokerWss: String, val brokerKey: String)
@@ -178,12 +170,13 @@ class SettingsStore internal constructor(private val backing: Backing) {
         private const val K_ONBOARDING_SEEN = "onboarding_seen"
         private const val K_HIDE_LISTENER_NOTIFICATION = "hide_listener_notification"
         private const val K_JOINER_N_ENABLED = "joiner_n_enabled"
-        private const val K_CASCADE_ENABLED = "cascade_enabled"
         // Legacy keys — read only during resetToDefaults() to
         // scrub leftover prefs from pre- installs. Never
         // written.
         private const val K_LEGACY_HOSTING_MODE = "hosting_mode"
         private const val K_LEGACY_JOINER_BACKEND = "joiner_backend"
+        /** Retired in v2 §11.3; see Tunnel.relayPolicy. */
+        private const val K_LEGACY_CASCADE_ENABLED = "cascade_enabled"
 
         fun create(context: Context): SettingsStore {
             val prefs = context.applicationContext

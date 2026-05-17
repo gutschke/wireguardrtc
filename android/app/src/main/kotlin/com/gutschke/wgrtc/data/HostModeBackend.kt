@@ -158,7 +158,11 @@ class HostModeBackend(
                 refreshActiveIds()
                 val handle = r.nativeBridgeHandle
                 val subnet = cfg.hostForwarderSubnet
-                if (handle != 0 && subnet != null) {
+                // CASCADE-2: only register with the ferry when the
+                // user has explicitly granted relay permission for
+                // this host.  Ask / Never both block; Always installs.
+                // See `docs/ux-design-v2.md` §2.1 rule (3).
+                if (handle != 0 && subnet != null && tunnel.relayPolicy == RelayPolicy.Always) {
                     CascadeWiring.onHostBridgeUp(handle, subnet)
                 }
             }
@@ -213,6 +217,30 @@ class HostModeBackend(
         val ids = slots.keys.toList()
         for (id in ids) {
             teardown(id)
+        }
+    }
+
+    /**
+     * Re-evaluate cascade registration for the host slot of
+     * [tunnel].  Called by the ViewModel when the user picks
+     * Allow / Block on the §2.3 banner (or otherwise edits
+     * [Tunnel.relayPolicy]).  No-op if the host isn't currently
+     * running — the next [start] will pick up the new policy
+     * naturally.
+     *
+     * Idempotent: re-registering an already-registered bridge with
+     * the same subnet is a no-op in the ferry registry; tearing
+     * down an unregistered bridge is also a no-op.
+     */
+    fun reevaluateCascade(tunnel: Tunnel) {
+        val slot = slots[tunnel.id] ?: return
+        if (slot.paused) return
+        val handle = slot.runner.nativeBridgeHandle
+        if (handle == 0) return
+        val subnet = tunnel.toRunnerConfig().hostForwarderSubnet ?: return
+        when (tunnel.relayPolicy) {
+            RelayPolicy.Always -> CascadeWiring.onHostBridgeUp(handle, subnet)
+            RelayPolicy.Never, RelayPolicy.Ask -> CascadeWiring.onHostBridgeDown(handle)
         }
     }
 
