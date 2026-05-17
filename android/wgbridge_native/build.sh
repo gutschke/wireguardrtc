@@ -65,17 +65,17 @@ lint_jni 'GetPrimitiveArrayCritical|ReleasePrimitiveArrayCritical' \
 # Resolve toolchain. Prefer the project-local Go install if no
 # system Go is present.
 if ! command -v go >/dev/null 2>&1; then
- PROJECT_GO="$HERE/../../tmp/go-toolchain/go/bin"
+ PROJECT_GO="$HERE/../../../tmp/go-toolchain/go/bin"
  if [[ -x "$PROJECT_GO/go" ]]; then
  export PATH="$PROJECT_GO:$PATH"
- export GOROOT="$HERE/../../tmp/go-toolchain/go"
+ export GOROOT="$HERE/../../../tmp/go-toolchain/go"
  else
  echo "[wgbridge_native] error: no 'go' on PATH" >&2
  exit 1
  fi
 fi
-export GOPATH="${GOPATH:-$HERE/../../tmp/go-toolchain/gopath}"
-export GOCACHE="${GOCACHE:-$HERE/../../tmp/go-toolchain/gocache}"
+export GOPATH="${GOPATH:-$HERE/../../../tmp/go-toolchain/gopath}"
+export GOCACHE="${GOCACHE:-$HERE/../../../tmp/go-toolchain/gocache}"
 
 # Pin to Go 1.24.5 — wireguard-android uses 1.24.3, we use the
 # closest readily-available patch. Go 1.25.0 (which gomobile master
@@ -84,10 +84,20 @@ export GOCACHE="${GOCACHE:-$HERE/../../tmp/go-toolchain/gocache}"
 export GOTOOLCHAIN="${GOTOOLCHAIN:-go1.24.5}"
 
 # NDK setup — same convention as wgbridge/build.sh.
-export ANDROID_HOME="${ANDROID_HOME:-$HERE/../../tmp/android-sdk}"
+# Default to the wgrtc-root sandbox: three levels up from this
+# script (github/android/wgbridge_native → wireguardrtc/).  The
+# pre-v0.2.0 layout had it two levels up; the relative path
+# silently breaks under that off-by-one (NDK glob returns nothing
+# → exit 1 — and "[wgbridge_native] error: no NDK found …" only
+# fires if stderr is visible).
+export ANDROID_HOME="${ANDROID_HOME:-$HERE/../../../tmp/android-sdk}"
 NDK_DIR="$(ls -d "$ANDROID_HOME/ndk"/*/ 2>/dev/null | head -1 | sed 's:/$::')"
 if [[ -z "$NDK_DIR" ]]; then
- echo "[wgbridge_native] error: no NDK found under $ANDROID_HOME/ndk/" >&2
+ # Loud error — silent failure here used to manifest as a
+ # successful-looking gradle build with an outdated .so packaged
+ # from a previous run.  Visible on stderr AND stdout so it
+ # survives pipe-to-tail in agent harnesses.
+ echo "[wgbridge_native] FATAL: no NDK under $ANDROID_HOME/ndk/" | tee /dev/stderr
  exit 1
 fi
 export ANDROID_NDK_HOME="$NDK_DIR"

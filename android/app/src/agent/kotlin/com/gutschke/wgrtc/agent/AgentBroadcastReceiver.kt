@@ -4,6 +4,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import com.gutschke.wgrtc.data.CascadeWiring
+import com.gutschke.wgrtc.data.SettingsStore
 import com.gutschke.wgrtc.data.Tunnel
 import com.gutschke.wgrtc.data.TunnelStore
 import java.util.Base64
@@ -42,6 +44,7 @@ class AgentBroadcastReceiver : BroadcastReceiver() {
         when (intent.action) {
             ACTION_ADD_TUNNEL -> handleAddTunnel(context, intent)
             ACTION_LIST_TUNNELS -> handleListTunnels(context)
+            ACTION_SET_CASCADE -> handleSetCascade(context, intent)
             else -> {
                 Log.w(TAG, "unknown action: ${intent.action}")
                 resultCode = RESULT_BAD_REQUEST
@@ -130,14 +133,32 @@ class AgentBroadcastReceiver : BroadcastReceiver() {
         resultData = tunnel.id
     }
 
+    /**
+     * Flip a Boolean app setting at runtime so cascade / joiner-N
+     * tests can drive both states without UI-Automator taps.
+     * `--es key cascade` + `--es value true|false`.
+     */
+    private fun handleSetCascade(context: Context, intent: Intent) {
+        val value = intent.getStringExtra(EXTRA_VALUE)
+            ?.equals("true", ignoreCase = true) ?: false
+        val store = SettingsStore.create(context.applicationContext)
+        store.cascadeEnabled = value
+        CascadeWiring.setEnabled(value)
+        resultCode = RESULT_OK
+        resultData = if (value) "cascade=on" else "cascade=off"
+        Log.i(TAG, "SET_CASCADE → $value")
+    }
+
     companion object {
         const val ACTION_ADD_TUNNEL = "com.gutschke.wgrtc.agent.ADD_TUNNEL"
         const val ACTION_LIST_TUNNELS = "com.gutschke.wgrtc.agent.LIST_TUNNELS"
+        const val ACTION_SET_CASCADE = "com.gutschke.wgrtc.agent.SET_CASCADE"
 
         const val EXTRA_NAME = "name"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_CONFIG_B64 = "configB64"
         const val EXTRA_SOURCE = "source"
+        const val EXTRA_VALUE = "value"
 
         // Activity.RESULT_OK is 0; broadcast result conventions reuse it.
         const val RESULT_OK = 0

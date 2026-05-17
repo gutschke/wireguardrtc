@@ -21,6 +21,7 @@
             <intent-filter>
                 <action android:name="com.gutschke.wgrtc.agent.ADD_TUNNEL" />
                 <action android:name="com.gutschke.wgrtc.agent.LIST_TUNNELS" />
+                <action android:name="com.gutschke.wgrtc.agent.SET_CASCADE" />
             </intent-filter>
         </receiver>
     </application>

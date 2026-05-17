@@ -149,6 +149,8 @@ object CascadeWiring {
             val rc = bridge.joinerAllowedIpsChanged(allowedIpsCsv)
             if (rc != 0) {
                 Log.w(TAG, "nativeCascadeOnAllowedIPsChanged rc=$rc csv=$allowedIpsCsv")
+            } else {
+                Log.i(TAG, "joiner AllowedIPs union updated: ${joinerAllowedIps.size} prefixes ($allowedIpsCsv)")
             }
         }
     }
