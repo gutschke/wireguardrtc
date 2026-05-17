@@ -1044,6 +1044,27 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  com.gutschke.wgrtc.data.nextAvailableTunnelName(
  _tunnels.value.map { it.name }, prefix = "Host", separator = " ")
 
+ /**
+ * §11.9 — next-available UDP listen port for a new host tunnel.
+ * Scans existing HOST_MODE tunnels' wg-quick ListenPort fields
+ * and returns the lowest free port at or above the WG-canonical
+ * 51820.  Used by [HostModeSetupScreen] as the placeholder /
+ * empty-input fallback.
+ *
+ * Joiner-mode tunnels' ListenPort values are ignored.  Imported
+ * wg-quick configs can carry a ListenPort line on the joiner
+ * side, but the joiner-N path doesn't bind to a fixed source
+ * port and any value we'd consume here would be misleading.
+ * Host tunnels are the only callers whose `ListenPort` is
+ * authoritatively the kernel UDP bind.
+ */
+ fun defaultHostListenPort(): Int {
+ val taken = _tunnels.value
+ .filter { it.source == Tunnel.Source.HOST_MODE }
+ .mapNotNull { com.gutschke.wgrtc.data.parseListenPortFromConfig(it.configText) }
+ return com.gutschke.wgrtc.data.nextAvailableHostListenPort(taken)
+ }
+
  // ---------------------------------------------------------- Connect/Disconnect
 
  /**

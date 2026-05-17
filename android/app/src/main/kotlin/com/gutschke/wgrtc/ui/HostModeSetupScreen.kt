@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.gutschke.wgrtc.WgrtcViewModel
+import com.gutschke.wgrtc.data.Tunnel
 
 /**
  * host-mode setup form. Collects:
@@ -69,7 +70,21 @@ fun HostModeSetupScreen(
     var name by remember { mutableStateOf("") }
     var subnet by remember { mutableStateOf("10.99.0.0/24") }
     var hostIp by remember { mutableStateOf("10.99.0.1") }
-    var listenPort by remember { mutableStateOf("51820") }
+    // §11.9 — collision-aware port default.  Key the recompute on
+    // the parsed-port SET (not the raw configText) so unrelated
+    // edits to existing host tunnels (rename, allowed-IPs change,
+    // peer rotation) don't clobber the user's in-progress typing.
+    val portKey = tunnels
+        .asSequence()
+        .filter { it.source == Tunnel.Source.HOST_MODE }
+        .mapNotNull { com.gutschke.wgrtc.data.parseListenPortFromConfig(it.configText) }
+        .toSet()
+    val defaultPort = remember(portKey) { vm.defaultHostListenPort().toString() }
+    // Field starts blank so the placeholder is visible (same UX
+    // pattern as `name`) — empty input at save time falls back to
+    // [defaultPort] rather than triggering the
+    // "Listen port must be 1..65535" error.
+    var listenPort by remember(portKey) { mutableStateOf("") }
     // Pre-fill the signalling server from settings — most users
     // won't need to change it. Stays editable for advanced cases.
     var brokerWss by remember { mutableStateOf(settings.brokerWss) }
@@ -194,6 +209,7 @@ fun HostModeSetupScreen(
                     onValueChange = { listenPort = it },
                     singleLine = true,
                     label = { Text("UDP port") },
+                    placeholder = { Text(defaultPort) },
                     trailingIcon = {
                         com.gutschke.wgrtc.ui.components.HelpHint(
                             title = "WireGuard handshake port",
@@ -246,7 +262,11 @@ fun HostModeSetupScreen(
             Spacer(Modifier.height(8.dp))
             Button(
                 onClick = {
-                    val port = listenPort.toIntOrNull()
+                    // Empty input → use the §11.9 next-available
+                    // default, matching the placeholder shown in
+                    // the field.  Same UX pattern as `name`.
+                    val portInput = listenPort.ifBlank { defaultPort }
+                    val port = portInput.toIntOrNull()
                     if (port == null || port !in 1..65535) {
                         error = "Listen port must be 1..65535"
                         return@Button
