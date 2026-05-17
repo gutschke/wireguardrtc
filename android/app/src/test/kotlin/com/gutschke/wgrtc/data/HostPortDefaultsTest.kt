@@ -127,6 +127,112 @@ class HostPortDefaultsTest {
         assertEquals(51821, nextAvailableHostListenPort(mixed))
     }
 
+    // ─── findCollidingHostTunnel — §11.9c inline check ─────────
+
+    private fun hostTunnel(id: String, name: String, port: Int): Tunnel = Tunnel(
+        id = id,
+        name = name,
+        configText = "[Interface]\nPrivateKey = abc\n" +
+            "Address = 10.99.0.1/24\nListenPort = $port\n",
+        source = Tunnel.Source.HOST_MODE,
+    )
+
+    @Test fun `findColliding returns null when no host tunnels`() {
+        assertEquals(
+            null,
+            findCollidingHostTunnel(emptyList(), emptySet(), 51820),
+        )
+    }
+
+    @Test fun `findColliding returns the active host tunnel's name`() {
+        val t1 = hostTunnel("t1", "home", 51820)
+        assertEquals(
+            "home",
+            findCollidingHostTunnel(listOf(t1), setOf("t1"), 51820),
+        )
+    }
+
+    @Test fun `findColliding ignores paused host tunnels (mirrors backend)`() {
+        // CRITICAL §11.9c invariant: HostModeBackend.start permits
+        // binding a port that another HOST_MODE tunnel "owns" if
+        // that tunnel is currently paused (its slot.listenPort
+        // sits at 0 per the pause UAPI).  The inline check must
+        // match — otherwise the UI grays out Save on a port the
+        // backend would happily accept.  Critic round-2 caught
+        // this exact divergence.
+        val active = hostTunnel("t1", "home", 51820)
+        val paused = hostTunnel("t2", "work", 51821)
+        // Only t1 is in activeHostTunnelIds; t2 is paused.
+        assertEquals(
+            "home",
+            findCollidingHostTunnel(
+                listOf(active, paused), setOf("t1"), 51820),
+        )
+        // Typing 51821 finds nothing — the paused tunnel doesn't
+        // count as a collision.
+        assertEquals(
+            null,
+            findCollidingHostTunnel(
+                listOf(active, paused), setOf("t1"), 51821),
+        )
+    }
+
+    @Test fun `findColliding skips joiner-mode tunnels even when active`() {
+        // Joiners don't bind a fixed source port; their persisted
+        // ListenPort (if any) is meaningless to the host-side
+        // collision check.
+        val joiner = Tunnel(
+            id = "j1",
+            name = "remote",
+            configText = "[Interface]\nListenPort = 51820\n",
+            source = Tunnel.Source.MANUAL,
+        )
+        assertEquals(
+            null,
+            findCollidingHostTunnel(listOf(joiner), setOf("j1"), 51820),
+        )
+    }
+
+    @Test fun `findColliding skips host tunnels with missing ListenPort`() {
+        // Hand-edited configs that stripped the field are invisible
+        // to the inline check (the runtime PortCollisionException
+        // remains the backstop).  Pin so a future refactor doesn't
+        // start silently throwing on null.
+        val cfg = Tunnel(
+            id = "t1",
+            name = "stripped",
+            configText = "[Interface]\nPrivateKey = abc\n",  // no ListenPort
+            source = Tunnel.Source.HOST_MODE,
+        )
+        assertEquals(
+            null,
+            findCollidingHostTunnel(listOf(cfg), setOf("t1"), 51820),
+        )
+    }
+
+    @Test fun `findColliding returns null for a port nobody uses`() {
+        val t1 = hostTunnel("t1", "home", 51820)
+        val t2 = hostTunnel("t2", "work", 51821)
+        assertEquals(
+            null,
+            findCollidingHostTunnel(
+                listOf(t1, t2), setOf("t1", "t2"), 51822),
+        )
+    }
+
+    @Test fun `findColliding returns first match when multiple active tunnels share the port`() {
+        // Shouldn't happen at the backend level (the backend's
+        // collision check would have refused the second to bind),
+        // but pin the deterministic-iteration property anyway.
+        val t1 = hostTunnel("t1", "home", 51820)
+        val t2 = hostTunnel("t2", "work", 51820)
+        assertEquals(
+            "home",
+            findCollidingHostTunnel(
+                listOf(t1, t2), setOf("t1", "t2"), 51820),
+        )
+    }
+
     @Test fun `realistic two-host pool returns 51821 then 51822`() {
         // End-to-end style smoke: simulate creating two host
         // tunnels back-to-back; the second should see 51821.

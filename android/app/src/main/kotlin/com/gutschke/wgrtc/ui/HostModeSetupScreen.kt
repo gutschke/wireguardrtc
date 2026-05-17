@@ -85,6 +85,22 @@ fun HostModeSetupScreen(
     // [defaultPort] rather than triggering the
     // "Listen port must be 1..65535" error.
     var listenPort by remember(portKey) { mutableStateOf("") }
+    // §11.9c — real-time port-collision detection that matches
+    // HostModeBackend.start's runtime check exactly (only ACTIVE
+    // host tunnels count, since paused slots are bound to
+    // listen_port=0).  Without this alignment the inline UI would
+    // be stricter than the backend and block Save on a port the
+    // user could legitimately bind right now.  Pure-function
+    // findCollidingHostTunnel encapsulates the rule so the
+    // invariant is testable without mounting Compose.
+    val activeHostIds by com.gutschke.wgrtc.WgrtcApp.instance.hostModeBackend
+        .activeTunnelIds.collectAsState()
+    val portCollisionTunnelName: String? = remember(listenPort, portKey, activeHostIds) {
+        listenPort.toIntOrNull()?.let { typed ->
+            com.gutschke.wgrtc.data.findCollidingHostTunnel(
+                tunnels, activeHostIds, typed)
+        }
+    }
     // Pre-fill the signalling server from settings — most users
     // won't need to change it. Stays editable for advanced cases.
     var brokerWss by remember { mutableStateOf(settings.brokerWss) }
@@ -210,6 +226,10 @@ fun HostModeSetupScreen(
                     singleLine = true,
                     label = { Text("UDP port") },
                     placeholder = { Text(defaultPort) },
+                    isError = portCollisionTunnelName != null,
+                    supportingText = portCollisionTunnelName?.let { name ->
+                        { Text("Port already used by \"$name\"") }
+                    },
                     trailingIcon = {
                         com.gutschke.wgrtc.ui.components.HelpHint(
                             title = "WireGuard handshake port",
@@ -261,6 +281,7 @@ fun HostModeSetupScreen(
             }
             Spacer(Modifier.height(8.dp))
             Button(
+                enabled = portCollisionTunnelName == null,
                 onClick = {
                     // Empty input → use the §11.9 next-available
                     // default, matching the placeholder shown in

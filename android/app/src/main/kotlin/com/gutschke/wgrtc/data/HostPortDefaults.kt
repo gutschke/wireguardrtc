@@ -50,3 +50,30 @@ const val DEFAULT_HOST_LISTEN_PORT = 51820
  */
 fun parseListenPortFromConfig(configText: String): Int? =
     parseInterfaceField(configText, "ListenPort")?.toIntOrNull()
+
+/**
+ * §11.9c — find the host tunnel that would actually collide if a
+ * new tunnel tried to bind [port].  Matches
+ * [HostModeBackend]'s start-time enforcement: only tunnels whose
+ * id is in [activeHostTunnelIds] count, since paused slots are
+ * bound to listen_port=0 and don't conflict.
+ *
+ * Returns the conflicting tunnel's name, or null if no collision.
+ * Pure function for UI-side validation; the backend's runtime
+ * check remains the source of truth on Save.
+ *
+ * Tunnels with missing / malformed [Interface] ListenPort lines
+ * are silently ignored — `HostModeFactory.newTunnel` always emits
+ * the field, so a parse failure means a user-edited config we
+ * can't reason about without running the backend.  The runtime
+ * check at Save time covers that residual edge.
+ */
+fun findCollidingHostTunnel(
+    hostTunnels: Collection<Tunnel>,
+    activeHostTunnelIds: Set<String>,
+    port: Int,
+): String? = hostTunnels
+    .asSequence()
+    .filter { it.source == Tunnel.Source.HOST_MODE && it.id in activeHostTunnelIds }
+    .firstOrNull { parseListenPortFromConfig(it.configText) == port }
+    ?.name
