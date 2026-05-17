@@ -442,56 +442,90 @@ miniature personal app store.
 
 ## Known limitations
 
-### IPv6 on ChromeOS is split three ways
+### IPv6 on ChromeOS: works in ARC, broken everywhere else
 
-On a Chromebook, your IPv6 connectivity depends on which subsystem
-the application lives in.  When a dual-stack wgrtc tunnel is up:
+When wgrtc runs on ChromeOS (as an Android app via ARC) with a
+dual-stack tunnel up:
 
-| Caller | IPv6 path |
+| Caller | IPv6 |
 |---|---|
-| Android apps inside ARC (including Android Chrome inside ARC, the wgrtc app's own NAT test) | through the wgrtc tunnel — works end-to-end |
-| ChromeOS-host (the ChromeOS Chrome browser, `crosh`) | routes claim tun0, but `send()` fails for new sockets — Patchpanel's v6 forwarding from ChromeOS-host to ARC's VpnService is incomplete |
-| Crostini (the Linux VM — `termina` and `penguin`) | **bypasses the VPN entirely**; uses the underlying network's IPv6 directly (cellular hotspot or Wi-Fi) |
+| Android apps inside ARC | ✓ works end-to-end through the wgrtc tunnel |
+| ChromeOS-host (`crosh`, ChromeOS Chrome browser) | ✗ broken |
+| Crostini (`termina`, `penguin`) | ✗ broken |
 
-This is a platform-side situation — ChromeOS Patchpanel forwards
-v4 traffic from ChromeOS-host into ARC's VpnService cleanly, but
-its v6 path tends to leave the host's main IPv6 routing table or
-DNS resolver in a partially-replaced state.  Crostini is one level
-further removed: its routes come from RAs relayed through
-termina's lxdbr0, so it sees a v6 default via the upstream
-hotspot's link-local, not through any VPN.
+**This is a ChromeOS platform-side limitation, not a wgrtc bug.**
+Confirmed by real-device testing 2026-05-17: every Android-based
+WireGuard client we tried (wgrtc and other public clients)
+exhibits the same v6 failure from ChromeOS-host and Crostini.
+Only ChromeOS's built-in WireGuard implementation routes v6
+correctly system-wide, because it integrates with the ChromeOS
+networking stack directly rather than via the Android VpnService
+→ Patchpanel bridge that all Android-app VPNs go through.
 
 Diagnostic fingerprint:
-- `arc dns ipv6.google.com` from crosh: returns both A and AAAA. ✓
-- `ping ipv6.google.com` from crosh: "unknown host."
-- `tracepath ...` from crosh with VPN up: "send failed" on the
-  first hop.
-- From Crostini's `ip -6 route`: default points at the upstream
-  hotspot's `fe80::...`, not at `tun0`.
-- The same tunnel works fully for v6 when used from a native
-  Android device or from a Linux daemon.
+- From ARC shell: `nc -6 <literal>` succeeds, tcpdump on the
+  server's `wg0` confirms the packets traversed the tunnel.
+- From `crosh`: `ping fd00:...` returns `connect: Invalid
+  argument`, `ping <v6-literal>` hangs.
+- From Crostini: `curl -6 icanhazip.com` fails with "Couldn't
+  connect to server" (DNS resolves, transport fails).
+- The same tunnel works fully for v6 from a native Android
+  phone or from a Linux daemon.
 
 What works vs doesn't from Crostini:
-- Public v6 destinations (`ipv6.google.com`, etc.) are reachable
-  via the underlying network — same as if the VPN were off.
-- Internal-LAN ULA v6 addresses (`fd00:...::101` etc., reachable
-  only through the wgrtc tunnel) are unreachable from Crostini —
-  the route to them lives in `tun0`'s table, which Crostini
-  doesn't consult.
+- v4 through the wgrtc tunnel: works.
+- Internal-LAN ULA v6: unreachable.
+- Public v6 destinations: when the VPN is *up* these also fail,
+  because ChromeOS-host's networking layer gets disrupted by
+  VpnService-up in ways that affect Crostini's egress too —
+  even though Crostini's own routes still point at cellular.
 
-Workarounds:
-- For v6-needing traffic that must traverse the wgrtc tunnel
-  (private LAN addresses), use an Android app inside ARC rather
-  than Crostini or ChromeOS-host's Chrome.
-- ChromeOS has an opt-in setting at `chrome://os-settings/crostini`
-  to route Crostini through ChromeOS-host VPNs.  For v4 this
-  generally works; for v6 it inherits the same Patchpanel
-  limitation as ChromeOS-host context.
+Workarounds for the v6-on-ChromeOS case:
+- Use the ChromeOS-built-in WireGuard client (`chrome://os-settings/network`)
+  for full system-wide v6 instead of an Android-app client.
+- Or use an Android app inside ARC for v6-needing traffic and
+  accept that ChromeOS-host / Crostini stay v4-only on the
+  wgrtc-tunneled side.
+- For the cascading case where you need wgrtc-side roaming /
+  obfuscation but ChromeOS-wide v6, point the built-in WireGuard
+  client at a host-mode wgrtc tunnel and let wgrtc do the
+  outbound work.  (See "Cascade limitations" below — this works
+  in principle but has known gaps as of v0.2.12.)
 
-We're tracking a wgrtc-side DNS proxy that will further improve
-the resolver path for users with proprietary/internal v4-only
-DNS servers, but the underlying ChromeOS-Patchpanel-v6 forwarding
-issue itself is upstream and outside wgrtc's reach.
+We track a wgrtc-side DNS proxy as a future improvement (better
+behavior for proprietary/internal v4-only DNS servers), but the
+underlying ChromeOS-Patchpanel-v6 forwarding gap is upstream and
+outside wgrtc's reach.
+
+### Cascade limitations on Android / ChromeOS (v0.2.12)
+
+Daemons cascade well (joiner → host → second WG tunnel) since
+v0.2.4 (task D3).  The same pattern on Android — running both a
+joiner-mode tunnel and a host-mode tunnel concurrently in the
+wgrtc app, so an external WireGuard client (e.g. ChromeOS's
+built-in one) can enter the host-mode tunnel and have its
+outbound traffic go out through the joiner-mode tunnel — has
+two known gaps:
+
+1. **Overlap detection is too strict.**  wgrtc refuses to bring
+   both tunnels up when the joiner-mode tunnel claims
+   `AllowedIPs = 0.0.0.0/0, ::/0` and the host-mode tunnel
+   claims its WG-side subnet (e.g. `10.99.0.0/24`) — even
+   though kernel longest-prefix-match would resolve the
+   apparent conflict cleanly.  Workaround: carve the host-mode
+   subnet out of the joiner-mode AllowedIPs by hand
+   (verbose multi-CIDR list).  Fix: relax the guard to flag
+   only *identical-prefix* conflicts, not LPM-resolvable
+   overlaps.  Tracked as a v0.2.x bugfix.
+2. **Cross-stack traffic forwarding isn't wired.**  Even after
+   the overlap workaround, traffic entering the host-mode
+   tunnel from an external joiner doesn't get forwarded out
+   the joiner-mode tunnel.  Host-mode and joiner-N each run
+   their own gvisor netstack instance; the two instances
+   don't currently share a routing path.  Fixing this is a
+   larger architectural change (probably aligned with the
+   v0.3 obfuscation work, since the same plumbing helps
+   MASQUE-fronted host scenarios).
 
 ## Privacy
 

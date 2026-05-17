@@ -1,6 +1,9 @@
 # IPv6 Through wgrtc Tunnel on ChromeOS — Diagnostic Test Plan
 
-**Status:** Open investigation as of 2026-05-16.
+**Status:** Completed 2026-05-17.  Phases A, B, C all ran; results
+below.  **Conclusion: confirmed platform-side limitation, not a
+wgrtc bug.**  See "Findings" at the bottom for the distilled
+write-up that fed into the README's "Known limitations" section.
 
 ## Background
 
@@ -501,3 +504,71 @@ at the bottom, which then gets distilled into the README's
 If a single test contradicts the current hypothesis cleanly,
 **stop and re-evaluate before running more tests** — there's no
 point continuing if the foundation has shifted.
+
+
+---
+
+## Findings (2026-05-17)
+
+### Phase A: foundations confirmed
+
+- **A1** ✓ ARC really uses the tunnel for v6.  `nc -6
+  2607:f8b0:4005:80b::200e 80` from `adb shell` got Google's HTTP
+  response, and on the server `tcpdump -ni wg0 'ip6'` showed the
+  unencapsulated v6 packets with source `fd00:a771:c05:80::6` and
+  the corresponding WG-encapsulated packets on `udp port 22111`.
+  Same for `nc -6 2606:4700:4700::1111 53` and `ping6
+  2606:4700:4700::1111` — every probe arrived at the server's
+  `wg0` and the reply traversed back through the tunnel.
+- **A2** ✓ External v6 IP differs between VPN-up and VPN-down.
+  - ARC, VPN up: `2001:5a8:4cea:ccff::101` (Sonic — home).
+  - ARC, VPN down: `2607:fb90:9fa2:c257:502c:e0ff:feb5:d2c4`
+    (T-Mobile cellular).
+- **A3** ✓ Internal-LAN ULA reachable from ARC (`ping6
+  fd00:a771:c05::101` → 28.5 ms), unreachable from crosh
+  (`Invalid argument`), unreachable from Crostini (`Network
+  unreachable`).
+- **A4** ✓ Server-side `wg show wg0 transfer` counters incremented
+  for peer `D9R7…95hc` during the v6 test — confirms the joiner
+  peer is the one carrying v6.
+
+### Phase B: configuration variants
+
+- **B1 (`AllowedIPs = ::/0` only)**, **B2 (split-tunnel)**, **B3
+  (/64 inner address)**, **B5 (global v6 prefix)**: all produced
+  the same pattern — ARC works, ChromeOS-host doesn't, Crostini
+  doesn't.  None of our config knobs change the outcome.
+
+### Phase C: native WireGuard comparison
+
+- **C1+C2**: **No Android-based WireGuard client routes v6 to
+  ChromeOS-host or Crostini.**  Multiple clients tried, same
+  failure pattern.  The ChromeOS-built-in WireGuard implementation
+  is the only one that handles v6 system-wide, because it
+  integrates with ChromeOS networking directly rather than going
+  through the Android VpnService → Patchpanel bridge.
+
+### Conclusion
+
+The v6 failure on ChromeOS-host and Crostini is **not a wgrtc
+issue** and **not fixable from any Android-app-side change**.
+Patchpanel's v6 forwarding from ChromeOS-host into ARC's
+VpnService is incomplete, and the same disruption it causes
+breaks Crostini's v6 egress when the VPN is up.  The Android
+side works correctly: ARC apps see full v6 through the tunnel.
+
+Documented in the README's "Known limitations" section.
+Workaround for ChromeOS-wide v6: use the built-in WireGuard
+client, optionally cascading into wgrtc via a host-mode
+tunnel for roaming / NAT-traversal / obfuscation needs.  The
+cascade pattern itself has two follow-up bugs (overlap
+detection too strict, cross-stack forwarding missing) tracked
+separately.
+
+### Phases D, E, F: not run
+
+Phases D (platform diagnostics like patchpaneld logs),
+E (Crostini-specific deep dives), F (long-shots) were not
+needed once Phase C confirmed the platform-side root cause.
+They're left in this document for future reference if the
+behavior changes on a different ChromeOS milestone.
