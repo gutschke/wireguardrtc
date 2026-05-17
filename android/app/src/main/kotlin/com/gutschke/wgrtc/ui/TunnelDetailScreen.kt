@@ -550,6 +550,24 @@ private fun AdvancedDisclosure(
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                 )
+                // §4 transition log — round-2 critic's highest-payoff
+                // diagnostic item.  The user copies, the maintainer
+                // reads, distance-to-diagnosis goes from 20-minute
+                // Zoom call to copy-paste.
+                Spacer(Modifier.height(16.dp))
+                TransitionLogSection(tunnelId = tunnel.id)
+                // Surface the broker URL alongside the raw config —
+                // §4.1 BrokerMissing remediation depends on the user
+                // seeing this value (and noticing it's null).
+                tunnel.brokerWss?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Broker URL: $it",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
                 OutlinedButton(
                     onClick = onDelete,
@@ -564,6 +582,70 @@ private fun AdvancedDisclosure(
                 }
             }
         }
+    }
+}
+
+/**
+ * §4 transition log — every state transition for the tunnel, oldest
+ * first.  Each row reads `[hh:mm:ss] from → to : note`.  Copyable
+ * via a Copy button at the bottom.  When the log is empty (tunnel
+ * never moved out of Disabled), shows a one-line "no transitions
+ * yet" hint instead of a blank section.
+ *
+ * Reactive: subscribes to `stateOf(tunnelId)` so every transition
+ * recomposes the card.  The registry's transitionLog is otherwise
+ * non-reactive (synchronous List read), but every push to it is
+ * paired with a flow emit on stateOf so this hook covers the wake.
+ */
+@Composable
+private fun TransitionLogSection(tunnelId: String) {
+    val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+        .getProcessSingleton()
+    // Subscribing to stateOf triggers recomposition on every
+    // transition; the value itself is unused (we read the log
+    // directly afterwards).  StateFlow guarantees the latest
+    // emission has happened before the re-read.
+    @Suppress("UNUSED_VARIABLE")
+    val state by registry.stateOf(tunnelId).collectAsState()
+    val log = registry.transitionLog(tunnelId)
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    Text(
+        "Transition log",
+        style = MaterialTheme.typography.titleSmall,
+    )
+    Spacer(Modifier.height(4.dp))
+    if (log.isEmpty()) {
+        Text(
+            "No transitions yet.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+    val df = remember {
+        java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT)
+    }
+    val rendered = remember(log) {
+        log.joinToString("\n") { e ->
+            val ts = df.format(java.util.Date(e.timestampMs))
+            val from = e.from?.toString() ?: "—"
+            val noteSuffix = if (e.note.isNullOrBlank()) "" else " : ${e.note}"
+            "[$ts] $from → ${e.to}$noteSuffix"
+        }
+    }
+    Text(
+        rendered,
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = FontFamily.Monospace,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    TextButton(
+        onClick = {
+            clipboard.setText(androidx.compose.ui.text.AnnotatedString(rendered))
+        },
+    ) {
+        Text("Copy log")
     }
 }
 
