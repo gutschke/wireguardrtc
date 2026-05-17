@@ -983,17 +983,16 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  val t = _tunnels.value.firstOrNull { it.id == id }
  ?: error("no tunnel with id $id")
  // ─── AllowedIPs overlap gate ─────────────────────────────
- // Refuse to bring up a tunnel whose claimed CIDR ranges
- // overlap any tunnel that's already active.  Today the host +
- // joiner single-instance checks fire first so this is mostly
- // dormant, but the wiring is in place for when those
- // restrictions come out (task D4).  See [TunnelOverlapGuard].
+ // Refuse to bring up a tunnel that claims the *same exact* CIDR
+ // as a tunnel that's already active.  LPM-resolvable overlaps
+ // (e.g. 0.0.0.0/0 + 10.99.0.0/24) are permitted — those route
+ // correctly under longest-prefix-match.  See [TunnelOverlapGuard].
  val activeForGate = activeTunnelsForOverlapGate()
  val conflict = com.gutschke.wgrtc.data.TunnelOverlapGuard
  .firstOverlap(t, activeForGate)
  if (conflict != null) {
- val msg = "Can't bring up \"${t.name}\" — its address range " +
- "overlaps the active tunnel \"${conflict.name}\". " +
+ val msg = "Can't bring up \"${t.name}\" — it claims the same " +
+ "CIDR as the active tunnel \"${conflict.name}\". " +
  "Disconnect that one first or change AllowedIPs."
  Log.w("wgrtc-vm", msg)
  _lastError.value = msg

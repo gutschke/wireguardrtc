@@ -276,4 +276,90 @@ class CidrTest {
         assertFalse(cidrsOverlap(
             listOf("10.0.0.0/25"), listOf("10.0.0.128/25")))
     }
+
+    // ─── cidrsShareExactPrefix ────────────────────────────────────────
+
+    @Test fun `cidrsShareExactPrefix empty lists return false`() {
+        assertFalse(cidrsShareExactPrefix(emptyList(), listOf("10.0.0.0/24")))
+        assertFalse(cidrsShareExactPrefix(listOf("10.0.0.0/24"), emptyList()))
+        assertFalse(cidrsShareExactPrefix(emptyList(), emptyList()))
+    }
+
+    @Test fun `cidrsShareExactPrefix identical CIDRs match`() {
+        assertTrue(cidrsShareExactPrefix(
+            listOf("10.0.0.0/24"), listOf("10.0.0.0/24")))
+    }
+
+    @Test fun `cidrsShareExactPrefix subnet relationship does NOT match`() {
+        // Critical CASCADE-1 case: /16 contains /24, but they have
+        // different prefix lengths — LPM resolves cleanly, no conflict.
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.5.0/24"), listOf("10.0.0.0/16")))
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.0.0/16"), listOf("10.0.5.0/24")))
+    }
+
+    @Test fun `cidrsShareExactPrefix full-tunnel and host subnet do NOT match`() {
+        // The literal CASCADE-1 scenario: 0.0.0.0/0 vs 10.99.0.0/24.
+        // Pre-fix this was treated as a conflict by cidrsOverlap;
+        // post-fix this function returns false.
+        assertFalse(cidrsShareExactPrefix(
+            listOf("0.0.0.0/0"), listOf("10.99.0.0/24")))
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.99.0.0/24"), listOf("0.0.0.0/0")))
+    }
+
+    @Test fun `cidrsShareExactPrefix same network different prefix does NOT match`() {
+        // Same base network address but different prefix lengths —
+        // still LPM-resolvable.  /24 wins for the first 256 addresses,
+        // /16 catches the rest.  No conflict.
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.0.0/24"), listOf("10.0.0.0/16")))
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.0.0/16"), listOf("10.0.0.0/24")))
+    }
+
+    @Test fun `cidrsShareExactPrefix disjoint CIDRs return false`() {
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.0.0/24"), listOf("192.168.0.0/24")))
+    }
+
+    @Test fun `cidrsShareExactPrefix v6 identical match`() {
+        assertTrue(cidrsShareExactPrefix(
+            listOf("fd00::/64"), listOf("fd00::/64")))
+    }
+
+    @Test fun `cidrsShareExactPrefix v6 different prefix does NOT match`() {
+        // ::/0 vs fd00::/64 is the v6 version of CASCADE-1.
+        assertFalse(cidrsShareExactPrefix(
+            listOf("::/0"), listOf("fd00::/64")))
+    }
+
+    @Test fun `cidrsShareExactPrefix mixed families do not match`() {
+        assertFalse(cidrsShareExactPrefix(
+            listOf("0.0.0.0/0"), listOf("::/0")))
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.0.0/24"), listOf("fd00::/24")))
+    }
+
+    @Test fun `cidrsShareExactPrefix finds match in lists`() {
+        val a = listOf("10.0.0.0/24", "192.168.1.0/24")
+        val b = listOf("172.16.0.0/12", "192.168.1.0/24")
+        // 192.168.1.0/24 appears identically in both.
+        assertTrue(cidrsShareExactPrefix(a, b))
+    }
+
+    @Test fun `cidrsShareExactPrefix silently skips malformed entries`() {
+        val a = listOf("not-a-cidr", "10.0.0.0/24")
+        val b = listOf("garbage", "10.0.0.0/24")
+        assertTrue(cidrsShareExactPrefix(a, b))
+        assertFalse(cidrsShareExactPrefix(
+            listOf("not-a-cidr"), listOf("10.0.0.0/24")))
+    }
+
+    @Test fun `cidrsShareExactPrefix host route inside subnet does NOT match`() {
+        // /32 inside /24 — different prefix lengths.
+        assertFalse(cidrsShareExactPrefix(
+            listOf("10.0.0.5/32"), listOf("10.0.0.0/24")))
+    }
 }

@@ -125,6 +125,34 @@ fun cidrsOverlap(a: List<String>, b: List<String>): Boolean {
     return false
 }
 
+/** True iff [a] and [b] each contain a CIDR with the *same exact*
+ * (network address, prefix length) tuple.  This is the criterion
+ * the multi-tunnel overlap gate ([TunnelOverlapGuard]) actually
+ * cares about: kernel routing uses longest-prefix-match, so two
+ * tunnels claiming `10.99.0.0/24` vs `0.0.0.0/0` is *not* a
+ * conflict (LPM picks /24 for that subnet, /0 catches the rest).
+ * Only identical-prefix claims produce true ambiguity that the
+ * kernel resolves arbitrarily.
+ *
+ * Returns true iff there exists a CIDR string in [a] (after
+ * canonicalisation via [parseCidr]) that also appears in [b] with
+ * the same (network_bytes, prefix_bits).  Both sets are
+ * malformed-tolerant.  Symmetric. */
+fun cidrsShareExactPrefix(a: List<String>, b: List<String>): Boolean {
+    if (a.isEmpty() || b.isEmpty()) return false
+    val parsedA = a.mapNotNull { parseCidr(it) }
+    if (parsedA.isEmpty()) return false
+    for (y in b) {
+        val py = parseCidr(y) ?: continue
+        for (px in parsedA) {
+            if (px.second != py.second) continue
+            if (!px.first.contentEquals(py.first)) continue
+            return true
+        }
+    }
+    return false
+}
+
 /**
  * Extract every `AllowedIPs = a/n, b/m, ...` value from a wg-quick
  * config block, returning a flat list of CIDR strings. Multiple

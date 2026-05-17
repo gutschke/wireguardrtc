@@ -1,17 +1,25 @@
 package com.gutschke.wgrtc.data
 
-import com.gutschke.wgrtc.signalling.cidrsOverlap
+import com.gutschke.wgrtc.signalling.cidrsShareExactPrefix
 import com.gutschke.wgrtc.signalling.parseAllowedIps
 
 /**
  * Pre-Connect AllowedIPs overlap check for multi-tunnel scenarios.
  *
  * **Why this exists:** when more than one wgrtc tunnel is active on
- * the same device, their claimed address ranges (joiner-mode
- * `AllowedIPs`, host-mode subnet) must be disjoint.  Two tunnels
- * claiming `10.99.0.0/24` create routing ambiguity that kernel WG
- * resolves arbitrarily and silently — much better to refuse the
- * second `Connect` and tell the user which tunnel conflicts.
+ * the same device, two tunnels claiming the *same exact CIDR*
+ * (e.g. both `10.99.0.0/24`) produce routing ambiguity that
+ * kernel WG resolves arbitrarily and silently — much better to
+ * refuse the second `Connect` and tell the user which tunnel
+ * conflicts.
+ *
+ * **LPM-resolvable overlaps are NOT conflicts.**  Two tunnels with
+ * `0.0.0.0/0` (full-tunnel joiner) and `10.99.0.0/24` (host-mode
+ * subnet) coexist cleanly because kernel longest-prefix-match
+ * picks the /24 for that subnet and the /0 catches the rest.  We
+ * use [cidrsShareExactPrefix], which flags only identical-prefix
+ * collisions, not subset/superset overlaps.  CASCADE-1 finding,
+ * 2026-05-17.
  *
  * **Today** the [HostModeBackend] and [JoinerWgRunner] singletons
  * each enforce single-instance, so the guard is mostly a dormant
@@ -28,12 +36,18 @@ object TunnelOverlapGuard {
 
     /**
      * Return the first tunnel in [active] whose claimed address
-     * ranges overlap [candidate]'s, or `null` if [candidate] is safe
-     * to bring up.
+     * ranges share an identical CIDR with [candidate]'s, or `null`
+     * if [candidate] is safe to bring up.
+     *
+     * Identical CIDR = same network address AND same prefix length.
+     * LPM-resolvable overlaps (e.g. `0.0.0.0/0` ∩ `10.99.0.0/24`)
+     * are deliberately permitted — the kernel routes those
+     * correctly.
      *
      * The candidate itself, if it appears in [active] (e.g.
      * re-activating a tunnel that's already up), is skipped — it
-     * trivially overlaps itself and that's not a conflict.
+     * trivially shares its own ranges with itself and that's not a
+     * conflict.
      */
     fun firstOverlap(candidate: Tunnel, active: List<Tunnel>): Tunnel? {
         val candidateRanges = claimedRanges(candidate)
@@ -42,7 +56,7 @@ object TunnelOverlapGuard {
             if (existing.id == candidate.id) continue
             val existingRanges = claimedRanges(existing)
             if (existingRanges.isEmpty()) continue
-            if (cidrsOverlap(candidateRanges, existingRanges)) return existing
+            if (cidrsShareExactPrefix(candidateRanges, existingRanges)) return existing
         }
         return null
     }
