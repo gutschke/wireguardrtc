@@ -48,6 +48,19 @@ class OfferListenerService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var watchJob: Job? = null
+    /**
+     * Periodic VPN-consent re-check.  See `docs/ux-design-v2.md`
+     * §6.1 step 4 (round-2 amendment A1).  Closes the
+     * phantom-active blind window for users who never re-foreground
+     * the app — the dominant phantom-active cohort.
+     *
+     * Cadence: every 30 minutes while the FGS is alive.  A `Service`
+     * can call `VpnService.prepare(this)` to DETECT consent loss
+     * (non-null Intent return value); it can't launch the consent
+     * UI (Activity-only) but detection is all we need to fire
+     * registry.recordRevoke(BackgroundResync).
+     */
+    private var consentRecheckJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -110,6 +123,8 @@ class OfferListenerService : Service() {
                 }
             }
         }
+        consentRecheckJob?.cancel()
+        consentRecheckJob = scope.launch { runConsentRecheckLoop() }
 
         // START_STICKY: the system will recreate us with a null
         // intent if the process is killed, and onStartCommand will
@@ -122,6 +137,58 @@ class OfferListenerService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         scope.cancel()
+    }
+
+    /**
+     * Background phantom-active detector.  Every
+     * [CONSENT_RECHECK_PERIOD_MS] we ask Android whether the VPN
+     * permission is still granted; if not, we mark every currently-
+     * active joiner as `Paused (system, BackgroundResync)` in the
+     * registry.  The signal-1-2-3 path (establish-null, onRevoke,
+     * MainActivity.onResume) catches the dominant cases; this loop
+     * catches the user-never-foregrounds-the-app case where none of
+     * those fire and the UI would otherwise lie indefinitely.
+     *
+     * Gating: skip the prepare() call entirely when no joiner has
+     * `intent=WantsOn`.  Reading [WgrtcApp.listenerHub] tunnels lets
+     * us check without binding to the joiner service.  Prepare's
+     * cost is ~a millisecond; this is more about not waking
+     * anything we don't have to.
+     */
+    private suspend fun runConsentRecheckLoop() {
+        while (true) {
+            kotlinx.coroutines.delay(CONSENT_RECHECK_PERIOD_MS)
+            try {
+                val tunnels = WgrtcApp.instance.listenerHub.loadTunnels()
+                val joinerWantsOnIds = tunnels
+                    .filter {
+                        it.source != com.gutschke.wgrtc.data.Tunnel.Source.HOST_MODE &&
+                            it.intent == com.gutschke.wgrtc.data.TunnelIntent.WantsOn
+                    }
+                    .map { it.id }
+                if (joinerWantsOnIds.isEmpty()) continue
+                val consent = android.net.VpnService.prepare(this)
+                if (consent != null) {
+                    val registry = com.gutschke.wgrtc.data.TunnelStateRegistry
+                        .getProcessSingleton()
+                    for (id in joinerWantsOnIds) {
+                        registry.recordRevoke(
+                            id,
+                            com.gutschke.wgrtc.data.PauseReason.BackgroundResync,
+                            note = "FGS periodic re-prepare returned non-null Intent",
+                        )
+                    }
+                    Log.i(TAG,
+                        "background re-prepare detected consent loss for $joinerWantsOnIds")
+                }
+            } catch (t: Throwable) {
+                // Re-prepare itself shouldn't fail, but if anything
+                // along the path throws (tunnel-store I/O, registry
+                // mutation, framework error) we don't want the loop
+                // to die.  Log and continue.
+                Log.w(TAG, "consent recheck threw: ${t.message}", t)
+            }
+        }
     }
 
     /** Started service, no IPC clients. */
@@ -184,6 +251,14 @@ class OfferListenerService : Service() {
         const val CHANNEL_ID_HIDDEN = "wgrtc.listener.hidden"
         const val NOTIFICATION_ID = 1
         const val TAG = "wgrtc-svc"
+
+        /** 30 min cadence for the background consent re-check.
+         *  See [runConsentRecheckLoop] kdoc + `docs/ux-design-v2.md`
+         *  §6.1 step 4.  Long enough to be invisible in battery
+         *  stats; short enough to catch the "user revoked an hour
+         *  ago and never reopened the app" case before they hit
+         *  Reconnect and get a confused-looking error. */
+        const val CONSENT_RECHECK_PERIOD_MS = 30L * 60L * 1_000L
 
         // notification action that the user can tap to stop
         // the FGS without going to Settings.  Routed back to
