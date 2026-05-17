@@ -717,6 +717,51 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  viewModelScope.launch(Dispatchers.IO) { hub.saveTunnels(all) }
  }
 
+ // ─── Tile #3 Bridge-orchestration plumbing ────────────────────
+ // §11.6 Tile #3 "Bridge two networks" walks the user through
+ // creating both halves of a Bridge in one flow.  The ViewModel
+ // carries a pending groupId across the two screens; each
+ // tunnel-creation surface (joiner-import + host-setup) checks
+ // this flow on save and stamps the pending id onto the new
+ // tunnel before clearing the flow's slot for that half.
+
+ /**
+ * Pure data holder for the in-flight Bridge orchestration.
+ * Extracted to [com.gutschke.wgrtc.data.BridgeOrchestrationState]
+ * so its transitions can be unit-tested without bootstrapping
+ * the AndroidViewModel.  Doc on the helper enumerates the state
+ * machine; the property + methods below are 1:1 passthroughs.
+ */
+ private val bridgeOrchestration =
+ com.gutschke.wgrtc.data.BridgeOrchestrationState(
+ onClobber = { previous ->
+ Log.w(TAG, "startBridgeFlow overwriting in-flight bridge groupId=$previous")
+ },
+ )
+
+ /**
+ * Pending Bridge groupId.  Downstream screens may collect this
+ * flow to auto-dismiss when the Bridge flow ends (StateFlow →
+ * null is the terminal signal).  Tile-#3 wizard callers SHOULD
+ * wire `DisposableEffect { onDispose { finishBridgeFlow() } }`
+ * at the flow-root composable so a user who backs out mid-flow
+ * doesn't leak the pending id.
+ */
+ val pendingBridgeGroupId: StateFlow<String?> =
+ bridgeOrchestration.pending
+
+ /** Allocate a Bridge groupId.  See
+ *  [com.gutschke.wgrtc.data.BridgeOrchestrationState.startFlow]. */
+ fun startBridgeFlow(): String = bridgeOrchestration.startFlow()
+
+ /** Peek at the pending Bridge groupId — both halves read this. */
+ fun peekBridgeGroupIdForNewTunnel(): String? = bridgeOrchestration.peek()
+
+ /** Clear the in-flight Bridge flow.  Idempotent. */
+ fun finishBridgeFlow() {
+ bridgeOrchestration.finish()
+ }
+
  /**
  * Update [Tunnel.relayPolicy] without bouncing the tunnel.
  * Targeted entrypoint for the §2.3 banner — the heavier
@@ -2170,6 +2215,8 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  }
 
  private companion object {
+ const val TAG = "wgrtc-vm"
+
  /** how long [connect] is willing to wait for a fresh OFFER
  * to land in the hub's candidate cache after firing a wake.
  * Picked above the typical OFFER round-trip (~600 ms LAN, ~1 s
