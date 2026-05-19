@@ -78,6 +78,19 @@ type CascadeFerryRegistry struct {
 	// at the ferry NIC (or drop-NIC during the gap).
 	joinerAllowedIPs []netip.Prefix
 
+	// joinerOwnV4 / joinerOwnV6 — the joiner-N's own assigned
+	// addresses (the wg-quick `[Interface] Address` line of the
+	// first/only joiner).  Used by the CASCADE-2 NAT to rewrite
+	// cascade traffic's inner source so the upstream WG server
+	// accepts it without requiring server-side AllowedIPs
+	// widening.  Zero-valued = NAT disabled for that family.
+	//
+	// Single-joiner MVP: each ferry's NatTable is configured with
+	// these on creation.  Multi-joiner support (= per-joiner NAT
+	// state + PAT) is a follow-up.
+	joinerOwnV4 netip.Addr
+	joinerOwnV6 netip.Addr
+
 	// hostStacks holds the active host-mode bridges, keyed by
 	// bridge handle.
 	hostStacks map[int32]*hostStackEntry
@@ -210,6 +223,28 @@ func (r *CascadeFerryRegistry) UnregisterHostBridge(handle int32) {
 	delete(r.hostStacks, handle)
 }
 
+// OnJoinerInterfaceAddrsChanged updates the joiner's own assigned
+// WG-side addresses (CASCADE-2 NAT source).  Propagates to every
+// active ferry so cascade traffic gets SNAT'd to the new values.
+// Zero-valued addresses disable NAT for that family.
+//
+// Idempotent: same values → no observable effect.
+func (r *CascadeFerryRegistry) OnJoinerInterfaceAddrsChanged(v4, v6 netip.Addr) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v4.IsValid() && !v4.Is4() {
+		v4 = netip.Addr{}
+	}
+	if v6.IsValid() && !v6.Is6() {
+		v6 = netip.Addr{}
+	}
+	r.joinerOwnV4 = v4
+	r.joinerOwnV6 = v6
+	for _, ferry := range r.ferries {
+		ferry.SetJoinerInterfaceAddrs(v4, v6)
+	}
+}
+
 // OnJoinerAllowedIPsChanged updates the cascade route set when
 // joiner-N's union of AllowedIPs changes (e.g. a joiner is added
 // or removed without a full stack rebuild).  Adds routes for
@@ -272,6 +307,9 @@ func (r *CascadeFerryRegistry) createFerryLocked(handle int32, entry *hostStackE
 	if err != nil {
 		return
 	}
+	// Seed the NAT with the currently-cached joiner-own addresses.
+	// Zero values = NAT disabled for that family (pure passthrough).
+	ferry.SetJoinerInterfaceAddrs(r.joinerOwnV4, r.joinerOwnV6)
 	// Install host-side routes: every joiner AllowedIP → ferry's
 	// host NIC.  Before adding, remove any drop-NIC route for
 	// the same prefix (left over from a prior UnregisterJoinerStack).

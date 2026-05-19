@@ -67,6 +67,17 @@ type CascadeFerry struct {
 	hostToJoinerDone chan struct{}
 	joinerToHostDone chan struct{}
 
+	// CASCADE-2 NAT — single-peer source-address translation that
+	// makes cascade traffic appear (to the joiner peer's upstream
+	// WG server) as if the joiner itself was the originator.
+	// Avoids requiring server-side AllowedIPs widening; works
+	// against commercial WG providers that hand out single /32+/128
+	// per peer.  Initialised with empty joiner-own addrs by default
+	// (= NAT off, pure passthrough).  Caller sets joiner-own addrs
+	// via [SetJoinerInterfaceAddrs] once the joiner-N controller
+	// has the values from the joiner's wg-quick `[Interface]`.
+	nat *NatTable
+
 	// routes track the prefixes we installed on each stack, for
 	// graceful removal in Stop.
 	mu             sync.Mutex
@@ -135,20 +146,40 @@ func newCascadeFerry(
 		cancel:           cancel,
 		hostToJoinerDone: make(chan struct{}),
 		joinerToHostDone: make(chan struct{}),
+		nat:              newNatTable(netip.Addr{}, netip.Addr{}),
 		hostRoutes:       make(map[netip.Prefix]struct{}),
 		joinerRoutes:     make(map[netip.Prefix]struct{}),
 	}
 
-	go f.drainLoop(hostEp, joinerEp, f.hostToJoinerDone)
-	go f.drainLoop(joinerEp, hostEp, f.joinerToHostDone)
+	go f.drainLoop(hostEp, joinerEp, f.hostToJoinerDone, true /* forward */)
+	go f.drainLoop(joinerEp, hostEp, f.joinerToHostDone, false /* reverse */)
 
 	return f, nil
+}
+
+// SetJoinerInterfaceAddrs configures the joiner's own assigned WG-
+// side addresses for NAT translation.  Either or both may be zero
+// (= disable NAT for that family).  Updates take effect on the next
+// packet through the drain loops.  Safe to call multiple times
+// (last call wins) — mutates [f.nat] in place under its own lock
+// rather than swapping the pointer, so the drain loops' reads are
+// race-free without an additional ferry-wide mutex.
+//
+// In production this is fed by the joiner's wg-quick
+// `[Interface] Address` line.  See `cascade_ferry_nat.go` for the
+// rationale (commercial WG providers won't widen per-peer
+// AllowedIPs server-side).
+func (f *CascadeFerry) SetJoinerInterfaceAddrs(v4, v6 netip.Addr) {
+	f.nat.setJoinerAddrs(v4, v6)
 }
 
 // drainLoop reads packets off [src] and re-injects them as inbound
 // on [dst].  Exits when ctx is cancelled OR src.Close() makes
 // ReadContext return nil.
-func (f *CascadeFerry) drainLoop(src, dst *channel.Endpoint, done chan struct{}) {
+//
+// [isForward] = true means host → joiner direction; false means
+// joiner → host.  Used to pick the NAT direction.
+func (f *CascadeFerry) drainLoop(src, dst *channel.Endpoint, done chan struct{}, isForward bool) {
 	defer close(done)
 	for {
 		pkt := src.ReadContext(f.ctx)
@@ -183,6 +214,17 @@ func (f *CascadeFerry) drainLoop(src, dst *channel.Endpoint, done chan struct{})
 		copy(rawCopy, raw)
 		view.Release()
 		pkt.DecRef()
+		// CASCADE-2 NAT — translate source/destination so cascade
+		// traffic appears, to the joiner peer's upstream, as
+		// originating from the joiner itself.  Forward direction
+		// rewrites SRC; reverse direction restores DST from the
+		// remembered original.  When NAT is disabled (empty joiner
+		// addrs) the calls are O(1) no-ops.
+		if isForward {
+			f.nat.snatForward(rawCopy)
+		} else {
+			f.nat.snatReverse(rawCopy)
+		}
 		clone := gvstack.NewPacketBuffer(gvstack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(rawCopy),
 		})

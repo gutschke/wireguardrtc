@@ -49,6 +49,7 @@ object CascadeWiring {
         fun registerJoiner(stackHandle: Int, allowedIpsCsv: String?): Int
         fun unregisterJoiner()
         fun joinerAllowedIpsChanged(allowedIpsCsv: String?): Int
+        fun joinerInterfaceAddrsChanged(addrsCsv: String?): Int
         fun registerHostBridge(bridgeHandle: Int, peerSubnetsCsv: String?): Int
         fun unregisterHostBridge(bridgeHandle: Int)
     }
@@ -62,6 +63,8 @@ object CascadeWiring {
         }
         override fun joinerAllowedIpsChanged(allowedIpsCsv: String?): Int =
             WgBridgeNative.nativeCascadeOnAllowedIPsChanged(allowedIpsCsv)
+        override fun joinerInterfaceAddrsChanged(addrsCsv: String?): Int =
+            WgBridgeNative.nativeCascadeOnJoinerInterfaceAddrsChanged(addrsCsv)
         override fun registerHostBridge(bridgeHandle: Int, peerSubnetsCsv: String?): Int =
             WgBridgeNative.nativeCascadeRegisterHostBridge(bridgeHandle, peerSubnetsCsv)
         override fun unregisterHostBridge(bridgeHandle: Int) {
@@ -151,6 +154,28 @@ object CascadeWiring {
                 Log.w(TAG, "nativeCascadeOnAllowedIPsChanged rc=$rc csv=$allowedIpsCsv")
             } else {
                 Log.i(TAG, "joiner AllowedIPs union updated: ${joinerAllowedIps.size} prefixes ($allowedIpsCsv)")
+            }
+        }
+    }
+
+    /**
+     * Update the joiner's own assigned WG-side address(es) used as
+     * the CASCADE-2 NAT source.  Bare addresses (no CIDR) joined by
+     * commas, e.g. `"10.240.234.3,2001:db8::3"`.  Empty CSV
+     * disables NAT for that family.
+     *
+     * Idempotent; safe to call when no joiner stack is up
+     * (currently a no-op, but the registry caches the value for
+     * the next ferry to use).
+     */
+    fun onJoinerInterfaceAddrsChanged(addrsCsv: String) {
+        synchronized(mu) {
+            if (!enabled) return
+            val rc = bridge.joinerInterfaceAddrsChanged(addrsCsv)
+            if (rc != 0) {
+                Log.w(TAG, "nativeCascadeOnJoinerInterfaceAddrsChanged rc=$rc csv=$addrsCsv")
+            } else {
+                Log.i(TAG, "joiner interface addrs for NAT: $addrsCsv")
             }
         }
     }

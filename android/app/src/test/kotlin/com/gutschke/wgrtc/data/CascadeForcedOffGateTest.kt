@@ -37,6 +37,10 @@ class CascadeForcedOffGateTest {
             calls += Call("joinerAllowedIpsChanged", listOf(allowedIpsCsv))
             return 0
         }
+        override fun joinerInterfaceAddrsChanged(addrsCsv: String?): Int {
+            calls += Call("joinerInterfaceAddrsChanged", listOf(addrsCsv))
+            return 0
+        }
         override fun registerHostBridge(bridgeHandle: Int, peerSubnetsCsv: String?): Int {
             calls += Call("registerHostBridge", listOf(bridgeHandle, peerSubnetsCsv))
             return 0

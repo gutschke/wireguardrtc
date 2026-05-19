@@ -52,6 +52,8 @@ extern int wgbridgeSharedStackOpenJoiner(int stackHandle,
 extern int wgbridgeSharedStackCascadeRegisterJoiner(int stackHandle,
                                           const char *allowedIpsCsv, long allowedIpsLen);
 extern void wgbridgeSharedStackCascadeUnregisterJoiner(void);
+extern int wgbridgeSharedStackCascadeOnJoinerInterfaceAddrsChanged(
+    const char *addrs, long addrsLen);
 extern int wgbridgeSharedStackCascadeOnAllowedIPsChanged(
                                           const char *allowedIpsCsv, long allowedIpsLen);
 extern int wgbridgeSharedStackCascadeRegisterHostBridge(int bridgeHandle,
@@ -609,6 +611,23 @@ Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeOnAllowedIPsChanged(
     }
     int rc = wgbridgeSharedStackCascadeOnAllowedIPsChanged(s, (long) n);
     if (allowedIps != NULL) (*env)->ReleaseStringUTFChars(env, allowedIps, s);
+    return (jint) rc;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_gutschke_wgrtc_data_WgBridgeNative_nativeCascadeOnJoinerInterfaceAddrsChanged(
+    JNIEnv *env, jclass cls, jstring addrs)
+{
+    (void) cls;
+    const char *s = "";
+    jsize n = 0;
+    if (addrs != NULL) {
+        s = (*env)->GetStringUTFChars(env, addrs, 0);
+        if (s == NULL) return -1;
+        n = (*env)->GetStringUTFLength(env, addrs);
+    }
+    int rc = wgbridgeSharedStackCascadeOnJoinerInterfaceAddrsChanged(s, (long) n);
+    if (addrs != NULL) (*env)->ReleaseStringUTFChars(env, addrs, s);
     return (jint) rc;
 }
 

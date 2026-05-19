@@ -78,6 +78,71 @@ func wgbridgeSharedStackCascadeOnAllowedIPsChanged(
 	return 0
 }
 
+// wgbridgeSharedStackCascadeOnJoinerInterfaceAddrsChanged updates
+// the joiner's own assigned WG-side address(es) used as the
+// CASCADE-2 NAT source.  [addrsCsv] is comma-separated; addresses
+// outside the unspecified-range (e.g. "10.240.234.3,2001:db8::3")
+// are picked by family.  Empty / unparseable input disables NAT
+// for that family (pure passthrough).  Idempotent.
+//
+// Returns:
+//	 0 : ok (NAT updated, even if input was empty)
+//	-1 : malformed CSV (couldn't parse any entries)
+//
+//export wgbridgeSharedStackCascadeOnJoinerInterfaceAddrsChanged
+func wgbridgeSharedStackCascadeOnJoinerInterfaceAddrsChanged(
+	addrsStr *C.char, addrsLen C.long,
+) C.int {
+	raw := goStringToGo(addrsStr, addrsLen)
+	v4, v6 := parseInterfaceAddrsCsv(raw)
+	getCascadeFerryRegistry().OnJoinerInterfaceAddrsChanged(v4, v6)
+	return 0
+}
+
+// parseInterfaceAddrsCsv parses a comma-separated list of bare IP
+// addresses (no CIDR prefix expected — the wg-quick Address field
+// has prefix lengths, but for NAT we only care about the host
+// portion).  Returns (v4, v6); zero netip.Addr means "not found
+// in input".  Tolerates whitespace + accepts CIDR-form input by
+// stripping `/...`.
+//
+// Multi-joiner-config note: in the union-CSV produced by
+// JoinerStackBackend.unionInterfaceAddrsCsv(), two slots that own
+// different /32s of the same family produce two same-family
+// addresses.  Single-peer NAT MVP can only honour ONE per family,
+// so we keep the first seen and warn-log the dropped peer.
+// Multi-peer PAT is the follow-up.
+func parseInterfaceAddrsCsv(csv string) (v4, v6 netip.Addr) {
+	for _, piece := range strings.Split(csv, ",") {
+		piece = strings.TrimSpace(piece)
+		if piece == "" {
+			continue
+		}
+		// Strip any CIDR suffix.
+		if idx := strings.Index(piece, "/"); idx >= 0 {
+			piece = piece[:idx]
+		}
+		addr, err := netip.ParseAddr(piece)
+		if err != nil {
+			continue
+		}
+		if addr.Is4() {
+			if v4.IsValid() {
+				hostFwdLog("[cascade-nat] dropping additional IPv4 addr %s (already pinned to %s) — single-peer NAT MVP; multi-peer PAT is the follow-up", addr, v4)
+			} else {
+				v4 = addr
+			}
+		} else if addr.Is6() {
+			if v6.IsValid() {
+				hostFwdLog("[cascade-nat] dropping additional IPv6 addr %s (already pinned to %s) — single-peer NAT MVP; multi-peer PAT is the follow-up", addr, v6)
+			} else {
+				v6 = addr
+			}
+		}
+	}
+	return v4, v6
+}
+
 // wgbridgeSharedStackCascadeRegisterHostBridge records the
 // host-mode bridge identified by [bridgeHandle] in the cascade
 // registry.  [peerSubnetsCsv] is a comma-separated list of the

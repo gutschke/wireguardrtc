@@ -59,6 +59,13 @@ class JoinerStackBackend(
         val bridgeHandle: Int,
         @Volatile var uapi: String,
         @Volatile var peerAllowed: List<String>,
+        /** CIDR-form interface addresses (the joiner's wg-quick
+         *  `[Interface] Address` line) — `["10.240.234.3/32",
+         *  "2001:db8::3/128"]` etc.  Used as the CASCADE-2 NAT
+         *  source so cascade traffic appears to upstream as
+         *  originating from the joiner itself.  See
+         *  `cascade_ferry_nat.go`. */
+        @Volatile var interfaceAddrs: List<String>,
     )
 
     private val slots: ConcurrentHashMap<String, Slot> = ConcurrentHashMap()
@@ -160,11 +167,13 @@ class JoinerStackBackend(
                     bridgeHandle = bridgeHandle,
                     uapi = wgQuickUapi,
                     peerAllowed = peerAllowed,
+                    interfaceAddrs = interfaceAddrs,
                 )
                 _activeJoinerIds.value = slots.keys.toSet()
                 bridgeHandle
             }.also {
                 CascadeWiring.onJoinerAllowedIpsChanged(unionAllowedIpsCsv())
+                CascadeWiring.onJoinerInterfaceAddrsChanged(unionInterfaceAddrsCsv())
             }
         }
     }
@@ -207,6 +216,7 @@ class JoinerStackBackend(
         val slot = slots.remove(tunnelId) ?: return
         _activeJoinerIds.value = slots.keys.toSet()
         CascadeWiring.onJoinerAllowedIpsChanged(unionAllowedIpsCsv())
+        CascadeWiring.onJoinerInterfaceAddrsChanged(unionInterfaceAddrsCsv())
         withContext(Dispatchers.IO) {
             try { factory.close(slot.bridgeHandle) } catch (_: Throwable) {}
         }
@@ -246,6 +256,16 @@ class JoinerStackBackend(
     private fun unionAllowedIpsCsv(): String {
         val all = linkedSetOf<String>()
         for (slot in slots.values) all.addAll(slot.peerAllowed)
+        return all.joinToString(",")
+    }
+
+    /** Comma-separated union of every active slot's
+     *  [Slot.interfaceAddrs] (the joiners' WG-side
+     *  `[Interface] Address` values).  Used as the CASCADE-2 NAT
+     *  source list.  Empty string when no joiner is up. */
+    private fun unionInterfaceAddrsCsv(): String {
+        val all = linkedSetOf<String>()
+        for (slot in slots.values) all.addAll(slot.interfaceAddrs)
         return all.joinToString(",")
     }
 }

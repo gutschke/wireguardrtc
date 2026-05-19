@@ -27,6 +27,10 @@ class CascadeWiringTest {
             calls += Call("joinerAllowedIpsChanged", listOf(allowedIpsCsv))
             return 0
         }
+        override fun joinerInterfaceAddrsChanged(addrsCsv: String?): Int {
+            calls += Call("joinerInterfaceAddrsChanged", listOf(addrsCsv))
+            return 0
+        }
         override fun registerHostBridge(bridgeHandle: Int, peerSubnetsCsv: String?): Int {
             calls += Call("registerHostBridge", listOf(bridgeHandle, peerSubnetsCsv))
             return 0
@@ -161,6 +165,29 @@ class CascadeWiringTest {
             CascadeWiring.onJoinerStackDown()
             CascadeWiring.onJoinerAllowedIpsChanged("10.50.0.0/24")
             assertTrue(b.calls.isEmpty(), "calls=${b.calls}")
+        }
+    }
+
+    @Test fun `onJoinerInterfaceAddrsChanged routes through the bridge when enabled`() {
+        // CASCADE-2 NAT — verify the new method threads the CSV
+        // through to the bridge unchanged.  Bridge isn't asked
+        // until cascade is enabled.
+        val b = RecordingBridge()
+        withBridge(b) {
+            CascadeWiring.onJoinerInterfaceAddrsChanged("10.240.234.3,2001:db8::3")
+            assertTrue(b.calls.isEmpty(),
+                "disabled cascade must not call bridge: ${b.calls}")
+            CascadeWiring.setEnabled(true)
+            b.calls.clear()
+            CascadeWiring.onJoinerInterfaceAddrsChanged("10.240.234.3,2001:db8::3")
+            assertEquals(
+                listOf("joinerInterfaceAddrsChanged"),
+                b.calls.map { it.name },
+            )
+            assertEquals(
+                listOf<Any?>("10.240.234.3,2001:db8::3"),
+                b.calls[0].args,
+            )
         }
     }
 

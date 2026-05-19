@@ -234,6 +234,17 @@ object WgBridgeNative {
     ): Int
 
     /**
+     * Update the joiner's own assigned WG-side address(es) used as
+     * the CASCADE-2 NAT source.  CSV of bare addresses (v4 and/or
+     * v6).  Empty / unparseable input disables NAT for the missing
+     * family (pure passthrough).  See `cascade_ferry_nat.go` for
+     * the rationale.  Idempotent.  -1 malformed CSV.
+     */
+    @JvmStatic external fun nativeCascadeOnJoinerInterfaceAddrsChanged(
+        addrsCsv: String?,
+    ): Int
+
+    /**
      * Record a host-mode bridge in the cascade registry.
      * [peerSubnetsCsv] is the host's claimed subnet(s).  -1
      * unknown bridge handle; -2 malformed CSV; -3 bridge is not
