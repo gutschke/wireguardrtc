@@ -91,7 +91,6 @@ fun TunnelListScreen(
     val tunnels by vm.tunnels.collectAsState()
     val activeIds by vm.activeTunnelIds.collectAsState()
     val connectingId by vm.connectingTunnelId.collectAsState()
-    val chromeOsWarningFor by vm.chromeOsLoopWarningFor.collectAsState()
     var bridgePartnerPicker by remember { mutableStateOf<Tunnel?>(null) }
     // dropped vm.liveState — it's a singular legacy signal
     // that can't tell two concurrent tunnels apart.  Per-row state
@@ -262,25 +261,10 @@ fun TunnelListScreen(
         )
     }
 
-    val ctx = androidx.compose.ui.platform.LocalContext.current
-    chromeOsWarningFor?.let { t ->
-        ChromeOsRoutingLoopDialog(
-            hostName = t.name,
-            onOpenSettings = {
-                val intent = android.content.Intent(
-                    android.provider.Settings.ACTION_VPN_SETTINGS)
-                intent.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
-                runCatching { ctx.startActivity(intent) }
-                vm.acknowledgeChromeOsLoopWarning(t.id, proceed = true)
-            },
-            onContinue = {
-                vm.acknowledgeChromeOsLoopWarning(t.id, proceed = true)
-            },
-            onCancel = {
-                vm.acknowledgeChromeOsLoopWarning(t.id, proceed = false)
-            },
-        )
-    }
+    // §6.2 dialog is rendered at the NavHost level via
+    // ChromeOsRoutingLoopHost so the warning surfaces from every
+    // screen Connect can be tapped on, not just TunnelList.  Don't
+    // duplicate the renderer here.
 }
 
 // ─── First-run tile launcher (v2 §11.6) ─────────────────────────
@@ -1081,51 +1065,10 @@ private fun BridgeWithDialog(
     )
 }
 
-/**
- * §6.2 ChromeOS routing-loop warning.  Fires once per host tunnel
- * at first Connect on ARC.  Sticky dismissal lives on the
- * persisted [Tunnel] via [Tunnel.chromeOsLoopWarned].
- *
- * Three actions:
- *   * **Open settings** — deep-links to ChromeOS Network → VPN so
- *     the user can verify no other WG client routes through this
- *     device's IP.  Treats this as "ack" — same as Continue.
- *   * **Continue** — user vouches they checked.  Proceeds.
- *   * **Cancel** — user backs out; the tunnel transitions to
- *     `Failed (permanent, RoutingLoopUserConfirmed)` so the row
- *     surfaces the reason.  Re-tapping Connect later re-shows the
- *     dialog (the sticky flag isn't set yet).
- */
-@Composable
-private fun ChromeOsRoutingLoopDialog(
-    hostName: String,
-    onOpenSettings: () -> Unit,
-    onContinue: () -> Unit,
-    onCancel: () -> Unit,
-) {
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onCancel,
-        title = { Text("Possible routing loop?") },
-        text = {
-            Text(
-                "Before \"$hostName\" comes up: if another WireGuard " +
-                    "client on this Chromebook has this device's IP " +
-                    "in its AllowedIPs, traffic will loop back here " +
-                    "and your network will break.\n\n" +
-                    "Open ChromeOS Settings → Network → VPN and check.",
-            )
-        },
-        confirmButton = {
-            Button(onClick = onOpenSettings) { Text("Open settings") }
-        },
-        dismissButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onCancel) { Text("Cancel") }
-                OutlinedButton(onClick = onContinue) { Text("I've checked") }
-            }
-        },
-    )
-}
+// ChromeOsRoutingLoopDialog moved to ChromeOsRoutingLoopHost.kt
+// and mounted at the NavHost level so the warning surfaces from
+// EVERY screen Connect can be tapped on, not just TunnelList.
+// See ChromeOsRoutingLoopHost for the renderer.
 
 /**
  * §2.3 cascade-eligibility banner.  Renders under a host tunnel

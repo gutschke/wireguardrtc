@@ -1,3 +1,26 @@
+wireguardrtc (0.3.1-1) unstable; urgency=medium
+
+  * Android: fix invisible Connect on ARC for host-mode tunnels.
+    v0.3.0 wired the §11.7 ChromeOS routing-loop precheck into
+    WgrtcViewModel.connect — but the dialog that surfaces the
+    warning was only rendered in TunnelListScreen.  When the user
+    tapped Connect from TunnelDetailScreen (the natural target
+    after creating a Bridge via the Tile #3 wizard), connect()
+    short-circuited at the precheck, flipped the warning state,
+    and returned — but the dialog never appeared because that
+    screen wasn't observing the flow.  The user saw "Connect →
+    nothing happens".  Reported in the field within hours of
+    v0.3.0 shipping.
+
+    Fix: ChromeOsRoutingLoopHost extracted to its own composable
+    and mounted at the AppNavHost level, so the dialog overlays
+    whichever route is active.  Also added a Log.i line at the
+    precheck transition so future debugging finds the trail.
+
+  * Daemon: no changes; bumped for parity.
+
+ -- wireguardrtc maintainers <maintainers@wgrtc.invalid>  Tue, 19 May 2026 21:00:00 +0000
+
 wireguardrtc (0.3.0-1) unstable; urgency=medium
 
   * Android: CASCADE-2 cross-stack forwarding ferry lets a host-mode

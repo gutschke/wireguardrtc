@@ -1314,6 +1314,9 @@ class WgrtcViewModel(app: Application) : AndroidViewModel(app), HostModeReconfig
  ) {
  // Bail out of this connect attempt; the UI will show
  // the dialog and re-enter via acknowledgeChromeOsLoopWarning.
+ Log.i(TAG,
+ "connect($id): ARC routing-loop precheck — surfacing dialog, " +
+ "deferring connect until user acks")
  _chromeOsLoopWarningFor.value = t
  _connectingTunnelId.value = null
  val myJob = currentCoroutineContext()[Job]

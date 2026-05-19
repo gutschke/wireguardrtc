@@ -563,6 +563,13 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+        // §6.2 ChromeOS routing-loop dialog — mounted OUTSIDE the
+        // NavHost so it overlays whichever route is active.  The
+        // bug it fixes: previously embedded inside TunnelListScreen,
+        // so a user who tapped Connect from TunnelDetailScreen saw
+        // the connect short-circuit invisibly because the dialog's
+        // observer wasn't in the active composition.
+        com.gutschke.wgrtc.ui.ChromeOsRoutingLoopHost(vm = vm)
     }
 
     private fun requestConnect(tunnelId: String) {
